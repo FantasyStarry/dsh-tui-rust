@@ -77,6 +77,17 @@ async fn probe() -> Result<()> {
         println!("session/resume: {} → ok", acp::short_id(&resumed));
     }
 
+    // Optional dwell: keep the process alive so delayed host-side work
+    // (e.g. the companion plugin's reconcile timers) can run before exit.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--dwell") {
+        let ms: u64 = args.get(pos + 1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        if ms > 0 {
+            println!("dwell {ms}ms …");
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+
     println!("probe 通过 ✔");
     Ok(())
 }

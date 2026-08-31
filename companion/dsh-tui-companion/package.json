@@ -1,0 +1,16 @@
+{
+  "name": "dsh-tui-companion",
+  "version": "0.1.0",
+  "description": "dsh-tui companion host plugin: auto-attach ACP-created sessions to the shared workspace registry by cwd, so TUI sessions group with web-side projects",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin"
+  ],
+  "license": "MIT"
+}

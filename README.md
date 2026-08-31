@@ -94,6 +94,44 @@ profile，模型是**会话级**状态（dsh acp 新会话默认走 profile 配�
 
 > 鼠标捕获开启后，Windows Terminal 中需 `Shift`+拖拽 才可选择终端文本（TUI 惯例）。
 
+### 与 web 端共用 `~/.dsh`（配置/插件/工作区）
+
+**天生共享**（home 级，所有 profile 通用）：`settings.yaml`、凭证、agent presets、
+skills、会话存储、工作区注册表（`storages/workspace.json`）、附件。
+
+**按 profile 隔离**（设计如此）：树外插件（各自 `node_modules`）、
+`cordis.patch.yml` 补丁层、bundle 列表。同步方式（已在本机执行）：
+
+```sh
+dsh plugin --profile acp add "@tt-a1i/archify-dsh@^0.1.0"        # bundle 级插件
+dsh plugin --profile acp add "link:C:/Users/Mayn/Desktop/dsh-token-stats"  # 本地源码 link
+dsh plugin --profile acp add "link:C:/Users/Mayn/Desktop/dsh-tui-rust/companion/dsh-tui-companion"
+```
+
+acp profile 的 `cordis.patch.yml` 挂载了：
+
+- `@deepseek-ai/dsh-workspace` — base 已带全部前置（storage/persistence），只缺这一行
+- `dsh-tui-companion`（本仓库 `companion/`，见下）
+- 从 web patch 镜像的 Exa MCP + token-stats（TUI 会话的工具调用同样计入用量统计）
+
+**模型选择是会话级状态**，web 与 TUI 互不同步是设计行为；TUI 侧的补偿见上文
+偏好持久化（`~/.dsh-tui/prefs.json`）。
+
+### companion 插件（工作区自动归组）
+
+web 端创建会话时由客户端显式携带 workspaceId；ACP 协议没有这个面，且 registry
+只在首次初始化时归组历史——所以 TUI 会话天生落"未分组"。`companion/dsh-tui-companion`
+（挂载在 acp profile）补上这块：
+
+- 按 canonical cwd 把会话 attach 到注册过的工作区（`Workspace.attachSession`
+  幂等且 mismatch 拒绝不写入，天然安全）
+- 实时路径：`session/event` 首事件即归组；兜底：启动后 3s/10s/30s + 每 60s 对账
+- 顺带清理历史遗留：任何 surface 产生的未分组会话，只要 cwd 匹配已注册工作区
+  就会被归组（子代理会话跳过）
+
+> 已实测：TUI 新会话实时进入 `dsh-tui-rust` 工作区；历史遗留的 web/TUI 会话
+> 被批量归组（File_Manager_Legacy 36→46、dsh-tui-rust 1→29）。
+
 ### 已知限制（Phase 1）
 
 - 正文按纯文本渲染（markdown/高亮留给 Phase 2）；思考流为暗色文本
