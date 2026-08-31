@@ -7,9 +7,12 @@
 
 mod acp;
 mod app;
+mod theme;
 mod ui;
 
 use anyhow::Result;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::ExecutableCommand;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,8 +22,12 @@ async fn main() -> Result<()> {
     }
 
     let terminal = ratatui::init();
+    let mouse_ok = std::io::stdout().execute(EnableMouseCapture).is_ok();
     let result = app::run(terminal).await;
     ratatui::restore();
+    if mouse_ok {
+        let _ = std::io::stdout().execute(DisableMouseCapture);
+    }
 
     match result? {
         None => Ok(()),

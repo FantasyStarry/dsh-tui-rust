@@ -1,14 +1,19 @@
-//! Application state and the event loop merging keyboard events with ACP events.
+//! Application state and the event loop merging keyboard/mouse events with
+//! ACP events.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::time::Instant;
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Span;
 use ratatui::DefaultTerminal;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::acp::{short_id, AcpClient, AcpEvent, ListedSession, PermOption};
+use crate::theme as t;
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +29,8 @@ pub enum EntryKind {
 pub struct Entry {
     pub kind: EntryKind,
     pub text: String,
+    /// Tool entries only: the current status word (drives the status dot).
+    pub status: Option<String>,
 }
 
 #[derive(Clone)]
@@ -64,8 +71,10 @@ pub struct App {
     pub usage: Option<(u64, u64)>,
     pub state: RunState,
     pub fatal: Option<String>,
+    /// When the in-flight prompt started (drives the elapsed timer + spinner).
+    pub busy_since: Option<Instant>,
     /// Flattened, wrapped display lines (rebuilt lazily on change/resize).
-    pub display: Vec<(EntryKind, String)>,
+    pub display: Vec<Vec<Span<'static>>>,
 
     quit: bool,
 
@@ -93,6 +102,7 @@ impl App {
             usage: None,
             state: RunState::Booting,
             fatal: None,
+            busy_since: Some(Instant::now()),
             display: Vec::new(),
             quit: false,
             history: Vec::new(),
@@ -105,8 +115,7 @@ impl App {
             dirty: true,
             last_width: 0,
         };
-        app.sysnote("dsh-tui v0.1.0 Phase 1 — 正在连接 dsh 内核…");
-        app.sysnote("输入消息后回车发送 · /list 会话列表 · /new 新会话 · Ctrl+C 退出");
+        app.sysnote("dsh-tui v0.1.0 — 正在连接 dsh 内核…");
         app
     }
 
@@ -115,14 +124,14 @@ impl App {
     }
 
     fn push_entry(&mut self, kind: EntryKind, text: &str) {
-        self.entries.push(Entry { kind, text: text.to_string() });
+        self.entries.push(Entry { kind, text: text.to_string(), status: None });
         self.dirty = true;
     }
 
     fn append_chunk(&mut self, kind: EntryKind, text: &str) {
         match self.entries.last_mut() {
             Some(e) if e.kind == kind => e.text.push_str(text),
-            _ => self.entries.push(Entry { kind, text: text.to_string() }),
+            _ => self.entries.push(Entry { kind, text: text.to_string(), status: None }),
         }
         self.dirty = true;
     }
@@ -138,37 +147,71 @@ impl App {
         }
     }
 
-    fn tool_line(title: &str, kind: &str, status: &str) -> String {
-        let mut s = format!("⚙ {title}");
-        if !kind.is_empty() {
-            s.push_str(&format!(" [{kind}]"));
+    fn scroll_by(&mut self, delta: i16) {
+        if delta >= 0 {
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(delta as u16);
+        } else {
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub((-delta) as u16);
         }
-        s.push_str(&format!(" · {status}"));
-        s
     }
 
     /// Rebuild the wrapped display lines when dirty or on resize.
+    /// Each entry becomes a set of span lines; visual hints (hairline rule
+    /// before a user turn) are inserted here too.
     pub fn ensure_display(&mut self, width: u16) {
         let w = width.max(10) as usize;
         if !self.dirty && self.last_width == width {
             return;
         }
-        let mut out = Vec::new();
+        let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+        let mut seen_content = false;
         for e in &self.entries {
-            let prefix = label_for(e.kind);
-            let mut first = true;
-            for raw in e.text.split('\n') {
-                let text = if first {
-                    format!("{prefix}{raw}")
-                } else {
-                    format!("  {raw}")
-                };
-                for line in wrap(&text, w) {
-                    out.push((e.kind, line));
+            match e.kind {
+                EntryKind::User => {
+                    if seen_content {
+                        out.push(vec![Span::styled("─".repeat(w), t::plain(t::HAIRLINE))]);
+                        out.push(vec![]);
+                    }
+                    seen_content = true;
+                    let spans = vec![
+                        Span::styled("❯ ".to_string(), t::bold(t::ACCENT)),
+                        Span::styled(e.text.clone(), t::bold(t::FG)),
+                    ];
+                    push_wrapped(&mut out, &spans, "  ", t::bold(t::FG), w);
                 }
-                first = false;
+                EntryKind::Agent => {
+                    seen_content = true;
+                    let spans = vec![Span::styled(e.text.clone(), t::plain(t::FG))];
+                    push_wrapped(&mut out, &spans, "  ", t::plain(t::FG), w);
+                }
+                EntryKind::Thought => {
+                    let spans = vec![Span::styled(
+                        e.text.clone(),
+                        t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                    )];
+                    push_wrapped(&mut out, &spans, "✻ ", t::plain(t::DIM), w);
+                }
+                EntryKind::Tool => {
+                    seen_content = true;
+                    let mut spans = vec![
+                        Span::styled("❯ ".to_string(), t::plain(t::ACCENT)),
+                        Span::styled(format!("{} ", e.text), t::plain(t::FG)),
+                    ];
+                    match &e.status {
+                        Some(s) => spans.push(Span::styled(
+                            format!("● {s}"),
+                            t::plain(t::status_color(s)),
+                        )),
+                        None => spans.push(Span::styled("● …", t::plain(t::MUTED))),
+                    }
+                    push_wrapped(&mut out, &spans, "  ", t::plain(t::FG), w);
+                }
+                EntryKind::System => {
+                    let spans = vec![Span::styled(e.text.clone(), t::plain(t::DIM))];
+                    push_wrapped(&mut out, &spans, "· ", t::plain(t::DIM), w);
+                }
             }
-            out.push((e.kind, String::new()));
+            out.push(vec![]);
         }
         self.display = out;
         self.dirty = false;
@@ -176,33 +219,73 @@ impl App {
     }
 }
 
-fn label_for(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::User => "❯ ",
-        EntryKind::Agent => "  ",
-        EntryKind::Thought => "◆ ",
-        EntryKind::Tool => "",
-        EntryKind::System => "· ",
-    }
-}
-
-/// Greedy character wrap using terminal display width (CJK aware).
-fn wrap(text: &str, max: usize) -> Vec<String> {
+/// Char-level wrap that preserves per-span styling (CJK aware).
+fn wrap_spans(spans: &[Span<'static>], max: usize) -> Vec<Vec<(char, Style)>> {
     use unicode_width::UnicodeWidthChar;
+    let mut flat: Vec<(char, Style)> = Vec::new();
+    for s in spans {
+        for ch in s.content.chars() {
+            flat.push((ch, s.style));
+        }
+    }
     let mut lines = Vec::new();
-    let mut cur = String::new();
+    let mut cur: Vec<(char, Style)> = Vec::new();
     let mut w = 0usize;
-    for ch in text.chars() {
+    for (ch, st) in flat {
         let cw = ch.width().unwrap_or(0);
         if w + cw > max && w > 0 {
             lines.push(std::mem::take(&mut cur));
             w = 0;
         }
-        cur.push(ch);
+        cur.push((ch, st));
         w += cw;
     }
     lines.push(cur);
     lines
+}
+
+/// Wrap `spans` to `max` display columns and coalesce adjacent same-style
+/// chars back into styled spans; continuation lines get `cont` (style)
+/// indented by `cont_prefix`.
+fn push_wrapped(
+    out: &mut Vec<Vec<Span<'static>>>,
+    spans: &[Span<'static>],
+    cont_prefix: &str,
+    cont_style: Style,
+    max: usize,
+) {
+    let lines = wrap_spans(spans, max);
+    let mut iter = lines.into_iter().peekable();
+    while let Some(line) = iter.next() {
+        let coalesced = coalesce(line);
+        if iter.peek().is_none() {
+            // Last (wrapped) line always keeps the full span style.
+            out.push(coalesced);
+        } else {
+            let mut l = vec![Span::styled(cont_prefix.to_string(), cont_style)];
+            l.extend(coalesced);
+            out.push(l);
+        }
+    }
+}
+
+fn coalesce(line: Vec<(char, Style)>) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut iter = line.into_iter().peekable();
+    while let Some((ch, st)) = iter.next() {
+        let mut s = String::new();
+        s.push(ch);
+        while let Some(&(c2, st2)) = iter.peek() {
+            if st2 == st {
+                s.push(c2);
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        out.push(Span::styled(s, st));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +320,8 @@ pub async fn run(
         });
     }
 
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+
     ui::draw(&mut terminal, &mut app)?;
     loop {
         tokio::select! {
@@ -252,6 +337,7 @@ pub async fn run(
                 }
                 None => break,
             },
+            _ = tick.tick() => {}
         }
         if app.quit_requested() {
             break;
@@ -273,11 +359,19 @@ impl App {
 }
 
 // ---------------------------------------------------------------------------
-// Keyboard handling
+// Keyboard / mouse handling
 // ---------------------------------------------------------------------------
 
 async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), anyhow::Error> {
     let key = match ev {
+        Event::Mouse(m) => {
+            match m.kind {
+                MouseEventKind::ScrollUp => app.scroll_by(3),
+                MouseEventKind::ScrollDown => app.scroll_by(-3),
+                _ => {}
+            }
+            return Ok(());
+        }
         Event::Key(k) if k.kind == KeyEventKind::Press => k,
         Event::Resize(_, _) => {
             app.dirty = true;
@@ -356,10 +450,16 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
             new_session(app, client).await;
         }
         KeyCode::PageUp => {
-            app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(10);
+            app.scroll_by(10);
         }
         KeyCode::PageDown => {
-            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(10);
+            app.scroll_by(-10);
+        }
+        KeyCode::Home => {
+            app.scroll_from_bottom = u16::MAX;
+        }
+        KeyCode::End => {
+            app.scroll_from_bottom = 0;
         }
         KeyCode::Esc => {
             if app.state == RunState::Busy {
@@ -406,6 +506,7 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
             app.hist_cursor = None;
             app.input.clear();
             app.state = RunState::Busy;
+            app.busy_since = Some(Instant::now());
             client.prompt(sid, text);
         }
         KeyCode::Backspace => {
@@ -470,6 +571,7 @@ async fn new_session(app: &mut App, client: &AcpClient) {
             app.tool_meta.clear();
             app.usage = None;
             app.scroll_from_bottom = 0;
+            app.busy_since = None;
             app.dirty = true;
             app.sysnote(&format!("新会话已创建 {}", short_id(&sid)));
         }
@@ -499,6 +601,7 @@ async fn resume_session(app: &mut App, client: &AcpClient, item: ListedSession) 
             app.tool_meta.clear();
             app.scroll_from_bottom = 0;
             app.usage = None;
+            app.busy_since = None;
             app.dirty = true;
             app.sysnote(&format!(
                 "已恢复会话 {}（ACP 不回放历史内容，但对话上下文已在内核恢复，可继续对话）",
@@ -524,10 +627,12 @@ fn handle_acp(app: &mut App, ev: AcpEvent) -> bool {
     match ev {
         AcpEvent::SessionCreated { session_id } => {
             app.session_id = Some(session_id.clone());
+            app.busy_since = None;
             if app.state == RunState::Booting {
                 app.state = RunState::Idle;
             }
             app.sysnote(&format!("会话就绪 {}", short_id(&session_id)));
+            app.sysnote("输入消息后回车发送 · /list 会话 · /new 新建 · Ctrl+C 退出");
             false
         }
         AcpEvent::MessageChunk(t) => {
@@ -539,8 +644,12 @@ fn handle_acp(app: &mut App, ev: AcpEvent) -> bool {
             false
         }
         AcpEvent::ToolCall { tool_call_id, title, kind, status } => {
-            let line = App::tool_line(&title, &kind, &status);
-            app.entries.push(Entry { kind: EntryKind::Tool, text: line });
+            let text = if kind.is_empty() {
+                title.clone()
+            } else {
+                format!("{title} [{kind}]")
+            };
+            app.entries.push(Entry { kind: EntryKind::Tool, text, status: Some(status.clone()) });
             app.tool_idx.insert(tool_call_id.clone(), app.entries.len() - 1);
             app.tool_meta.insert(tool_call_id, ToolMeta { title, kind, status });
             app.dirty = true;
@@ -555,7 +664,13 @@ fn handle_acp(app: &mut App, ev: AcpEvent) -> bool {
                     if let Some(s) = status {
                         meta.status = s;
                     }
-                    app.entries[idx].text = App::tool_line(&meta.title, &meta.kind, &meta.status);
+                    let text = if meta.kind.is_empty() {
+                        meta.title.clone()
+                    } else {
+                        format!("{} [{}]", meta.title, meta.kind)
+                    };
+                    app.entries[idx].text = text;
+                    app.entries[idx].status = Some(meta.status.clone());
                     app.dirty = true;
                 }
             }
@@ -581,6 +696,7 @@ fn handle_acp(app: &mut App, ev: AcpEvent) -> bool {
         }
         AcpEvent::PromptSettled { stop_reason, error } => {
             app.state = RunState::Idle;
+            app.busy_since = None;
             if let Some(err) = error {
                 app.sysnote(&format!("请求失败: {err}"));
             } else if stop_reason == "cancelled" {

@@ -55,14 +55,24 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 |------|------|
 | `Enter` | 发送输入框中的消息（`/quit` `/new` `/list` 斜杠命令） |
 | `Esc` | 任务运行中 → 取消（session/cancel）；否则清空输入 |
-| 权限弹窗 | `↑↓` 选择 · `Enter` 确认（默认首选 allow_once 项）· `Esc` 拒绝 |
+| 权限弹窗 | `↑↓` 选择 · `Enter` 确认（紫色选中条）· `Esc` 拒绝 |
 | `Ctrl+L` 或 `/list` | 持久化会话列表 → `Enter` 恢复（session/resume，需 cwd 校验） |
 | `Ctrl+N` 或 `/new` | 新建会话（旧会话 close 后保留在持久化里） |
-| `PgUp` / `PgDn` | 滚动历史；有新内容且在底部时自动跟随 |
+| `鼠标滚轮` / `PgUp` / `PgDn` | 滚动历史；状态栏显示滚动标尺；回到底部自动跟随 |
+| `Home` / `End` | 跳到顶部 / 底部 |
 | `↑` / `↓` | 输入历史 |
 | `Ctrl+C` | 退出（stdin EOF 触发 dsh 优雅关机） |
 
-状态栏显示：运行状态 · 当前模型 · 上下文占用（usage_update）· 会话短 ID。
+视觉语言（基于 gpt-image-2 生成的设计稿，本地 `design/` 参考，不入库）：
+
+- 顶栏：🐋 + 渐变字标 DSH·TUI，右侧模型药丸 + 上下文进度条（>70% 变黄、>90% 变红）
+- 转写区：蓝色 `❯` 用户前缀、暗色斜体思考行、青色工具行 + 彩色状态点
+  （completed 绿 / failed 红 / running 黄）、回合间发丝分隔线
+- 状态行：状态点 + braille spinner + 运行计时 + 滚动标尺，右侧 keycap 风格按键提示
+- 输入框：圆角紫边 + 蓝色 `❯` + 占位符；运行时边框变黄
+- 弹窗：圆角边框 + 全宽紫色选中条（权限/会话列表共用）
+
+> 鼠标捕获开启后，Windows Terminal 中需 `Shift`+拖拽 才可选择终端文本（TUI 惯例）。
 
 ### 已知限制（Phase 1）
 
