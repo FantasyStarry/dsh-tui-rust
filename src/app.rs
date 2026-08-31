@@ -12,7 +12,9 @@ use ratatui::DefaultTerminal;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::acp::{short_id, AcpClient, AcpEvent, ListedSession, PermOption};
+use crate::acp::{
+    short_id, AcpClient, AcpEvent, ConfigChoice, ConfigOptionState, ListedSession, PermOption,
+};
 use crate::theme as t;
 use crate::ui;
 
@@ -31,6 +33,8 @@ pub struct Entry {
     pub text: String,
     /// Tool entries only: the current status word (drives the status dot).
     pub status: Option<String>,
+    /// Tool entries only: clipped rawInput preview (the actual command/args).
+    pub detail: Option<String>,
 }
 
 #[derive(Clone)]
@@ -52,6 +56,13 @@ pub enum Dialog {
         items: Vec<ListedSession>,
         selected: usize,
     },
+    Config {
+        id: String,
+        title: String,
+        current: String,
+        choices: Vec<ConfigChoice>,
+        selected: usize,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,7 +78,7 @@ pub struct App {
     pub scroll_from_bottom: u16,
     pub dialog: Dialog,
     pub session_id: Option<String>,
-    pub model: Option<String>,
+    pub config: Vec<ConfigOptionState>,
     pub usage: Option<(u64, u64)>,
     pub state: RunState,
     pub fatal: Option<String>,
@@ -77,6 +88,9 @@ pub struct App {
     pub display: Vec<Vec<Span<'static>>>,
 
     quit: bool,
+
+    /// Messages typed while a prompt is in flight; drained on settlement.
+    queue: VecDeque<String>,
 
     history: Vec<String>,
     hist_cursor: Option<usize>,
@@ -98,13 +112,14 @@ impl App {
             scroll_from_bottom: 0,
             dialog: Dialog::None,
             session_id: None,
-            model: None,
+            config: Vec::new(),
             usage: None,
             state: RunState::Booting,
             fatal: None,
             busy_since: Some(Instant::now()),
             display: Vec::new(),
             quit: false,
+            queue: VecDeque::new(),
             history: Vec::new(),
             hist_cursor: None,
             queued_permissions: Vec::new(),
@@ -124,16 +139,39 @@ impl App {
     }
 
     fn push_entry(&mut self, kind: EntryKind, text: &str) {
-        self.entries.push(Entry { kind, text: text.to_string(), status: None });
+        self.entries.push(Entry { kind, text: text.to_string(), status: None, detail: None });
         self.dirty = true;
     }
 
     fn append_chunk(&mut self, kind: EntryKind, text: &str) {
         match self.entries.last_mut() {
             Some(e) if e.kind == kind => e.text.push_str(text),
-            _ => self.entries.push(Entry { kind, text: text.to_string(), status: None }),
+            _ => self.entries.push(Entry {
+                kind,
+                text: text.to_string(),
+                status: None,
+                detail: None,
+            }),
         }
         self.dirty = true;
+    }
+
+    /// Pretty model name from the model selector's currentValue
+    /// (`"[\"provider\",\"model\"]"` → `model`).
+    pub fn model_label(&self) -> Option<String> {
+        let c = self.config.iter().find(|c| c.id == "model")?;
+        let cur = c.current.trim();
+        if cur.is_empty() {
+            return None;
+        }
+        if let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(cur) {
+            return parts.last().and_then(|v| v.as_str()).map(String::from);
+        }
+        Some(cur.to_string())
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queue.len()
     }
 
     fn note_line(&mut self, line: &str) {
@@ -157,7 +195,8 @@ impl App {
 
     /// Rebuild the wrapped display lines when dirty or on resize.
     /// Each entry becomes a set of span lines; visual hints (hairline rule
-    /// before a user turn) are inserted here too.
+    /// before a user turn) are inserted here too. Agent text goes through a
+    /// markdown-lite pass (fences, headings, bullets, inline code/bold).
     pub fn ensure_display(&mut self, width: u16) {
         let w = width.max(10) as usize;
         if !self.dirty && self.last_width == width {
@@ -173,23 +212,47 @@ impl App {
                         out.push(vec![]);
                     }
                     seen_content = true;
-                    let spans = vec![
-                        Span::styled("❯ ".to_string(), t::bold(t::ACCENT)),
-                        Span::styled(e.text.clone(), t::bold(t::FG)),
-                    ];
-                    push_wrapped(&mut out, &spans, "  ", t::bold(t::FG), w);
+                    for (i, seg) in e.text.split('\n').enumerate() {
+                        let mut spans = Vec::new();
+                        if i == 0 {
+                            spans.push(Span::styled("❯ ".to_string(), t::bold(t::ACCENT)));
+                        } else {
+                            spans.push(Span::styled("  ".to_string(), t::bold(t::FG)));
+                        }
+                        spans.push(Span::styled(seg.to_string(), t::bold(t::FG)));
+                        push_wrapped(&mut out, &spans, "  ", t::bold(t::FG), w);
+                    }
                 }
                 EntryKind::Agent => {
                     seen_content = true;
-                    let spans = vec![Span::styled(e.text.clone(), t::plain(t::FG))];
-                    push_wrapped(&mut out, &spans, "  ", t::plain(t::FG), w);
+                    for line in markdown_spans(&e.text) {
+                        if line.is_empty() {
+                            out.push(vec![]);
+                        } else {
+                            push_wrapped(&mut out, &line, "  ", t::plain(t::FG), w);
+                        }
+                    }
                 }
                 EntryKind::Thought => {
-                    let spans = vec![Span::styled(
-                        e.text.clone(),
-                        t::plain(t::DIM).add_modifier(Modifier::ITALIC),
-                    )];
-                    push_wrapped(&mut out, &spans, "✻ ", t::plain(t::DIM), w);
+                    for (i, seg) in e.text.split('\n').enumerate() {
+                        let mut spans = Vec::new();
+                        if i == 0 {
+                            spans.push(Span::styled(
+                                "✻ ".to_string(),
+                                t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                            ));
+                        } else {
+                            spans.push(Span::styled(
+                                "  ".to_string(),
+                                t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                            ));
+                        }
+                        spans.push(Span::styled(
+                            seg.to_string(),
+                            t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                        ));
+                        push_wrapped(&mut out, &spans, "  ", t::plain(t::DIM), w);
+                    }
                 }
                 EntryKind::Tool => {
                     seen_content = true;
@@ -205,10 +268,25 @@ impl App {
                         None => spans.push(Span::styled("● …", t::plain(t::MUTED))),
                     }
                     push_wrapped(&mut out, &spans, "  ", t::plain(t::FG), w);
+                    if let Some(detail) = &e.detail {
+                        let d = vec![
+                            Span::styled("  ⤷ ".to_string(), t::plain(t::HAIRLINE)),
+                            Span::styled(detail.clone(), t::plain(t::DIM)),
+                        ];
+                        push_wrapped(&mut out, &d, "    ", t::plain(t::DIM), w);
+                    }
                 }
                 EntryKind::System => {
-                    let spans = vec![Span::styled(e.text.clone(), t::plain(t::DIM))];
-                    push_wrapped(&mut out, &spans, "· ", t::plain(t::DIM), w);
+                    for (i, seg) in e.text.split('\n').enumerate() {
+                        let mut spans = Vec::new();
+                        if i == 0 {
+                            spans.push(Span::styled("· ".to_string(), t::plain(t::DIM)));
+                        } else {
+                            spans.push(Span::styled("  ".to_string(), t::plain(t::DIM)));
+                        }
+                        spans.push(Span::styled(seg.to_string(), t::plain(t::DIM)));
+                        push_wrapped(&mut out, &spans, "  ", t::plain(t::DIM), w);
+                    }
                 }
             }
             out.push(vec![]);
@@ -242,6 +320,110 @@ fn wrap_spans(spans: &[Span<'static>], max: usize) -> Vec<Vec<(char, Style)>> {
     }
     lines.push(cur);
     lines
+}
+
+// ---------------------------------------------------------------------------
+// Markdown-lite for agent text: fenced code blocks, headings, bullets,
+// quotes, inline `code` and **bold**. Deliberately conservative — anything
+// unrecognized renders as plain text.
+// ---------------------------------------------------------------------------
+
+fn markdown_spans(text: &str) -> Vec<Vec<Span<'static>>> {
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut in_code = false;
+    for raw in text.split('\n') {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            let lang = trimmed.trim_start_matches('`').trim();
+            let edge = if in_code { "╭" } else { "╰" };
+            let label = if in_code && !lang.is_empty() {
+                format!("{edge}─── {lang} ", )
+            } else {
+                format!("{edge}───")
+            };
+            out.push(vec![Span::styled(label, t::plain(t::HAIRLINE))]);
+            continue;
+        }
+        if in_code {
+            out.push(vec![
+                Span::styled("  │ ".to_string(), t::plain(t::HAIRLINE)),
+                Span::styled(line.to_string(), t::plain(t::CODE_FG)),
+            ]);
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            let stripped = trimmed.trim_start_matches('#').trim_start();
+            out.push(vec![
+                Span::styled("  ".to_string(), t::plain(t::FG)),
+                Span::styled(stripped.to_string(), t::bold(t::ACCENT)),
+            ]);
+            continue;
+        }
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+            let indent_len = raw.len() - trimmed.len();
+            let indent = " ".repeat(indent_len.min(6));
+            out.push(inline_spans(
+                &format!("{indent}• {}", &trimmed[2..]),
+                t::plain(t::FG),
+            ));
+            continue;
+        }
+        if let Some(quoted) = trimmed.strip_prefix("> ") {
+            out.push(inline_spans(
+                &format!("▌ {quoted}"),
+                t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+            ));
+            continue;
+        }
+        if trimmed.is_empty() {
+            out.push(vec![]);
+            continue;
+        }
+        out.push(inline_spans(line, t::plain(t::FG)));
+    }
+    out
+}
+
+/// Inline markdown: `code` → accent, **bold** → bold. Unclosed markers stay
+/// literal (streaming-friendly: partial chunks render as plain text).
+fn inline_spans(s: &str, base: Style) -> Vec<Span<'static>> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    let flush = |cur: &mut String, out: &mut Vec<Span<'static>>, style: Style| {
+        if !cur.is_empty() {
+            out.push(Span::styled(std::mem::take(cur), style));
+        }
+    };
+    while i < chars.len() {
+        if chars[i] == '`' {
+            if let Some(end) = (i + 1..chars.len()).find(|&j| chars[j] == '`') {
+                flush(&mut cur, &mut out, base);
+                let code: String = chars[i + 1..end].iter().collect();
+                out.push(Span::styled(code, t::plain(t::CODE_FG)));
+                i = end + 1;
+                continue;
+            }
+        }
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            if let Some(end) = (i + 2..chars.len()).find(|&j| j + 1 < chars.len() && chars[j] == '*' && chars[j + 1] == '*') {
+                flush(&mut cur, &mut out, base);
+                let bolded: String = chars[i + 2..end].iter().collect();
+                if !bolded.is_empty() {
+                    out.push(Span::styled(bolded, base.add_modifier(Modifier::BOLD)));
+                }
+                i = end + 2;
+                continue;
+            }
+        }
+        cur.push(chars[i]);
+        i += 1;
+    }
+    flush(&mut cur, &mut out, base);
+    out
 }
 
 /// Wrap `spans` to `max` display columns and coalesce adjacent same-style
@@ -314,7 +496,10 @@ pub async fn run(
         let cwd = app.cwd.clone();
         tokio::spawn(async move {
             match client2.new_session(&cwd).await {
-                Ok(sid) => client2.emit(AcpEvent::SessionCreated { session_id: sid }),
+                Ok((sid, cfg)) => {
+                    client2.emit(AcpEvent::ConfigUpdated(cfg));
+                    client2.emit(AcpEvent::SessionCreated { session_id: sid });
+                }
                 Err(e) => client2.emit(AcpEvent::ServerGone(format!("创建会话失败: {e:#}"))),
             }
         });
@@ -331,7 +516,7 @@ pub async fn run(
             },
             e = acp_rx.recv() => match e {
                 Some(ev) => {
-                    if handle_acp(&mut app, ev) {
+                    if handle_acp(&mut app, &client, ev) {
                         break;
                     }
                 }
@@ -441,6 +626,35 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
         return Ok(());
     }
 
+    // --- config (model / effort) dialog ------------------------------------
+    if let Dialog::Config { id, title, choices, selected, .. } = &mut app.dialog {
+        match key.code {
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if *selected + 1 < choices.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let Some(choice) = choices.get(*selected).cloned() else {
+                    return Ok(());
+                };
+                let (id, title) = (id.clone(), title.clone());
+                app.dialog = Dialog::None;
+                apply_config(app, client, &id, &title, choice).await;
+                advance_permission_queue(app);
+            }
+            KeyCode::Esc => {
+                app.dialog = Dialog::None;
+                advance_permission_queue(app);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // --- main mode ----------------------------------------------------------
     match key.code {
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -448,6 +662,12 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
         }
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             new_session(app, client).await;
+        }
+        KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            open_config(app, "model", "模型");
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            open_config(app, "reasoning_effort", "推理档位");
         }
         KeyCode::PageUp => {
             app.scroll_by(10);
@@ -469,6 +689,9 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                 }
             } else if !app.input.is_empty() {
                 app.input.clear();
+            } else if app.queue_len() > 0 {
+                app.queue.clear();
+                app.sysnote("已清空排队消息");
             }
         }
         KeyCode::Enter => {
@@ -491,10 +714,25 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                     open_sessions(app, client).await;
                     return Ok(());
                 }
+                "/model" => {
+                    app.input.clear();
+                    open_config(app, "model", "模型");
+                    return Ok(());
+                }
+                "/effort" => {
+                    app.input.clear();
+                    open_config(app, "reasoning_effort", "推理档位");
+                    return Ok(());
+                }
                 _ => {}
             }
             if app.state == RunState::Busy {
-                app.sysnote("请等待当前任务完成，或按 Esc 取消");
+                // dsh allows one in-flight prompt per session; queue instead.
+                app.queue.push_back(text.clone());
+                app.history.push(text.clone());
+                app.hist_cursor = None;
+                app.input.clear();
+                app.sysnote(&format!("已排队（第 {} 条，完成后自动发送）", app.queue_len()));
                 return Ok(());
             }
             let Some(sid) = app.session_id.clone() else {
@@ -553,6 +791,42 @@ async fn open_sessions(app: &mut App, client: &AcpClient) {
     }
 }
 
+/// Open the model / reasoning-effort picker from the advertised config state.
+fn open_config(app: &mut App, id: &str, title: &str) {
+    let Some(opt) = app.config.iter().find(|c| c.id == id) else {
+        app.sysnote("配置尚未就绪（会话还在初始化？）");
+        return;
+    };
+    if opt.options.is_empty() {
+        app.sysnote(&format!("{title}：没有可选项"));
+        return;
+    }
+    app.dialog = Dialog::Config {
+        id: opt.id.clone(),
+        title: title.to_string(),
+        current: opt.current.clone(),
+        choices: opt.options.clone(),
+        selected: 0,
+    };
+}
+
+async fn apply_config(app: &mut App, client: &AcpClient, id: &str, title: &str, choice: ConfigChoice) {
+    let Some(sid) = app.session_id.clone() else {
+        app.sysnote("会话尚未就绪");
+        return;
+    };
+    app.sysnote(&format!("正在切换{title} → {}…", choice.name));
+    match client.set_config_option(&sid, id, &choice.value).await {
+        Ok(cfg) => {
+            if !cfg.is_empty() {
+                app.config = cfg;
+            }
+            app.sysnote(&format!("{title}已切换 → {}", choice.name));
+        }
+        Err(e) => app.sysnote(&format!("切换失败: {e:#}")),
+    }
+}
+
 async fn new_session(app: &mut App, client: &AcpClient) {
     if app.state == RunState::Busy {
         app.sysnote("任务运行中，无法新建会话");
@@ -561,7 +835,10 @@ async fn new_session(app: &mut App, client: &AcpClient) {
     app.sysnote("正在创建新会话…");
     let old = app.session_id.clone();
     match client.new_session(&app.cwd).await {
-        Ok(sid) => {
+        Ok((sid, cfg)) => {
+            if !cfg.is_empty() {
+                app.config = cfg;
+            }
             if let Some(o) = old {
                 let _ = client.close_session(&o).await;
             }
@@ -623,7 +900,7 @@ fn advance_permission_queue(app: &mut App) {
 // ACP event handling — returns true when the loop should exit
 // ---------------------------------------------------------------------------
 
-fn handle_acp(app: &mut App, ev: AcpEvent) -> bool {
+fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
     match ev {
         AcpEvent::SessionCreated { session_id } => {
             app.session_id = Some(session_id.clone());
@@ -632,7 +909,7 @@ fn handle_acp(app: &mut App, ev: AcpEvent) -> bool {
                 app.state = RunState::Idle;
             }
             app.sysnote(&format!("会话就绪 {}", short_id(&session_id)));
-            app.sysnote("输入消息后回车发送 · /list 会话 · /new 新建 · Ctrl+C 退出");
+            app.sysnote("输入消息后回车发送 · /model 切模型 · /list 会话 · Ctrl+C 退出");
             false
         }
         AcpEvent::MessageChunk(t) => {
@@ -643,15 +920,23 @@ fn handle_acp(app: &mut App, ev: AcpEvent) -> bool {
             app.append_chunk(EntryKind::Thought, &t);
             false
         }
-        AcpEvent::ToolCall { tool_call_id, title, kind, status } => {
+        AcpEvent::ToolCall { tool_call_id, title, kind, status, raw } => {
             let text = if kind.is_empty() {
                 title.clone()
             } else {
                 format!("{title} [{kind}]")
             };
-            app.entries.push(Entry { kind: EntryKind::Tool, text, status: Some(status.clone()) });
+            app.entries.push(Entry {
+                kind: EntryKind::Tool,
+                text,
+                status: Some(status.clone()),
+                detail: raw,
+            });
             app.tool_idx.insert(tool_call_id.clone(), app.entries.len() - 1);
-            app.tool_meta.insert(tool_call_id, ToolMeta { title, kind, status });
+            app.tool_meta.insert(
+                tool_call_id,
+                ToolMeta { title, kind, status },
+            );
             app.dirty = true;
             false
         }
@@ -680,9 +965,9 @@ fn handle_acp(app: &mut App, ev: AcpEvent) -> bool {
             app.usage = Some((used, size));
             false
         }
-        AcpEvent::ModelChanged(m) => {
-            if m.is_some() {
-                app.model = m;
+        AcpEvent::ConfigUpdated(cfg) => {
+            if !cfg.is_empty() {
+                app.config = cfg;
             }
             false
         }
@@ -697,12 +982,20 @@ fn handle_acp(app: &mut App, ev: AcpEvent) -> bool {
         AcpEvent::PromptSettled { stop_reason, error } => {
             app.state = RunState::Idle;
             app.busy_since = None;
-            if let Some(err) = error {
-                app.sysnote(&format!("请求失败: {err}"));
-            } else if stop_reason == "cancelled" {
-                app.sysnote("已取消");
-            } else {
-                app.sysnote(&format!("— 完成（{stop_reason}）—"));
+            match &error {
+                Some(err) => app.sysnote(&format!("请求失败: {err}")),
+                None if stop_reason == "cancelled" => app.sysnote("已取消"),
+                None => app.sysnote(&format!("— 完成（{stop_reason}）—")),
+            }
+            // Drain the queue: send the next queued message, if any.
+            if error.is_none() && !app.queue.is_empty() {
+                if let Some(sid) = app.session_id.clone() {
+                    let next = app.queue.pop_front().expect("checked non-empty");
+                    app.push_entry(EntryKind::User, &next);
+                    app.state = RunState::Busy;
+                    app.busy_since = Some(Instant::now());
+                    client.prompt(sid, next);
+                }
             }
             false
         }

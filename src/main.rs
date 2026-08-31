@@ -50,8 +50,15 @@ async fn probe() -> Result<()> {
     );
 
     let cwd = std::env::current_dir()?;
-    let sid = client.new_session(&cwd).await?;
+    let (sid, config) = client.new_session(&cwd).await?;
     println!("session/new: {sid}");
+    if let Some(model) = config.iter().find(|c| c.id == "model") {
+        println!("model options: {} 个，当前 {}", model.options.len(), model.current);
+        // Validate the set_config_option call shape with a no-op set to the
+        // current value (the wire contract is dsh-specific).
+        let cfg = client.set_config_option(&sid, "model", &model.current).await?;
+        println!("set_config_option(no-op): ok, {} 个配置项", cfg.len());
+    }
 
     let sessions = client.list_sessions().await?;
     println!("session/list: {} 个持久化会话", sessions.len());

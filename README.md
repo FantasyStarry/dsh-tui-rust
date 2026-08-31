@@ -53,9 +53,12 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 
 | 按键 | 作用 |
 |------|------|
-| `Enter` | 发送输入框中的消息（`/quit` `/new` `/list` 斜杠命令） |
-| `Esc` | 任务运行中 → 取消（session/cancel）；否则清空输入 |
+| `Enter` | 发送输入框中的消息（`/quit` `/new` `/list` `/model` `/effort` 斜杠命令） |
+| `Esc` | 任务运行中 → 取消（session/cancel）；输入非空 → 清空；有空闲队列 → 清空队列 |
+| 忙时输入 | 自动**排队**（状态栏显示队列数），当前任务完成后逐条自动发送 |
 | 权限弹窗 | `↑↓` 选择 · `Enter` 确认（紫色选中条）· `Esc` 拒绝 |
+| `Ctrl+M` / `/model` | 模型切换（session/set_config_option，带当前标记；运行中也可切换，下一轮生效） |
+| `Ctrl+E` / `/effort` | 推理档位切换（off/low/high/max） |
 | `Ctrl+L` 或 `/list` | 持久化会话列表 → `Enter` 恢复（session/resume，需 cwd 校验） |
 | `Ctrl+N` 或 `/new` | 新建会话（旧会话 close 后保留在持久化里） |
 | `鼠标滚轮` / `PgUp` / `PgDn` | 滚动历史；状态栏显示滚动标尺；回到底部自动跟随 |
@@ -67,7 +70,10 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 
 - 顶栏：🐋 + 渐变字标 DSH·TUI，右侧模型药丸 + 上下文进度条（>70% 变黄、>90% 变红）
 - 转写区：蓝色 `❯` 用户前缀、暗色斜体思考行、青色工具行 + 彩色状态点
-  （completed 绿 / failed 红 / running 黄）、回合间发丝分隔线
+  （completed 绿 / failed 红 / running 黄）+ 工具实参预览（`⤷` 暗行，来自 rawInput）、
+  回合间发丝分隔线
+- 正文 markdown-lite：``` 代码块带语言标注边框、`行内代码`、**粗体**、标题、
+  列表与引用（保守渲染，识别不了的原样显示，流式安全）
 - 状态行：状态点 + braille spinner + 运行计时 + 滚动标尺，右侧 keycap 风格按键提示
 - 输入框：圆角紫边 + 蓝色 `❯` + 占位符；运行时边框变黄
 - 弹窗：圆角边框 + 全宽紫色选中条（权限/会话列表共用）
@@ -86,8 +92,9 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
       session/update → stopReason → session/close（已实测通过，真实模型回复）
 - [x] **Phase 1 MVP** — ratatui 聊天界面（流式正文/思考/工具卡）、权限弹窗 UI、
       `session/list` / `session/resume`（probe 自检通过；resume 需带 cwd 参数）
-- [ ] **Phase 2** — diff 视图、markdown 渲染、模型/effort 切换
-      （`session/set_config_option`）、主题
+- [x] **可用化里程碑** — 模型/推理档位热切换（`set_config_option`，probe 验证
+      configId 契约）、忙时消息队列、markdown-lite 正文渲染、工具 rawInput 预览
+- [ ] **Phase 2** — diff 视图、完整 markdown/高亮、主题系统
 - [ ] **Phase 3** — companion 插件 bundle（`tui` profile）+ npm 分发（平台预编译二进制）
 
 ## 协议速查（dsh acp surface 实测）
@@ -99,7 +106,7 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 | `session/prompt` | `{sessionId, prompt: [{type: "text", text}]}`，返回 `stopReason` |
 | `session/update`（通知） | `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update` / `config_option_update` / `usage_update` |
 | `session/request_permission`（agent 反向请求） | 需应答 `{outcome: {outcome: "selected", optionId}}` |
-| `session/set_config_option` | 切换 model / reasoning_effort |
+| `session/set_config_option` | `{sessionId, configId, value}`（**configId 而非 configOptionId**，probe 实测），返回完整配置状态；模型选项是嵌套分组结构需拍平；运行中切换对下一轮生效 |
 | `session/list` / `session/resume` / `session/close` | 持久化会话管理；**dsh 的 resume 额外要求 `cwd` 参数**（校验会话规范工作目录，标准 ACP 未定义，缺省返回 -32602） |
 
 dsh acp surface 不支持 client filesystem 操作、elicitation、terminals、modes/plans——

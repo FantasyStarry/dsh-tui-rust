@@ -40,6 +40,7 @@ fn render(f: &mut Frame, app: &mut App) {
     match &app.dialog {
         Dialog::Permission { .. } => draw_permission(f, app),
         Dialog::Sessions { .. } => draw_sessions(f, app),
+        Dialog::Config { .. } => draw_config(f, app),
         Dialog::None => {}
     }
 }
@@ -59,8 +60,8 @@ fn draw_top_bar(f: &mut Frame, app: &App, area: Rect) {
     left.push(Span::styled("  v0.1", plain(DIM)));
 
     let mut right: Vec<Span> = Vec::new();
-    if let Some(m) = &app.model {
-        right.push(theme::pill(m, VIOLET));
+    if let Some(m) = app.model_label() {
+        right.push(theme::pill(&m, VIOLET));
         right.push(Span::raw(" "));
     }
     if let Some((used, size)) = app.usage {
@@ -168,6 +169,9 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
     if app.scroll_from_bottom > 0 {
         left.push(Span::styled(format!(" · ↑{} 行", app.scroll_from_bottom), plain(WARN)));
+    }
+    if app.queue_len() > 0 {
+        left.push(Span::styled(format!(" · 队列 {}", app.queue_len()), plain(WARN)));
     }
     if let Some(sid) = &app.session_id {
         left.push(Span::styled(format!(" · {}", short_id(sid)), plain(DIM)));
@@ -376,6 +380,68 @@ fn draw_sessions(f: &mut Frame, app: &App) {
         Span::styled("Enter 恢复", plain(MUTED)),
         Span::styled(" · ", plain(HAIRLINE)),
         Span::styled("Esc 关闭", plain(MUTED)),
+    ]));
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Config dialog (model / reasoning effort picker)
+// ---------------------------------------------------------------------------
+
+fn draw_config(f: &mut Frame, app: &App) {
+    let Dialog::Config { title, current, choices, selected, .. } = &app.dialog else {
+        return;
+    };
+
+    let screen = f.area();
+    let height = (choices.len() as u16 + 5).clamp(6, screen.height.saturating_sub(2));
+    let width = (screen.width * 56 / 100).clamp(46, screen.width.saturating_sub(2));
+    let area = centered(screen, width, height);
+
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(plain(VIOLET))
+        .title(Line::from(vec![
+            Span::styled(" ⬡ ", bold(VIOLET)),
+            Span::styled(format!("{title} "), bold(VIOLET)),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, c) in choices.iter().enumerate() {
+        let is_current = c.value == *current;
+        let desc = c
+            .description
+            .as_deref()
+            .map(|d| format!("  —  {}", crate::acp::clip(d, 60)))
+            .unwrap_or_default();
+        if i == *selected {
+            let name = if is_current { format!("{}（当前）", c.name) } else { c.name.clone() };
+            let bar = pad_to_width(
+                &format!(" ❯ {name}{desc} "),
+                inner.width.saturating_sub(1) as usize,
+            );
+            lines.push(Line::from(Span::styled(
+                bar,
+                Style::new().bg(VIOLET).fg(BAR_BG).add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            let name = if is_current { format!("{}（当前）", c.name) } else { c.name.clone() };
+            lines.push(Line::from(Span::styled(
+                format!("   {name}{desc}"),
+                plain(MUTED),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" ↑↓ 选择", plain(MUTED)),
+        Span::styled(" · ", plain(HAIRLINE)),
+        Span::styled("Enter 应用", plain(MUTED)),
+        Span::styled(" · ", plain(HAIRLINE)),
+        Span::styled("Esc 取消", plain(MUTED)),
     ]));
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }

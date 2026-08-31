@@ -13,6 +13,7 @@ pub const ERR: Color = Color::Rgb(248, 113, 113); // red
 pub const FG: Color = Color::Rgb(226, 232, 240); // main text
 pub const MUTED: Color = Color::Rgb(148, 163, 184); // hints
 pub const DIM: Color = Color::Rgb(100, 116, 139); // thinking / de-emphasis
+pub const CODE_FG: Color = Color::Rgb(125, 211, 252); // inline/fenced code
 pub const HAIRLINE: Color = Color::Rgb(48, 54, 66); // separators
 pub const PILL_BG: Color = Color::Rgb(30, 38, 52); // pill / keycap background
 pub const BAR_BG: Color = Color::Rgb(13, 17, 23); // selection bar text

@@ -44,10 +44,16 @@ pub enum AcpEvent {
     SessionCreated { session_id: String },
     MessageChunk(String),
     ThoughtChunk(String),
-    ToolCall { tool_call_id: String, title: String, kind: String, status: String },
+    ToolCall {
+        tool_call_id: String,
+        title: String,
+        kind: String,
+        status: String,
+        raw: Option<String>,
+    },
     ToolCallUpdate { tool_call_id: String, title: Option<String>, status: Option<String> },
     Usage { used: u64, size: u64 },
-    ModelChanged(Option<String>),
+    ConfigUpdated(Vec<ConfigOptionState>),
     PermissionRequest { request_id: Value, tool_title: String, options: Vec<PermOption> },
     PromptSettled { stop_reason: String, error: Option<String> },
     ServerGone(String),
@@ -60,6 +66,66 @@ pub struct ListedSession {
     pub cwd: String,
     pub title: Option<String>,
     pub updated_at: Option<String>,
+}
+
+/// One advertised configuration selector (`model`, `reasoning_effort`, …).
+#[derive(Clone, Debug)]
+pub struct ConfigOptionState {
+    pub id: String,
+    pub current: String,
+    pub options: Vec<ConfigChoice>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigChoice {
+    pub name: String,
+    pub value: String,
+    pub description: Option<String>,
+}
+
+/// Parse the `configOptions` payload defensively (session/new result,
+/// `config_option_update` notifications, `set_config_option` responses).
+/// The model selector nests its choices inside group nodes — flatten them.
+pub fn parse_config(v: Option<&Value>) -> Vec<ConfigOptionState> {
+    let Some(arr) = v.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|o| {
+            let mut options = Vec::new();
+            if let Some(raw) = o.get("options").and_then(|x| x.as_array()) {
+                flatten_choices(raw, &mut options);
+            }
+            Some(ConfigOptionState {
+                id: str_field(o, &["id"])?,
+                current: o
+                    .get("currentValue")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                options,
+            })
+        })
+        .collect()
+}
+
+fn flatten_choices(arr: &[Value], out: &mut Vec<ConfigChoice>) {
+    for c in arr {
+        if let Some(inner) = c.get("options").and_then(|x| x.as_array()) {
+            flatten_choices(inner, out);
+        } else if let Some(name) = str_field(c, &["name"]) {
+            let value = match c.get("value") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => continue,
+            };
+            out.push(ConfigChoice {
+                name,
+                value,
+                description: str_field(c, &["description"]),
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,14 +278,35 @@ impl AcpClient {
         .await
     }
 
-    pub async fn new_session(&self, cwd: &Path) -> Result<String> {
+    pub async fn new_session(&self, cwd: &Path) -> Result<(String, Vec<ConfigOptionState>)> {
         let r = self
             .request("session/new", json!({"cwd": cwd, "mcpServers": []}), SESSION_TIMEOUT)
             .await?;
-        if let Some(m) = extract_model(r.get("configOptions")) {
-            let _ = self.inner.events.send(AcpEvent::ModelChanged(Some(m)));
+        let cfg = parse_config(r.get("configOptions"));
+        if !cfg.is_empty() {
+            let _ = self.inner.events.send(AcpEvent::ConfigUpdated(cfg.clone()));
         }
-        session_id_of(&r).context("session/new 未返回 sessionId")    }
+        let sid = session_id_of(&r).context("session/new 未返回 sessionId")?;
+        Ok((sid, cfg))
+    }
+
+    /// Switch an advertised selector (`model`, `reasoning_effort`). dsh allows
+    /// this while a prompt is in flight — the change applies to the next turn.
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOptionState>> {
+        let r = self
+            .request(
+                "session/set_config_option",
+                json!({"sessionId": session_id, "configId": id, "value": value}),
+                SESSION_TIMEOUT,
+            )
+            .await?;
+        Ok(parse_config(r.get("configOptions")))
+    }
 
     pub async fn list_sessions(&self) -> Result<Vec<ListedSession>> {
         let r = self.request("session/list", json!({}), SESSION_TIMEOUT).await?;
@@ -355,11 +442,16 @@ async fn dispatch(inner: &Arc<Inner>, v: Value) {
             }
         }
         "tool_call" => {
+            let raw = update
+                .get("rawInput")
+                .or_else(|| update.get("raw_input"))
+                .map(|v| clip(&v.to_string(), 160));
             let _ = inner.events.send(AcpEvent::ToolCall {
                 tool_call_id: str_field(update, &["toolCallId", "tool_call_id"]).unwrap_or_default(),
                 title: str_field(update, &["title"]).unwrap_or_else(|| "工具调用".into()),
                 kind: str_field(update, &["kind"]).unwrap_or_default(),
                 status: str_field(update, &["status"]).unwrap_or_else(|| "pending".into()),
+                raw,
             });
         }
         "tool_call_update" => {
@@ -376,8 +468,8 @@ async fn dispatch(inner: &Arc<Inner>, v: Value) {
             });
         }
         "config_option_update" => {
-            let model = extract_model(update.get("configOptions"));
-            let _ = inner.events.send(AcpEvent::ModelChanged(model));
+            let cfg = parse_config(update.get("configOptions"));
+            let _ = inner.events.send(AcpEvent::ConfigUpdated(cfg));
         }
         other => {
             let _ = inner.events.send(AcpEvent::Notice(format!(
@@ -415,18 +507,6 @@ fn session_id_of(r: &Value) -> Option<String> {
         r.get("session")
             .and_then(|s| str_field(s, &["sessionId"]))
     })
-}
-
-/// The model selector's `currentValue` is a stringified JSON pair
-/// `"[\"provider\",\"model\"]"` — take the model part.
-fn extract_model(config_options: Option<&Value>) -> Option<String> {
-    let arr = config_options?.as_array()?;
-    let item = arr.iter().find(|o| o.get("id").and_then(|v| v.as_str()) == Some("model"))?;
-    let cur = item.get("currentValue")?.as_str()?;
-    if let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(cur) {
-        return parts.last().and_then(|v| v.as_str()).map(|s| s.to_string());
-    }
-    Some(cur.to_string())
 }
 
 fn parse_permission(params: &Value) -> (String, Vec<PermOption>) {
