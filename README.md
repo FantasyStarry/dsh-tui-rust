@@ -53,7 +53,8 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 
 | 按键 | 作用 |
 |------|------|
-| `Enter` | 发送输入框中的消息（`/quit` `/new` `/list` `/model` `/effort` 斜杠命令） |
+| `Enter` | 发送输入框中的消息 |
+| 输入 `/` | **弹出命令菜单**：继续输入过滤，`↑↓` 选择，`Tab` 补全，`Enter` 执行 |
 | `Esc` | 任务运行中 → 取消（session/cancel）；输入非空 → 清空；有空闲队列 → 清空队列 |
 | 忙时输入 | 自动**排队**（状态栏显示队列数），当前任务完成后逐条自动发送 |
 | 权限弹窗 | `↑↓` 选择 · `Enter` 确认（紫色选中条）· `Esc` 拒绝 |
@@ -65,6 +66,19 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 | `Home` / `End` | 跳到顶部 / 底部 |
 | `↑` / `↓` | 输入历史 |
 | `Ctrl+C` | 退出（stdin EOF 触发 dsh 优雅关机） |
+
+命令一览：`/help` `/new` `/list` `/model` `/effort` `/clear`（清屏，不影响会话）`/quit`。
+
+### 模型选择与 web 端的关系
+
+**TUI 与 web GUI 的模型互不同步——这是设计，不是缺陷**：web 与 acp 是两个独立
+profile，模型是**会话级**状态（dsh acp 新会话默认走 profile 配置的
+`deepseek-v4-flash`）。TUI 的补偿机制：
+
+- 你在 TUI 里切换过模型/档位后，选择会持久化到 `~/.dsh-tui/prefs.json`，
+  之后每个新会话自动应用
+- 想改 TUI 会话的"出厂默认"，patch acp profile 的 dsh-acp 配置即可
+  （`$DSH_HOME/profiles/acp/`），无需改 TUI 代码
 
 视觉语言（基于 gpt-image-2 生成的设计稿，本地 `design/` 参考，不入库）：
 

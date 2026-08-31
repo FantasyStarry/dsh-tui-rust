@@ -72,6 +72,67 @@ pub enum RunState {
     Busy,
 }
 
+// ---------------------------------------------------------------------------
+// Slash commands
+// ---------------------------------------------------------------------------
+
+pub struct Cmd {
+    pub name: &'static str,
+    pub desc: &'static str,
+}
+
+pub const COMMANDS: &[Cmd] = &[
+    Cmd { name: "/help", desc: "显示所有命令" },
+    Cmd { name: "/new", desc: "新建会话" },
+    Cmd { name: "/list", desc: "历史会话列表" },
+    Cmd { name: "/model", desc: "切换模型" },
+    Cmd { name: "/effort", desc: "切换推理档位" },
+    Cmd { name: "/clear", desc: "清屏（不影响会话上下文）" },
+    Cmd { name: "/quit", desc: "退出" },
+];
+
+/// Persisted user preferences (`~/.dsh-tui/prefs.json`): the last model /
+/// effort choice is re-applied automatically to every new session, because
+/// dsh creates acp sessions with the profile's default route.
+#[derive(Clone, Default)]
+pub struct Prefs {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+fn prefs_path() -> Option<PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    let dir = PathBuf::from(home).join(".dsh-tui");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("prefs.json"))
+}
+
+fn load_prefs() -> Prefs {
+    let Some(p) = prefs_path() else {
+        return Prefs::default();
+    };
+    let Ok(txt) = std::fs::read_to_string(p) else {
+        return Prefs::default();
+    };
+    let v: Value = serde_json::from_str(&txt).unwrap_or(Value::Null);
+    Prefs {
+        model: v.get("model").and_then(|x| x.as_str()).map(String::from),
+        effort: v.get("effort").and_then(|x| x.as_str()).map(String::from),
+    }
+}
+
+fn save_prefs(p: &Prefs) {
+    if let Some(path) = prefs_path() {
+        let v = serde_json::json!({
+            "model": p.model,
+            "effort": p.effort,
+        });
+        let _ = std::fs::write(path, serde_json::to_string_pretty(&v).unwrap_or_default());
+    }
+}
+
 pub struct App {
     pub entries: Vec<Entry>,
     pub input: String,
@@ -91,6 +152,10 @@ pub struct App {
 
     /// Messages typed while a prompt is in flight; drained on settlement.
     queue: VecDeque<String>,
+    /// Slash-command menu selection index.
+    pub cmd_selected: usize,
+    /// Persisted model / effort preferences, applied to each new session.
+    pref: Prefs,
 
     history: Vec<String>,
     hist_cursor: Option<usize>,
@@ -120,6 +185,8 @@ impl App {
             display: Vec::new(),
             quit: false,
             queue: VecDeque::new(),
+            cmd_selected: 0,
+            pref: load_prefs(),
             history: Vec::new(),
             hist_cursor: None,
             queued_permissions: Vec::new(),
@@ -172,6 +239,21 @@ impl App {
 
     pub fn queue_len(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Slash commands matching the current input (menu is shown when the
+    /// input is a bare `/prefix` with no space).
+    pub fn cmd_matches(&self) -> Vec<&'static Cmd> {
+        let Some(q) = self.input.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if self.input.contains(' ') {
+            return Vec::new();
+        }
+        COMMANDS
+            .iter()
+            .filter(|c| c.name[1..].starts_with(q))
+            .collect()
     }
 
     fn note_line(&mut self, line: &str) {
@@ -655,6 +737,44 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
         return Ok(());
     }
 
+    // --- slash command menu -------------------------------------------------
+    let menu: Vec<&'static Cmd> = app.cmd_matches();
+    let menu_active = app.input.starts_with('/') && !app.input.contains(' ') && !menu.is_empty();
+    if menu_active {
+        let sel = app.cmd_selected.min(menu.len() - 1);
+        match key.code {
+            KeyCode::Up => {
+                app.cmd_selected = sel.saturating_sub(1);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                if sel + 1 < menu.len() {
+                    app.cmd_selected = sel + 1;
+                }
+                return Ok(());
+            }
+            KeyCode::Tab => {
+                if let Some(c) = menu.get(sel) {
+                    app.input = c.name.to_string();
+                }
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                let name = menu[sel].name;
+                app.input.clear();
+                app.cmd_selected = 0;
+                run_command(app, client, name).await;
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                app.input.clear();
+                app.cmd_selected = 0;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // --- main mode ----------------------------------------------------------
     match key.code {
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -749,6 +869,7 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
         }
         KeyCode::Backspace => {
             app.input.pop();
+            app.cmd_selected = 0;
         }
         KeyCode::Up => {
             if !app.history.is_empty() {
@@ -773,6 +894,7 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
         }
         KeyCode::Char(ch) => {
             app.input.push(ch);
+            app.cmd_selected = 0;
         }
         _ => {}
     }
@@ -788,6 +910,30 @@ async fn open_sessions(app: &mut App, client: &AcpClient) {
     match client.list_sessions().await {
         Ok(items) => app.dialog = Dialog::Sessions { items, selected: 0 },
         Err(e) => app.sysnote(&format!("获取会话列表失败: {e:#}")),
+    }
+}
+
+/// Execute a slash command chosen from the menu (or typed verbatim).
+async fn run_command(app: &mut App, client: &AcpClient, name: &str) {
+    match name {
+        "/quit" => app.request_quit(),
+        "/new" => new_session(app, client).await,
+        "/list" => open_sessions(app, client).await,
+        "/model" => open_config(app, "model", "模型"),
+        "/effort" => open_config(app, "reasoning_effort", "推理档位"),
+        "/clear" => {
+            app.entries.clear();
+            app.tool_idx.clear();
+            app.tool_meta.clear();
+            app.dirty = true;
+            app.sysnote("已清屏（会话上下文不受影响）");
+        }
+        "/help" => {
+            for c in COMMANDS {
+                app.sysnote(&format!("{:<8} — {}", c.name, c.desc));
+            }
+        }
+        other => app.sysnote(&format!("未知命令 {other}（输入 / 查看命令菜单）")),
     }
 }
 
@@ -822,6 +968,14 @@ async fn apply_config(app: &mut App, client: &AcpClient, id: &str, title: &str, 
                 app.config = cfg;
             }
             app.sysnote(&format!("{title}已切换 → {}", choice.name));
+            // Persist the choice so future sessions start with it.
+            if id == "model" {
+                app.pref.model = Some(choice.value.clone());
+            }
+            if id == "reasoning_effort" {
+                app.pref.effort = Some(choice.value.clone());
+            }
+            save_prefs(&app.pref);
         }
         Err(e) => app.sysnote(&format!("切换失败: {e:#}")),
     }
@@ -909,7 +1063,33 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
                 app.state = RunState::Idle;
             }
             app.sysnote(&format!("会话就绪 {}", short_id(&session_id)));
-            app.sysnote("输入消息后回车发送 · /model 切模型 · /list 会话 · Ctrl+C 退出");
+            app.sysnote("输入 / 打开命令菜单 · /model 切模型 · Ctrl+C 退出");
+
+            // Re-apply persisted model / effort preferences to the fresh
+            // session (dsh starts acp sessions on the profile's default).
+            let prefs = app.pref.clone();
+            let cfg = app.config.clone();
+            let sid = session_id.clone();
+            let c2 = client.clone();
+            tokio::spawn(async move {
+                for (id, want) in
+                    [("model", prefs.model.clone()), ("reasoning_effort", prefs.effort.clone())]
+                {
+                    let Some(want) = want else { continue };
+                    let Some(opt) = cfg.iter().find(|c| c.id == id) else {
+                        continue;
+                    };
+                    if opt.current == want || !opt.options.iter().any(|ch| ch.value == want) {
+                        continue;
+                    }
+                    if let Ok(newcfg) = c2.set_config_option(&sid, id, &want).await {
+                        if !newcfg.is_empty() {
+                            c2.emit(AcpEvent::ConfigUpdated(newcfg));
+                            c2.emit(AcpEvent::Notice(format!("已应用上次选择的 {id} 偏好")));
+                        }
+                    }
+                }
+            });
             false
         }
         AcpEvent::MessageChunk(t) => {

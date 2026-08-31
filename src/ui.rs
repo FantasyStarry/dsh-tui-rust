@@ -36,6 +36,7 @@ fn render(f: &mut Frame, app: &mut App) {
     }
     draw_status(f, app, chunks[2]);
     draw_input(f, app, chunks[3]);
+    draw_cmd_menu(f, app, chunks[3]);
 
     match &app.dialog {
         Dialog::Permission { .. } => draw_permission(f, app),
@@ -381,6 +382,64 @@ fn draw_sessions(f: &mut Frame, app: &App) {
         Span::styled(" · ", plain(HAIRLINE)),
         Span::styled("Esc 关闭", plain(MUTED)),
     ]));
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Slash command menu (floating above the input box)
+// ---------------------------------------------------------------------------
+
+fn draw_cmd_menu(f: &mut Frame, app: &App, input_area: Rect) {
+    use unicode_width::UnicodeWidthStr;
+
+    let items = app.cmd_matches();
+    if items.is_empty() || !matches!(app.dialog, Dialog::None) {
+        return;
+    }
+    let sel = app.cmd_selected.min(items.len() - 1);
+
+    let screen = f.area();
+    let w = (items
+        .iter()
+        .map(|c| c.name.len() + UnicodeWidthStr::width(c.desc) + 6)
+        .max()
+        .unwrap_or(30) as u16)
+        .clamp(24, 60)
+        .min(screen.width.saturating_sub(2));
+    let h = (items.len() as u16 + 2).min(9);
+    let x = (input_area.x + 1).min(screen.width.saturating_sub(w));
+    let y = input_area.y.saturating_sub(h);
+    if y < screen.y || h < 3 {
+        return;
+    }
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(plain(ACCENT))
+        .title(Span::styled(" 命令 ", bold(ACCENT)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, c) in items.iter().enumerate() {
+        if i == sel {
+            let bar = pad_to_width(
+                &format!(" ❯ {:<8} {} ", c.name, c.desc),
+                inner.width.saturating_sub(1) as usize,
+            );
+            lines.push(Line::from(Span::styled(
+                bar,
+                Style::new().bg(VIOLET).fg(BAR_BG).add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {}", c.name), plain(FG)),
+                Span::styled(format!("  {}", c.desc), plain(DIM)),
+            ]));
+        }
+    }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
