@@ -349,11 +349,20 @@ fn draw_sessions(f: &mut Frame, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Scroll window for long session lists.
+    let total = items.len();
+    let overflow = total + 3 > inner.height as usize;
+    let footer = if overflow { 3 } else { 2 };
+    let visible = (inner.height as usize).saturating_sub(footer).max(1);
+    let top = if *selected < visible { 0 } else { *selected - visible + 1 };
+    let end = (top + visible).min(total);
+
     let mut lines: Vec<Line> = Vec::new();
     if items.is_empty() {
         lines.push(Line::from(Span::styled("（还没有持久化会话）", plain(DIM))));
     }
-    for (i, it) in items.iter().enumerate() {
+    for i in top..end {
+        let it = &items[i];
         let desc = it
             .title
             .clone()
@@ -373,6 +382,13 @@ fn draw_sessions(f: &mut Frame, app: &App) {
         } else {
             lines.push(Line::from(Span::styled(format!("   {base}"), plain(MUTED))));
         }
+    }
+    if total > visible {
+        let pct = ((*selected + 1) * 100) / total;
+        lines.push(Line::from(Span::styled(
+            format!("   · 第 {}/{} 项（{pct}%） ↑↓ 滚动", *selected + 1, total),
+            plain(HAIRLINE),
+        )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -453,7 +469,7 @@ fn draw_config(f: &mut Frame, app: &App) {
     };
 
     let screen = f.area();
-    let height = (choices.len() as u16 + 5).clamp(6, screen.height.saturating_sub(2));
+    let height = (choices.len() as u16 + 5).clamp(8, screen.height.saturating_sub(2));
     let width = (screen.width * 56 / 100).clamp(46, screen.width.saturating_sub(2));
     let area = centered(screen, width, height);
 
@@ -463,13 +479,23 @@ fn draw_config(f: &mut Frame, app: &App) {
         .border_style(plain(VIOLET))
         .title(Line::from(vec![
             Span::styled(" ⬡ ", bold(VIOLET)),
-            Span::styled(format!("{title} "), bold(VIOLET)),
+            Span::styled(format!("{title}（{}） ", choices.len()), bold(VIOLET)),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Scroll window: keep the selection visible when the catalog overflows
+    // the dialog (the synced model list now spans every provider).
+    let total = choices.len();
+    let overflow = total + 3 > inner.height as usize;
+    let footer = if overflow { 3 } else { 2 };
+    let visible = (inner.height as usize).saturating_sub(footer).max(1);
+    let top = if *selected < visible { 0 } else { *selected - visible + 1 };
+    let end = (top + visible).min(total);
+
     let mut lines: Vec<Line> = Vec::new();
-    for (i, c) in choices.iter().enumerate() {
+    for i in top..end {
+        let c = &choices[i];
         let is_current = c.value == *current;
         let desc = c
             .description
@@ -493,6 +519,13 @@ fn draw_config(f: &mut Frame, app: &App) {
                 plain(MUTED),
             )));
         }
+    }
+    if total > visible {
+        let pct = ((*selected + 1) * 100) / total;
+        lines.push(Line::from(Span::styled(
+            format!("   · 第 {}/{} 项（{pct}%） ↑↓ 滚动", *selected + 1, total),
+            plain(HAIRLINE),
+        )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![

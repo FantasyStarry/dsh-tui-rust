@@ -81,11 +81,16 @@ pub struct ConfigChoice {
     pub name: String,
     pub value: String,
     pub description: Option<String>,
+    /// Provider group this choice belongs to (model picker only; set when
+    /// the payload nests choices inside provider groups).
+    pub group: Option<String>,
 }
 
 /// Parse the `configOptions` payload defensively (session/new result,
 /// `config_option_update` notifications, `set_config_option` responses).
-/// The model selector nests its choices inside group nodes — flatten them.
+/// The model selector nests its choices inside group nodes — flatten them,
+/// carrying the group name down so the UI can disambiguate same-named models
+/// across providers.
 pub fn parse_config(v: Option<&Value>) -> Vec<ConfigOptionState> {
     let Some(arr) = v.and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -94,7 +99,7 @@ pub fn parse_config(v: Option<&Value>) -> Vec<ConfigOptionState> {
         .filter_map(|o| {
             let mut options = Vec::new();
             if let Some(raw) = o.get("options").and_then(|x| x.as_array()) {
-                flatten_choices(raw, &mut options);
+                flatten_choices(raw, None, &mut options);
             }
             Some(ConfigOptionState {
                 id: str_field(o, &["id"])?,
@@ -109,10 +114,13 @@ pub fn parse_config(v: Option<&Value>) -> Vec<ConfigOptionState> {
         .collect()
 }
 
-fn flatten_choices(arr: &[Value], out: &mut Vec<ConfigChoice>) {
+fn flatten_choices(arr: &[Value], group: Option<&str>, out: &mut Vec<ConfigChoice>) {
     for c in arr {
         if let Some(inner) = c.get("options").and_then(|x| x.as_array()) {
-            flatten_choices(inner, out);
+            // Group node: descend with its group name (innermost wins).
+            let inner_group = str_field(c, &["group", "name"]);
+            let inner_group_ref = inner_group.as_deref().or(group);
+            flatten_choices(inner, inner_group_ref, out);
         } else if let Some(name) = str_field(c, &["name"]) {
             let value = match c.get("value") {
                 Some(Value::String(s)) => s.clone(),
@@ -123,6 +131,7 @@ fn flatten_choices(arr: &[Value], out: &mut Vec<ConfigChoice>) {
                 name,
                 value,
                 description: str_field(c, &["description"]),
+                group: str_field(c, &["group"]).or_else(|| group.map(String::from)),
             });
         }
     }
@@ -306,6 +315,23 @@ impl AcpClient {
             )
             .await?;
         Ok(parse_config(r.get("configOptions")))
+    }
+
+    /// Re-fetch the complete config state (model + reasoning options).
+    ///
+    /// The `session/new` response computes its `configOptions` at request
+    /// admission time, before the settings-backed pi-ai provider adapters
+    /// have registered — so early calls advertise only the built-in
+    /// DeepSeek route. A no-op `set_config_option` to the current model is
+    /// the standard ACP way to pull the *current* full state: the server
+    /// validates the value (it is already selected, so always valid) and
+    /// answers with the freshly enumerated catalog. Callers retry until the
+    /// catalog covers every provider.
+    pub async fn refresh_config(&self, session_id: &str, current_model: &str) -> Result<Vec<ConfigOptionState>> {
+        if current_model.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.set_config_option(session_id, "model", current_model).await
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<ListedSession>> {

@@ -1,8 +1,4 @@
-//! `dsh-tui` binary entry point — a thin wrapper over the shared library.
-//!
-//! Modes:
-//! - `dsh-tui`            interactive TUI (requires a real terminal TTY)
-//! - `dsh-tui --probe`    non-interactive self-check (see `dsh_tui::probe`)
+//! `dtr` binary entry point — short alias for `dsh-tui` (identical behavior).
 
 use anyhow::Result;
 
@@ -16,7 +12,7 @@ async fn main() -> Result<()> {
     match dsh_tui::run_tui().await? {
         None => Ok(()),
         Some(reason) => {
-            eprintln!("dsh-tui: 与内核的连接已断开：{reason}");
+            eprintln!("dtr: 与内核的连接已断开：{reason}");
             eprintln!("会话已持久化，重启后 Ctrl+L 可恢复。");
             std::process::exit(1);
         }

@@ -8,10 +8,23 @@
  * `@deepseek-ai/dsh-workspace` mounted in the acp profile, because the
  * registry only auto-groups history during its one-time bootstrap.
  *
- * Fix: reconcile persisted session headers against registered workspaces by
- * canonical cwd, and attach live sessions as their first events arrive.
- * Everything rides the official `Workspace.attachSession` contract, which is
- * idempotent for accounted ids and rejects cwd mismatches without writing.
+ * Fix: attach sessions to the workspace owning their canonical cwd, and
+ * auto-create a workspace when none exists (mirroring the registry's own
+ * bootstrap, which gives every session path a workspace at first init). Two
+ * triggers:
+ *
+ *  1. Live path — `session/event` fires the moment a session appends its
+ *     first event (the TUI's first prompt), attaching immediately with
+ *     auto-create. (`session/created` is emitted only inside agent scopes,
+ *     so a host plugin cannot rely on it; we still listen defensively.)
+ *  2. Sweep — 3s/10s/30s after start, then every 15s, every persisted root
+ *     session is reconciled the same way, so a session that never appended
+ *     an event still converges within seconds (registered dirs attach, and
+ *     genuinely new project dirs get a workspace created).
+ *
+ * Everything rides the official `Workspace.create`/`attachSession`
+ * contracts: create is idempotent per canonical path, attach is idempotent
+ * for accounted ids and rejects cwd mismatches without writing.
  *
  * Mounted in the acp profile via a patch insert row:
  *   - insert:
@@ -19,7 +32,9 @@
  *         name: dsh-tui-companion
  */
 
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename } from "node:path";
 import { appendFileSync } from "node:fs";
 
 const DEBUG = process.env.DSH_TUI_COMPANION_DEBUG;
@@ -44,33 +59,70 @@ export default {
   name: "dsh-tui-companion",
   inject: ["workspaceRegistry", "sessionPersistence"],
 
-  apply(ctx) {
+  apply(ctx, config) {
     log("apply entered (services ready)");
     const registry = ctx.workspaceRegistry;
     const persistence = ctx.sessionPersistence;
-    log(`registry=${typeof registry} persistence=${typeof persistence}`);
+    const createIfMissing = config?.createIfMissing ?? true;
+    const home = homedir();
+    log(`registry=${typeof registry} persistence=${typeof persistence} createIfMissing=${createIfMissing}`);
 
-    /** Live sessions already attempted through the event path. */
+    /** Live sessions already attempted through the event paths. */
     const attempted = new Set();
 
-    /** Canonical cwd → matches the workspace path? Attach; mismatches no-op. */
-    async function attachByCwd(sessionId, cwd) {
-      if (!cwd) return;
-      let canonical;
+    /**
+     * Canonicalize a session cwd, or return undefined when it is unusable.
+     * The home directory never becomes a workspace (avoids a junk "Mayn"
+     * workspace when the TUI is launched from $HOME).
+     */
+    async function canonicalCwd(cwd) {
+      if (!cwd) return undefined;
       try {
-        canonical = await realpath(cwd);
+        const canonical = await realpath(cwd);
+        const info = await stat(canonical);
+        if (!info.isDirectory()) return undefined;
+        if (canonical === home) return undefined;
+        return canonical;
       } catch {
-        return; // cwd no longer resolves — registry would reject anyway
+        return undefined;
       }
+    }
+
+    /** Find the workspace owning a canonical path, if any. */
+    function workspaceAt(canonical) {
       for (const ws of registry.list()) {
-        if (ws.path !== canonical) continue;
-        if (ws.sessionIds.includes(sessionId)) return; // already accounted
+        if (ws.path === canonical) return ws;
+      }
+      return undefined;
+    }
+
+    /**
+     * Attach one session to the workspace owning its cwd, creating the
+     * workspace first when none is registered for the path. Session ids
+     * already accounted by a workspace are skipped; `attachSession` rejects
+     * cwd mismatches without writing, so this can never mis-file a session.
+     */
+    async function attachByCwd(sessionId, cwd) {
+      const canonical = await canonicalCwd(cwd);
+      if (canonical === undefined) return;
+      let ws = workspaceAt(canonical);
+      if (ws === undefined) {
+        if (!createIfMissing) return;
         try {
-          await ws.attachSession(sessionId);
-        } catch {
-          // mismatch / transient rejection: never fatal for the session
+          ws = await registry.create(canonical, basename(canonical));
+          log(`auto-created workspace for ${canonical}`);
+        } catch (error) {
+          log(`create workspace ${canonical} failed: ${error?.message ?? error}`);
+          return;
         }
-        return;
+      }
+      if (ws.sessionIds.includes(sessionId)) return; // already accounted
+      try {
+        await ws.attachSession(sessionId);
+        log(`attached ${sessionId} -> ${ws.path}`);
+      } catch (error) {
+        // mismatch / transient rejection: never fatal for the session
+        log(`attach ${sessionId} -> ${ws.path} failed: ${error?.message ?? error}`);
       }
     }
 
@@ -85,30 +137,30 @@ export default {
       }
       const workspaces = registry.list();
       log(`reconcile: ${headers.length} headers, ${workspaces.length} workspaces`);
-      if (workspaces.length === 0) return;
-      const byPath = new Map();
-      for (const ws of workspaces) {
-        byPath.set(ws.path, ws);
-      }
-      let attached = 0;
       let attemptedCount = 0;
       for (const entry of headers) {
         const header = entry?.header ?? entry;
         if (!isRootSession(header) || !header.id || !header.cwd) continue;
-        const ws = byPath.get(await realpath(header.cwd).catch(() => null));
-        if (!ws || ws.sessionIds.includes(header.id)) continue;
         attemptedCount += 1;
-        try {
-          await ws.attachSession(header.id);
-          attached += 1;
-        } catch (error) {
-          log(`attach ${header.id} → ${ws.path} failed: ${error.message}`);
-        }
+        await attachByCwd(header.id, header.cwd);
       }
-      log(`reconcile done, attempted ${attemptedCount}, attached ${attached}`);
+      log(`reconcile done, attempted ${attemptedCount}`);
     }
 
-    // Live path: the first event of a session carries its header.
+    // Live path 1 (defensive): `session/created` is normally emitted only in
+    // agent-scoped contexts, so a host plugin usually never sees it — but
+    // when it does, attach before the first event even exists.
+    ctx.on("session/created", (session) => {
+      const header = session?.header;
+      if (!isRootSession(header) || !header.id) return;
+      if (attempted.has(header.id)) return;
+      attempted.add(header.id);
+      void attachByCwd(header.id, header.cwd);
+    });
+
+    // Live path 2: the first appended event of a session surfaces it on the
+    // host scope immediately — the TUI's first prompt therefore groups the
+    // session the moment the conversation starts.
     ctx.on("session/event", (session) => {
       const header = session?.header;
       if (!isRootSession(header) || !header.id) return;
@@ -123,7 +175,7 @@ export default {
     const timers = [3_000, 10_000, 30_000].map((delay) =>
       setTimeout(() => void reconcile(), delay),
     );
-    const timer = setInterval(() => void reconcile(), 60_000);
+    const timer = setInterval(() => void reconcile(), 15_000);
     ctx.on("dispose", () => {
       for (const t of timers) clearTimeout(t);
       clearInterval(timer);

@@ -87,6 +87,7 @@ pub const COMMANDS: &[Cmd] = &[
     Cmd { name: "/list", desc: "历史会话列表" },
     Cmd { name: "/model", desc: "切换模型" },
     Cmd { name: "/effort", desc: "切换推理档位" },
+    Cmd { name: "/web", desc: "启动/打开 web 界面" },
     Cmd { name: "/clear", desc: "清屏（不影响会话上下文）" },
     Cmd { name: "/quit", desc: "退出" },
 ];
@@ -784,10 +785,10 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
             new_session(app, client).await;
         }
         KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            open_config(app, "model", "模型");
+            open_config(app, client, "model", "模型").await;
         }
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            open_config(app, "reasoning_effort", "推理档位");
+            open_config(app, client, "reasoning_effort", "推理档位").await;
         }
         KeyCode::PageUp => {
             app.scroll_by(10);
@@ -836,12 +837,17 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                 }
                 "/model" => {
                     app.input.clear();
-                    open_config(app, "model", "模型");
+                    open_config(app, client, "model", "模型").await;
                     return Ok(());
                 }
                 "/effort" => {
                     app.input.clear();
-                    open_config(app, "reasoning_effort", "推理档位");
+                    open_config(app, client, "reasoning_effort", "推理档位").await;
+                    return Ok(());
+                }
+                "/web" => {
+                    app.input.clear();
+                    start_web(client);
                     return Ok(());
                 }
                 _ => {}
@@ -919,8 +925,9 @@ async fn run_command(app: &mut App, client: &AcpClient, name: &str) {
         "/quit" => app.request_quit(),
         "/new" => new_session(app, client).await,
         "/list" => open_sessions(app, client).await,
-        "/model" => open_config(app, "model", "模型"),
-        "/effort" => open_config(app, "reasoning_effort", "推理档位"),
+        "/model" => open_config(app, client, "model", "模型").await,
+        "/effort" => open_config(app, client, "reasoning_effort", "推理档位").await,
+        "/web" => start_web(client),
         "/clear" => {
             app.entries.clear();
             app.tool_idx.clear();
@@ -938,7 +945,29 @@ async fn run_command(app: &mut App, client: &AcpClient, name: &str) {
 }
 
 /// Open the model / reasoning-effort picker from the advertised config state.
-fn open_config(app: &mut App, id: &str, title: &str) {
+///
+/// The model catalog is refreshed first: `session/new` computes its
+/// `configOptions` before the settings-backed pi-ai provider adapters have
+/// registered, so the snapshot may advertise only the built-in DeepSeek
+/// route. A no-op `set_config_option` pulls the current full state, keeping
+/// the picker in sync with the web GUI's model list.
+async fn open_config(app: &mut App, client: &AcpClient, id: &str, title: &str) {
+    if let Some(sid) = app.session_id.clone() {
+        let current = app
+            .config
+            .iter()
+            .find(|c| c.id == "model")
+            .map(|c| c.current.clone())
+            .unwrap_or_default();
+        if !current.is_empty() {
+            app.sysnote("正在刷新模型列表…");
+            if let Ok(cfg) = client.refresh_config(&sid, &current).await {
+                if !cfg.is_empty() {
+                    app.config = cfg;
+                }
+            }
+        }
+    }
     let Some(opt) = app.config.iter().find(|c| c.id == id) else {
         app.sysnote("配置尚未就绪（会话还在初始化？）");
         return;
@@ -947,11 +976,27 @@ fn open_config(app: &mut App, id: &str, title: &str) {
         app.sysnote(&format!("{title}：没有可选项"));
         return;
     }
+    // Same-named models from different providers are distinguishable by their
+    // provider group (`my-api · DeepSeek V4 Flash` vs `deepseek-official · …`).
+    let has_groups = opt.options.iter().any(|c| c.group.is_some());
+    let display: Vec<ConfigChoice> = opt
+        .options
+        .iter()
+        .map(|ch| {
+            let mut c = ch.clone();
+            if has_groups {
+                if let Some(g) = &c.group {
+                    c.name = format!("{g} · {}", c.name);
+                }
+            }
+            c
+        })
+        .collect();
     app.dialog = Dialog::Config {
         id: opt.id.clone(),
         title: title.to_string(),
         current: opt.current.clone(),
-        choices: opt.options.clone(),
+        choices: display,
         selected: 0,
     };
 }
@@ -990,7 +1035,9 @@ async fn new_session(app: &mut App, client: &AcpClient) {
     let old = app.session_id.clone();
     match client.new_session(&app.cwd).await {
         Ok((sid, cfg)) => {
-            if !cfg.is_empty() {
+            // Guard against the stale snapshot clobbering the already-synced
+            // catalog (see catalog_is_richer).
+            if !cfg.is_empty() && catalog_is_richer(&cfg, &app.config) {
                 app.config = cfg;
             }
             if let Some(o) = old {
@@ -1043,11 +1090,111 @@ async fn resume_session(app: &mut App, client: &AcpClient, item: ListedSession) 
     }
 }
 
+/// Start (or reveal) the web GUI from inside the TUI.
+///
+/// `dsh web` serves the browser UI on the composed port (default 3080,
+/// override with `DSH_TUI_WEB_PORT`). If the port is already listening we
+/// just print the URL; otherwise the web profile is spawned detached (it
+/// opens the default browser itself) and we poll until it accepts TCP.
+fn start_web(client: &AcpClient) {
+    let port: u16 = std::env::var("DSH_TUI_WEB_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3080);
+    let url = format!("http://127.0.0.1:{port}");
+    let addr = format!("127.0.0.1:{port}");
+
+    let c = client.clone();
+    tokio::spawn(async move {
+        use std::time::Duration;
+        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            c.emit(AcpEvent::Notice(format!("web 已在运行：{url}")));
+            return;
+        }
+        c.emit(AcpEvent::Notice("正在启动 dsh web（后台）…".into()));
+        match spawn_web(port) {
+            Ok(_) => {
+                for i in 0..45u32 {
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                        c.emit(AcpEvent::Notice(format!(
+                            "web 已启动：{url}（浏览器已打开；退出 TUI 不影响 web）"
+                        )));
+                        return;
+                    }
+                    if i > 0 && i % 5 == 0 {
+                        c.emit(AcpEvent::Notice(format!("等待 web 就绪…（{}s）", i)));
+                    }
+                }
+                c.emit(AcpEvent::Notice(format!(
+                    "web 启动超时：{url} 未监听。请手动运行 `dsh web` 查看原因"
+                )));
+            }
+            Err(e) => c.emit(AcpEvent::Notice(format!(
+                "启动 dsh web 失败: {e:#}（请手动运行 `dsh web`）"
+            ))),
+        }
+    });
+}
+
+/// Spawn `dsh web --port <port>` detached from the TUI. On Windows the npm
+/// `dsh` shim is a .cmd file, so we route through `cmd /C start` (new
+/// console; the intermediate cmd exits immediately). On Unix a background
+/// shell job is used.
+#[cfg(target_os = "windows")]
+fn spawn_web(port: u16) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", "dsh", "web", "--port", &port.to_string()])
+        .spawn()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_web(port: u16) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("sh")
+        .args(["-c", &format!("nohup dsh web --port {port} >/dev/null 2>&1 &")])
+        .spawn()
+}
+
 fn advance_permission_queue(app: &mut App) {
     if !app.queued_permissions.is_empty() {
         let (request_id, tool_title, options) = app.queued_permissions.remove(0);
         app.dialog = Dialog::Permission { request_id, tool_title, options, selected: 0 };
     }
+}
+
+/// Whether `incoming` should replace `current` as the config state.
+///
+/// The `session/new` snapshot computes its `configOptions` before the
+/// settings-backed pi-ai adapters register, so it may advertise only the
+/// built-in DeepSeek route; the `config_option_update` notification that
+/// follows carries the full multi-provider catalog. Because the two can
+/// arrive in either order, a smaller catalog must never clobber a larger
+/// one — the model catalog only grows as providers register, so comparing
+/// the flattened model-choice count is a safe guard (a later provider
+/// removal is reflected on the next explicit refresh from `/model`).
+fn catalog_is_richer(incoming: &[ConfigOptionState], current: &[ConfigOptionState]) -> bool {
+    let models = |cfg: &[ConfigOptionState]| {
+        cfg.iter()
+            .find(|c| c.id == "model")
+            .map(|m| m.options.len())
+            .unwrap_or(0)
+    };
+    models(incoming) >= models(current)
+}
+
+/// Number of distinct provider groups advertised by the model selector.
+/// One group = only the built-in DeepSeek route; more than one = the
+/// settings-backed pi-ai adapters have registered (catalog synced with web).
+fn provider_group_count(cfg: &[ConfigOptionState]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    if let Some(m) = cfg.iter().find(|c| c.id == "model") {
+        for ch in &m.options {
+            if let Some(g) = &ch.group {
+                seen.insert(g.clone());
+            }
+        }
+    }
+    seen.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,20 +1210,58 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
                 app.state = RunState::Idle;
             }
             app.sysnote(&format!("会话就绪 {}", short_id(&session_id)));
-            app.sysnote("输入 / 打开命令菜单 · /model 切模型 · Ctrl+C 退出");
+            app.sysnote("输入 / 打开命令菜单 · /model 切模型 · /web 打开 web · Ctrl+C 退出");
 
-            // Re-apply persisted model / effort preferences to the fresh
-            // session (dsh starts acp sessions on the profile's default).
+            // The session/new snapshot advertises only the built-in DeepSeek
+            // route (the settings-backed pi-ai adapters register a moment
+            // later); the config_option_update notification carries the full
+            // catalog and the ConfigUpdated guard keeps it. When the
+            // notification was missed (catalog still stale here), pull the
+            // catalog via a no-op set; then apply persisted model / effort
+            // preferences against the complete list.
             let prefs = app.pref.clone();
-            let cfg = app.config.clone();
+            let snapshot = app.config.clone();
             let sid = session_id.clone();
             let c2 = client.clone();
             tokio::spawn(async move {
+                let mut latest = snapshot;
+                let mut current = latest
+                    .iter()
+                    .find(|c| c.id == "model")
+                    .map(|c| c.current.clone())
+                    .unwrap_or_default();
+                let stale = provider_group_count(&latest) <= 1;
+                let mut synced = !stale;
+                if stale && !current.is_empty() {
+                    for attempt in 0..4u32 {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        if let Ok(fresh) = c2.refresh_config(&sid, &current).await {
+                            if !fresh.is_empty() {
+                                if let Some(m) = fresh.iter().find(|c| c.id == "model") {
+                                    current = m.current.clone();
+                                }
+                                latest = fresh;
+                                // More than one provider group means the
+                                // settings-backed adapters have registered.
+                                if provider_group_count(&latest) > 1 || attempt >= 3 {
+                                    synced = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                c2.emit(AcpEvent::ConfigUpdated(latest.clone()));
+                if synced {
+                    c2.emit(AcpEvent::Notice("模型列表已与 web 端同步".into()));
+                }
+                // Re-apply persisted model / effort preferences to the fresh
+                // session (dsh starts acp sessions on the profile's default).
                 for (id, want) in
                     [("model", prefs.model.clone()), ("reasoning_effort", prefs.effort.clone())]
                 {
                     let Some(want) = want else { continue };
-                    let Some(opt) = cfg.iter().find(|c| c.id == id) else {
+                    let Some(opt) = latest.iter().find(|c| c.id == id) else {
                         continue;
                     };
                     if opt.current == want || !opt.options.iter().any(|ch| ch.value == want) {
@@ -1146,7 +1331,7 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
             false
         }
         AcpEvent::ConfigUpdated(cfg) => {
-            if !cfg.is_empty() {
+            if !cfg.is_empty() && catalog_is_richer(&cfg, &app.config) {
                 app.config = cfg;
             }
             false

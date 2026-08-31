@@ -1,15 +1,29 @@
 [package]
 name = "dsh-tui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Terminal UI client for DeepSeek Harness — Phase 0 ACP spike"
+description = "Terminal UI client for DeepSeek Harness over the ACP protocol"
+
+[lib]
+name = "dsh_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dsh-tui"
+path = "src/main.rs"
+
+# Short alias launcher: `dtr` == `dsh-tui` (install both with `cargo install --path .`
+# or `install.ps1`).
+[[bin]]
+name = "dtr"
+path = "src/bin/dtr.rs"
 
 [dependencies]
 anyhow = "1"
 crossterm = "0.28"
 ratatui = "0.29"
 serde_json = "1"
-tokio = { version = "1", features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
 unicode-width = "0.2"
 
 [profile.release]
