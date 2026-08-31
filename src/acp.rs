@@ -1,0 +1,508 @@
+//! ACP (Agent Client Protocol v1) client for the dsh `acp` profile.
+//!
+//! Spawns `dsh --profile acp` as a child process and speaks newline-delimited
+//! JSON-RPC over stdio. Outgoing frames go through one writer task; incoming
+//! frames are dispatched by one reader task into:
+//!
+//! - responses  → the pending-response map (awaited by [`AcpClient::request`])
+//! - agent requests (permission prompts) → [`AcpEvent::PermissionRequest`]
+//! - notifications → typed [`AcpEvent`]s consumed by the UI event loop
+//!
+//! The Node.js harness core is never modified — this is a pure protocol client.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::{mpsc, Mutex, oneshot};
+
+const INIT_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(3600);
+
+// ---------------------------------------------------------------------------
+// Public events consumed by the UI
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct PermOption {
+    pub option_id: Value,
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug)]
+pub enum AcpEvent {
+    SessionCreated { session_id: String },
+    MessageChunk(String),
+    ThoughtChunk(String),
+    ToolCall { tool_call_id: String, title: String, kind: String, status: String },
+    ToolCallUpdate { tool_call_id: String, title: Option<String>, status: Option<String> },
+    Usage { used: u64, size: u64 },
+    ModelChanged(Option<String>),
+    PermissionRequest { request_id: Value, tool_title: String, options: Vec<PermOption> },
+    PromptSettled { stop_reason: String, error: Option<String> },
+    ServerGone(String),
+    Notice(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ListedSession {
+    pub session_id: String,
+    pub cwd: String,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+struct Inner {
+    out: mpsc::UnboundedSender<Value>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+    next_id: AtomicU64,
+    events: mpsc::UnboundedSender<AcpEvent>,
+}
+
+impl Inner {
+    async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (rtx, rrx) = oneshot::channel();
+        self.pending.lock().await.insert(id, rtx);
+
+        self.out
+            .send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .map_err(|_| anyhow::anyhow!("连接已关闭"))?;
+
+        let resp = match tokio::time::timeout(timeout, rrx).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => bail!("{method}: 响应通道断开"),
+            Err(_) => bail!("{method}: 超时（{timeout:?}）"),
+        };
+        if let Some(err) = resp.get("error") {
+            bail!("{method} 失败: {err}");
+        }
+        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+    }
+}
+
+#[derive(Clone)]
+pub struct AcpClient {
+    inner: Arc<Inner>,
+}
+
+impl AcpClient {
+    /// Spawn `dsh --profile acp` and wire up the protocol tasks.
+    pub async fn spawn() -> Result<(Self, mpsc::UnboundedReceiver<AcpEvent>)> {
+        let mut cmd = dsh_command();
+        cmd.args(["--profile", "acp"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
+            .context("无法启动 dsh（需要 dsh 在 PATH 上，或用 DSH_BIN 指向可执行文件）")?;
+
+        let stdin = child.stdin.take().context("子进程缺少 stdin")?;
+        let stdout = child.stdout.take().context("子进程缺少 stdout")?;
+        let stderr = child.stderr.take().context("子进程缺少 stderr")?;
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<AcpEvent>();
+
+        // Writer: every outgoing frame funnels through here; dropping the
+        // client closes the channel → stdin EOF → dsh performs its bounded
+        // successful shutdown.
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(v) = out_rx.recv().await {
+                let mut line = v.to_string();
+                line.push('\n');
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+                let _ = stdin.flush().await;
+            }
+        });
+
+        // dsh logs go to stderr; stdout is protocol-only.
+        {
+            let ev = ev_tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    let _ = ev.send(AcpEvent::Notice(format!("[dsh] {l}")));
+                }
+            });
+        }
+
+        let inner = Arc::new(Inner {
+            out: out_tx,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            events: ev_tx.clone(),
+        });
+
+        // Reader: dispatch responses / agent requests / notifications.
+        {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let v: Value = match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let _ = inner.events.send(AcpEvent::Notice(format!("[non-json] {line}")));
+                            continue;
+                        }
+                    };
+                    dispatch(&inner, v).await;
+                }
+                let _ = inner.events.send(AcpEvent::ServerGone("stdout 已关闭".into()));
+            });
+        }
+
+        // Process watcher.
+        {
+            let ev = ev_tx.clone();
+            tokio::spawn(async move {
+                let mut child = child;
+                let status = child.wait().await;
+                let _ = ev.send(AcpEvent::ServerGone(format!("dsh 进程退出: {status:?}")));
+            });
+        }
+
+        Ok((Self { inner }, ev_rx))
+    }
+
+    async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        self.inner.request(method, params, timeout).await
+    }
+
+    pub fn emit(&self, ev: AcpEvent) {
+        let _ = self.inner.events.send(ev);
+    }
+
+    pub fn notify(&self, method: &str, params: Value) -> Result<()> {
+        self.inner
+            .out
+            .send(json!({"jsonrpc": "2.0", "method": method, "params": params}))
+            .context("连接已关闭")?;
+        Ok(())
+    }
+
+    // -- lifecycle -----------------------------------------------------------
+
+    pub async fn initialize(&self) -> Result<Value> {
+        self.request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+            INIT_TIMEOUT,
+        )
+        .await
+    }
+
+    pub async fn new_session(&self, cwd: &Path) -> Result<String> {
+        let r = self
+            .request("session/new", json!({"cwd": cwd, "mcpServers": []}), SESSION_TIMEOUT)
+            .await?;
+        if let Some(m) = extract_model(r.get("configOptions")) {
+            let _ = self.inner.events.send(AcpEvent::ModelChanged(Some(m)));
+        }
+        session_id_of(&r).context("session/new 未返回 sessionId")    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<ListedSession>> {
+        let r = self.request("session/list", json!({}), SESSION_TIMEOUT).await?;
+        Ok(parse_sessions(&r))
+    }
+
+    /// dsh extends the standard resume call with a required `cwd` — it
+    /// verifies the session's canonical workspace before composing.
+    pub async fn resume_session(&self, id: &str, cwd: &str) -> Result<String> {
+        let r = self
+            .request(
+                "session/resume",
+                json!({"sessionId": id, "cwd": cwd}),
+                SESSION_TIMEOUT,
+            )
+            .await?;
+        Ok(session_id_of(&r).unwrap_or_else(|| id.to_string()))
+    }
+
+    pub async fn close_session(&self, id: &str) -> Result<()> {
+        let _ = self
+            .request("session/close", json!({"sessionId": id}), CLOSE_TIMEOUT)
+            .await;
+        Ok(())
+    }
+
+    // -- in-flight work ------------------------------------------------------
+
+    /// Send one prompt in a background task; the result arrives as
+    /// [`AcpEvent::PromptSettled`] so the UI keeps rendering while it runs.
+    pub fn prompt(&self, session_id: String, text: String) {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let params = json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": text}]
+            });
+            match inner.request("session/prompt", params, PROMPT_TIMEOUT).await {
+                Ok(r) => {
+                    let stop = r
+                        .get("stopReason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let _ = inner.events.send(AcpEvent::PromptSettled { stop_reason: stop, error: None });
+                }
+                Err(e) => {
+                    let _ = inner.events.send(AcpEvent::PromptSettled {
+                        stop_reason: "error".into(),
+                        error: Some(format!("{e:#}")),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn cancel(&self, session_id: &str) {
+        let _ = self.notify("session/cancel", json!({"sessionId": session_id}));
+    }
+
+    /// Answer a `session/request_permission` initiated by the agent.
+    /// `None` means "cancelled / rejected".
+    pub fn respond_permission(&self, request_id: Value, option_id: Option<Value>) {
+        let outcome = match option_id {
+            Some(oid) => json!({"outcome": "selected", "optionId": oid}),
+            None => json!({"outcome": "cancelled"}),
+        };
+        let _ = self
+            .inner
+            .out
+            .send(json!({"jsonrpc": "2.0", "id": request_id, "result": {"outcome": outcome}}));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frame dispatch
+// ---------------------------------------------------------------------------
+
+async fn dispatch(inner: &Arc<Inner>, v: Value) {
+    if let Some(id) = v.get("id").cloned() {
+        if v.get("method").is_none() {
+            // Response to one of our requests.
+            if let Some(n) = id.as_u64() {
+                if let Some(rtx) = inner.pending.lock().await.remove(&n) {
+                    let _ = rtx.send(v);
+                }
+            }
+            return;
+        }
+        // Request originating from the agent.
+        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
+        let params = v.get("params").cloned().unwrap_or(Value::Null);
+        match method.as_str() {
+            "session/request_permission" => {
+                let (tool_title, options) = parse_permission(&params);
+                let _ = inner.events.send(AcpEvent::PermissionRequest {
+                    request_id: id,
+                    tool_title,
+                    options,
+                });
+            }
+            other => {
+                let _ = inner.out.send(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": format!("method not supported: {other}")}
+                }));
+            }
+        }
+        return;
+    }
+
+    // Notification.
+    let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    if method != "session/update" {
+        let _ = inner.events.send(AcpEvent::Notice(format!("[notify] {method}")));
+        return;
+    }
+    let Some(update) = v.pointer("/params/update") else {
+        return;
+    };
+    let kind = update.get("sessionUpdate").and_then(|k| k.as_str()).unwrap_or("");
+    match kind {
+        "agent_message_chunk" | "agent_message" => {
+            let t = content_text(update.get("content"));
+            if !t.is_empty() {
+                let _ = inner.events.send(AcpEvent::MessageChunk(t));
+            }
+        }
+        "agent_thought_chunk" => {
+            let t = content_text(update.get("content"));
+            if !t.is_empty() {
+                let _ = inner.events.send(AcpEvent::ThoughtChunk(t));
+            }
+        }
+        "tool_call" => {
+            let _ = inner.events.send(AcpEvent::ToolCall {
+                tool_call_id: str_field(update, &["toolCallId", "tool_call_id"]).unwrap_or_default(),
+                title: str_field(update, &["title"]).unwrap_or_else(|| "工具调用".into()),
+                kind: str_field(update, &["kind"]).unwrap_or_default(),
+                status: str_field(update, &["status"]).unwrap_or_else(|| "pending".into()),
+            });
+        }
+        "tool_call_update" => {
+            let _ = inner.events.send(AcpEvent::ToolCallUpdate {
+                tool_call_id: str_field(update, &["toolCallId", "tool_call_id"]).unwrap_or_default(),
+                title: str_field(update, &["title"]),
+                status: str_field(update, &["status"]),
+            });
+        }
+        "usage_update" => {
+            let _ = inner.events.send(AcpEvent::Usage {
+                used: update.get("used").and_then(|v| v.as_u64()).unwrap_or(0),
+                size: update.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            });
+        }
+        "config_option_update" => {
+            let model = extract_model(update.get("configOptions"));
+            let _ = inner.events.send(AcpEvent::ModelChanged(model));
+        }
+        other => {
+            let _ = inner.events.send(AcpEvent::Notice(format!(
+                "[update:{other}] {}",
+                clip(&update.to_string(), 160)
+            )));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing helpers (defensive: unknown shapes degrade to labels, not panics)
+// ---------------------------------------------------------------------------
+
+/// Extract concatenated text from an ACP content block or block array.
+fn content_text(c: Option<&Value>) -> String {
+    match c {
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(block) => block.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+        None => String::new(),
+    }
+}
+
+fn str_field(v: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string()))
+}
+
+fn session_id_of(r: &Value) -> Option<String> {
+    str_field(r, &["sessionId"]).or_else(|| {
+        r.get("session")
+            .and_then(|s| str_field(s, &["sessionId"]))
+    })
+}
+
+/// The model selector's `currentValue` is a stringified JSON pair
+/// `"[\"provider\",\"model\"]"` — take the model part.
+fn extract_model(config_options: Option<&Value>) -> Option<String> {
+    let arr = config_options?.as_array()?;
+    let item = arr.iter().find(|o| o.get("id").and_then(|v| v.as_str()) == Some("model"))?;
+    let cur = item.get("currentValue")?.as_str()?;
+    if let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(cur) {
+        return parts.last().and_then(|v| v.as_str()).map(|s| s.to_string());
+    }
+    Some(cur.to_string())
+}
+
+fn parse_permission(params: &Value) -> (String, Vec<PermOption>) {
+    let tool_title = params
+        .pointer("/toolCall/title")
+        .and_then(|v| v.as_str())
+        .or_else(|| params.pointer("/toolCall/kind").and_then(|v| v.as_str()))
+        .unwrap_or("工具调用")
+        .to_string();
+    let options = params
+        .get("options")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| {
+                    Some(PermOption {
+                        option_id: o.get("optionId").cloned()?,
+                        name: str_field(o, &["name"]).unwrap_or_default(),
+                        kind: str_field(o, &["kind"]).unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (tool_title, options)
+}
+
+fn parse_sessions(r: &Value) -> Vec<ListedSession> {
+    let arr = r
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .or_else(|| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    arr.iter()
+        .filter_map(|s| {
+            Some(ListedSession {
+                session_id: str_field(s, &["sessionId", "session_id", "id"])?,
+                cwd: str_field(s, &["cwd", "workspace", "workspaceDir"]).unwrap_or_default(),
+                title: str_field(s, &["title", "name", "summary"]),
+                updated_at: str_field(s, &["updatedAt", "updated_at", "lastActivityAt", "mtime"]),
+            })
+        })
+        .collect()
+}
+
+/// Truncate by chars (never splits a UTF-8 code point).
+pub fn clip(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push('…');
+        out
+    }
+}
+
+pub fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Resolve the dsh launcher. `DSH_BIN` overrides; on Windows the npm `dsh`
+/// shim is a .cmd file that CreateProcess cannot exec directly, so we route
+/// through `cmd /C`. Stdio pipes pass through cmd.exe unchanged.
+fn dsh_command() -> Command {
+    if let Ok(bin) = std::env::var("DSH_BIN") {
+        return Command::new(bin);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "dsh"]);
+        c
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("dsh")
+    }
+}
