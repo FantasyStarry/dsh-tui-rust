@@ -1,8 +1,11 @@
 {
-  "name": "dsh-tui",
+  "name": "@fantasystarry/dsh-tui",
   "version": "0.3.0",
   "description": "Terminal UI client for DeepSeek Harness over the ACP protocol (ratatui)",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "dsh-tui": "bin/dsh-tui.js",
     "dtr": "bin/dtr.js"
