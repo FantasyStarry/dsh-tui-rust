@@ -313,6 +313,21 @@ dsh 的 acp profile 禁用了模型生成标题（ACP 面无标题 surface，只
 - 模型目录同步依赖提供商注册时机，极端情况下（settings 加载失败）会保留
   内置 DeepSeek 列表并在打开 `/model` 时重试刷新
 
+### 安装 · companion 引导 · npm 分发（Phase 3）
+
+- **一键安装**：`install.ps1` / `install.sh` 现在 = cargo 构建 + 安装二进制 +
+  **自动 companion 引导**（`-SkipCompanion` / `SKIP_COMPANION=1` 跳过）
+- **companion 引导**（`bootstrap.ps1` / `bootstrap.sh`，幂等）：检查 dsh 存在性 →
+  `dsh plugin --profile acp add "link:<仓库>/companion/dsh-tui-companion"` →
+  确保 acp profile 的 cordis.patch.yml 含 `workspace` 服务与 `tui-companion`
+  两段插入行（缺失才追加，不动用户其它插件行）。卸载：
+  `dsh plugin --profile acp rm dsh-tui-companion` + 手动删两段插入行
+- **npm 分发**：`scripts/build-release.ps1` / `.sh` 构建并暂存平台预编译二进制到
+  `npm/dist/<平台键>/`；`npm/bin/*.js` shim 按 `DSH_TUI_BIN` → 包内 dist →
+  `~/.dsh-tui/bin` → PATH 解析二进制并透传参数/退出码；`cd npm && npm publish`
+  发布（需 npm 账号，详见 npm/README.md）。发布后 `npm i -g dsh-tui` 即得
+  `dsh-tui` / `dtr` 命令
+
 ## Roadmap
 
 - [x] **Phase 0** — ACP 管道验证：initialize → session/new → prompt → 流式
@@ -333,7 +348,10 @@ dsh 的 acp profile 禁用了模型生成标题（ACP 面无标题 surface，只
       解析 old_str/new_str 与 create/file_text）、图片粘贴（Ctrl+V 剪贴板 →
       PNG 重编码 → ACP 顺序 image 块，`promptCapabilities.image` 门控）、
       语法高亮（fenced code 按语言逐行 token 着色）
-- [ ] **Phase 3** — companion 插件 bundle（`tui` profile）+ npm 分发（平台预编译二进制）
+- [x] **Phase 3** — companion 插件 bundle（bootstrap.ps1/.sh 幂等引导：
+      `dsh plugin --profile acp add` + patch 插入行，install 脚本末尾自动调用）+
+      npm 分发（npm/ 包 + 平台二进制 shim + scripts/build-release.*，
+      实际 `npm publish` 需 npm 账号，流程见 npm/README.md）
 
 ## 协议速查（dsh acp surface 实测）
 

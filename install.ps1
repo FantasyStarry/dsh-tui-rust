@@ -8,10 +8,12 @@
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File install.ps1
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -SkipBuild   # 只复制已有产物
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -SkipBuild      # 只复制已有产物
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -SkipCompanion  # 跳过 companion 引导
 
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$SkipCompanion
 )
 
 $ErrorActionPreference = "Stop"
@@ -55,4 +57,11 @@ Write-Host "安装完成 ✔"
 Write-Host "  命令：dtr / dsh-tui / dsh-tui-rust（三者等价）"
 Write-Host "  位置：$binDir"
 Write-Host ""
+
+# companion 引导（Phase 3）：把工作区归组插件挂进 dsh 的 acp profile
+if (-not $SkipCompanion) {
+    & (Join-Path $root "bootstrap.ps1")
+} else {
+    Write-Host "已跳过 companion 引导（-SkipCompanion）"
+}
 Write-Host "在项目目录打开新终端，直接输入 dtr 启动；TUI 内 /web 可启动 web 界面。"

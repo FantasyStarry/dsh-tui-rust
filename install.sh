@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # dsh-tui-rust 安装脚本（macOS / Linux）
+# 环境变量：SKIP_COMPANION=1 跳过末尾的 companion 引导
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -21,3 +22,10 @@ case ":${PATH}:" in
 esac
 
 echo "安装完成 ✔  命令：dtr / dsh-tui / dsh-tui-rust"
+
+# companion 引导（Phase 3）
+if [ "${SKIP_COMPANION:-0}" != "1" ]; then
+  bash "$ROOT/bootstrap.sh"
+else
+  echo "已跳过 companion 引导（SKIP_COMPANION=1）"
+fi
