@@ -49,7 +49,11 @@ pub enum AcpEvent {
         title: String,
         kind: String,
         status: String,
+        /// Clipped rawInput preview (single line, for the card detail row).
         raw: Option<String>,
+        /// Full rawInput JSON string (unclipped) — the diff view parses edit
+        /// payloads (`old_str`/`new_str`, `file_text`) out of this.
+        raw_full: Option<String>,
     },
     ToolCallUpdate { tool_call_id: String, title: Option<String>, status: Option<String> },
     Usage { used: u64, size: u64 },
@@ -65,6 +69,9 @@ pub enum AcpEvent {
         exit_code: Option<i32>,
         send: bool,
     },
+    /// The kernel's initialize response advertised inline image prompts for
+    /// the boot route (`agentCapabilities.promptCapabilities.image`).
+    ImageCapable(bool),
     /// The `dsh web` probe result (up = port is listening).
     WebStatus { up: bool, url: String },
     ServerGone(String),
@@ -426,11 +433,17 @@ impl AcpClient {
     /// Send one prompt in a background task; the result arrives as
     /// [`AcpEvent::PromptSettled`] so the UI keeps rendering while it runs.
     pub fn prompt(&self, session_id: String, text: String) {
+        self.prompt_blocks(session_id, vec![json!({"type": "text", "text": text})]);
+    }
+
+    /// Prompt with fully built content blocks (text + pasted images, wire
+    /// order preserved). Same settlement contract as [`Self::prompt`].
+    pub fn prompt_blocks(&self, session_id: String, blocks: Vec<Value>) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let params = json!({
                 "sessionId": session_id,
-                "prompt": [{"type": "text", "text": text}]
+                "prompt": blocks
             });
             match inner.request("session/prompt", params, PROMPT_TIMEOUT).await {
                 Ok(r) => {
@@ -530,16 +543,18 @@ async fn dispatch(inner: &Arc<Inner>, v: Value) {
             }
         }
         "tool_call" => {
-            let raw = update
+            let raw_full = update
                 .get("rawInput")
                 .or_else(|| update.get("raw_input"))
-                .map(|v| clip(&v.to_string(), 160));
+                .map(|v| v.to_string());
+            let raw = raw_full.as_ref().map(|s| clip(s, 160));
             let _ = inner.events.send(AcpEvent::ToolCall {
                 tool_call_id: str_field(update, &["toolCallId", "tool_call_id"]).unwrap_or_default(),
                 title: str_field(update, &["title"]).unwrap_or_else(|| "工具调用".into()),
                 kind: str_field(update, &["kind"]).unwrap_or_default(),
                 status: str_field(update, &["status"]).unwrap_or_else(|| "pending".into()),
                 raw,
+                raw_full,
             });
         }
         "tool_call_update" => {

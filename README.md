@@ -139,6 +139,20 @@ dtr          # 或 dsh-tui / dsh-tui-rust，三者等价
 
 启动时后台检查 `dsh --version`（≥ 0.1.2-alpha.2 契约），过低或缺失会在状态区警告。
 
+### 工具 diff 视图 · 图片粘贴 · 语法高亮（Phase 2）
+
+- **diff 视图**：编辑类工具（str_replace / create）的工具卡解析 rawInput，
+  以 `- `（红，删除行）/ `+ `（绿，新增行）着色渲染新旧内容，路径在 `⤷` 头行；
+  每侧超过 12 行折叠为计数提示，Ctrl+O 整卡收起
+- **图片粘贴**：`Ctrl+V` 捕获剪贴板位图 → 本地重编码 PNG → canonical base64 →
+  随下一条消息按 ACP 线序作为 `{type:"image"}` 块发送（最多 4 张，Enter 发送、
+  Esc 清除、运行中不可发）。仅当内核 initialize 公布
+  `agentCapabilities.promptCapabilities.image` 时启用——取决于**启动时**的模型
+  路由，且目标模型还需声明 image 输入，否则 prompt 被内核拒绝并回显原因
+- **语法高亮**：fenced code 按语言逐行 token 着色——关键字紫、字符串绿、
+  数字橙、注释斜体暗、大写标识符按类型强调、JSON 键强调；内置
+  rust / js·ts / python / json / bash / sql / yaml·toml 词表，未知语言保持单色
+
 ### 流式展示说明（重要）
 
 **实测结论**（`scripts/acp-stream-probe.mjs`，对真实内核逐事件计时）：dsh 的 ACP
@@ -292,7 +306,7 @@ dsh 的 acp profile 禁用了模型生成标题（ACP 面无标题 surface，只
 
 ### 已知限制（Phase 1）
 
-- 正文按纯文本渲染（markdown/高亮留给 Phase 2）；思考流为暗色文本
+- 正文 markdown-lite + fenced code 逐行语法高亮；思考流为暗色斜体文本
 - ACP `session/resume` 不回放历史内容（内核上下文已恢复，但 TUI 不显示旧消息）
 - 会话列表标题：TUI 本地生成（首条消息前 24 字符，`~/.dsh-tui/session-titles.json`），
   而非内核模型生成
@@ -315,7 +329,10 @@ dsh 的 acp profile 禁用了模型生成标题（ACP 面无标题 surface，只
       CSI 2026 同步输出、`--render-bench` 基准（~500fps）、工具调用状态卡片、
       多行输入（Shift+Enter）、kimi 式命令体系（别名/分组/忙时门控）、
       `/doctor` `/preset` `/usage` `/permission`、主题系统（theme.json）
-- [ ] **Phase 2** — diff 视图（受 ACP 限制：无工具结果流）、图片粘贴、语法高亮
+- [x] **Phase 2** — diff 视图（编辑类工具卡着色渲染 `-`/`+` 新旧行，rawInput
+      解析 old_str/new_str 与 create/file_text）、图片粘贴（Ctrl+V 剪贴板 →
+      PNG 重编码 → ACP 顺序 image 块，`promptCapabilities.image` 门控）、
+      语法高亮（fenced code 按语言逐行 token 着色）
 - [ ] **Phase 3** — companion 插件 bundle（`tui` profile）+ npm 分发（平台预编译二进制）
 
 ## 协议速查（dsh acp surface 实测）

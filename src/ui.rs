@@ -282,17 +282,29 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     let mut cursor_col = inner.x + 2;
     for (i, raw) in all_lines.iter().enumerate().skip(start) {
-        let disp = tail_by_width(raw, avail);
+        // Staged clipboard images show as a count chip on the first line.
+        let marker = if i == 0 && !app.pending_images.is_empty() {
+            format!("[图×{}] ", app.pending_images.len())
+        } else {
+            String::new()
+        };
+        let marker_w = UnicodeWidthStr::width(marker.as_str());
+        let disp = tail_by_width(raw, avail.saturating_sub(marker_w));
         let mut spans: Vec<Span> = if i == 0 {
             vec![Span::raw(" "), Span::styled("❯ ", bold(app.theme.accent))]
         } else {
             vec![Span::styled("   ", plain(app.theme.fg))]
         };
+        if !marker.is_empty() {
+            spans.push(Span::styled(marker.clone(), plain(app.theme.warn)));
+        }
         if i == 0 && app.input.is_empty() {
-            spans.push(Span::styled(
-                "输入消息…（/ 命令 · !cmd 执行 shell · Shift+Enter 换行）",
-                plain(app.theme.dim),
-            ));
+            let hint = if app.image_capable {
+                "输入消息…（/ 命令 · !cmd 执行 shell · Shift+Enter 换行 · Ctrl+V 粘贴图片）"
+            } else {
+                "输入消息…（/ 命令 · !cmd 执行 shell · Shift+Enter 换行）"
+            };
+            spans.push(Span::styled(hint, plain(app.theme.dim)));
         } else if disp.is_empty() && i != 0 {
             spans.push(Span::styled(" ", plain(app.theme.fg)));
         } else {
@@ -301,7 +313,8 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
         if i == all_lines.len() - 1 {
             cursor_col = inner.x
                 + 3
-                + (UnicodeWidthStr::width(disp.as_str()) as u16).min(inner.width.saturating_sub(4));
+                + ((marker_w as u16) + (UnicodeWidthStr::width(disp.as_str()) as u16))
+                    .min(inner.width.saturating_sub(4));
         }
         lines.push(Line::from(spans));
     }

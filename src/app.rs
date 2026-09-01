@@ -35,8 +35,120 @@ pub struct Entry {
     pub status: Option<String>,
     /// Tool entries only: clipped rawInput preview (the actual command/args).
     pub detail: Option<String>,
+    /// Tool entries only: structured old/new content for edit-shaped tools
+    /// (parsed from rawInput) — rendered as a colored diff card body.
+    pub diff: Option<DiffView>,
     /// Tool entries only: the ACP tool_call_id (drives Ctrl+O collapse).
     pub tool_id: Option<String>,
+}
+
+/// Old/new line sets of one edit-shaped tool call (str_replace / file
+/// create), rendered as a colored diff inside the tool card.
+#[derive(Clone)]
+pub struct DiffView {
+    pub path: String,
+    pub old: Vec<String>,
+    pub new: Vec<String>,
+}
+
+/// Extract an editable diff from a tool's rawInput JSON. Recognizes the
+/// replacement shape (`old_str` + `new_str`) and the file-creation shape
+/// (`file_text`/`content`); anything else (bash, read, …) yields None.
+pub(crate) fn parse_diff(raw: &str) -> Option<DiffView> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let obj = v.as_object()?;
+    let path = obj
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let lines = |s: &str| s.lines().map(str::to_string).collect::<Vec<_>>();
+    if let (Some(o), Some(n)) = (
+        obj.get("old_str").and_then(|s| s.as_str()),
+        obj.get("new_str").and_then(|s| s.as_str()),
+    ) {
+        return Some(DiffView { path, old: lines(o), new: lines(n) });
+    }
+    if let Some(created) = obj
+        .get("file_text")
+        .or_else(|| obj.get("content"))
+        .and_then(|s| s.as_str())
+    {
+        return Some(DiffView { path, old: Vec::new(), new: lines(created) });
+    }
+    None
+}
+
+/// One clipboard image staged for the next prompt.
+#[derive(Clone)]
+pub struct PendingImage {
+    /// Kernel-admitted raster MIME (image/png here — clipboard bitmaps are
+    /// re-encoded to PNG before staging).
+    pub mime: &'static str,
+    /// Canonical base64 of the PNG bytes (kernel validates round-trip).
+    pub b64: String,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl PendingImage {
+    /// The ACP prompt block for this image (`{type, data, mimeType}` —
+    /// the kernel's strict admission shape, no base64 aliases accepted).
+    pub(crate) fn to_block(&self) -> serde_json::Value {
+        serde_json::json!({"type": "image", "data": self.b64, "mimeType": self.mime})
+    }
+}
+
+/// Grab one image from the system clipboard and stage it as PNG. Blocking —
+/// call from `spawn_blocking`.
+fn capture_clipboard_image() -> Result<PendingImage, String> {
+    let img = arboard::Clipboard::new()
+        .map_err(|e| format!("打开剪贴板失败: {e}"))?
+        .get_image()
+        .map_err(|_| "剪贴板里没有图片".to_string())?;
+    let (w, h) = (img.width as u32, img.height as u32);
+    let mut png_bytes = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png_bytes, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().map_err(|e| format!("PNG 编码失败: {e}"))?;
+        writer.write_image_data(&img.bytes).map_err(|e| format!("PNG 编码失败: {e}"))?;
+    }
+    Ok(PendingImage {
+        mime: "image/png",
+        b64: base64_encode(&png_bytes),
+        w,
+        h,
+    })
+}
+
+/// Canonical base64 (padded) — the kernel rejects non-canonical data.
+fn base64_encode(data: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// Kick off a blocking clipboard capture; the outcome arrives via the paste
+/// channel wired in [`App`] by the event loop.
+fn paste_clipboard_image(app: &mut App) {
+    if !app.image_capable {
+        app.sysnote("当前连接未公布图片输入能力（取决于启动时的模型路由），无法粘贴图片");
+        return;
+    }
+    if app.pending_images.len() >= 4 {
+        app.sysnote("最多附带 4 张图片");
+        return;
+    }
+    let Some(tx) = app.paste_tx.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let outcome = tokio::task::spawn_blocking(capture_clipboard_image)
+            .await
+            .unwrap_or_else(|e| Err(format!("后台任务失败: {e}")));
+        let _ = tx.send(outcome);
+    });
 }
 
 #[derive(Clone)]
@@ -434,6 +546,14 @@ pub struct App {
     /// Whether any prompt was dispatched in the current session. A fresh
     /// session that never saw one is pure residue and is closed on quit.
     prompted: bool,
+    /// Images captured from the clipboard (Ctrl+V), sent with the next
+    /// prompt as ordered ACP image blocks.
+    pub(crate) pending_images: Vec<PendingImage>,
+    /// Whether the kernel advertised inline image prompts at initialize
+    /// (`agentCapabilities.promptCapabilities.image`).
+    pub(crate) image_capable: bool,
+    /// Clipboard capture runs on a blocking thread; results land here.
+    paste_tx: Option<tokio::sync::mpsc::UnboundedSender<Result<PendingImage, String>>>,
     debug_log: VecDeque<String>,
     /// Locally generated session titles (first user prompt → short title),
     /// persisted in `~/.dsh-tui/session-titles.json`. The dsh acp profile
@@ -481,6 +601,9 @@ impl App {
             pending_settle: None,
             fresh_session: false,
             prompted: false,
+            pending_images: Vec::new(),
+            image_capable: false,
+            paste_tx: None,
             debug_log: VecDeque::new(),
             titles: load_titles(),
             perm_rules: load_permission_rules(),
@@ -513,6 +636,7 @@ impl App {
             text: text.to_string(),
             status: None,
             detail: None,
+            diff: None,
             tool_id: None,
         });
         // A non-chunk entry (tool card / user message / system note) breaks
@@ -531,6 +655,7 @@ impl App {
                 text: text.to_string(),
                 status: None,
                 detail: None,
+                diff: None,
                 tool_id: None,
             }),
         }
@@ -656,6 +781,7 @@ impl App {
                     text: slice,
                     status: None,
                     detail: None,
+                    diff: None,
                     tool_id: None,
                 });
                 self.entries.len() - 1
@@ -972,7 +1098,56 @@ fn entry_block(
                 ]);
             }
             if !collapsed {
-                if let Some(detail) = &e.detail {
+                if let Some(d) = &e.diff {
+                    // Structured edit diff: path header, `-` removals in err,
+                    // `+` additions in ok. Long sides cap with a count note —
+                    // the card is a preview, Ctrl+O collapses it entirely.
+                    const MAX_SIDE: usize = 12;
+                    if !d.path.is_empty() {
+                        let inner = cw.saturating_sub(2).max(2);
+                        for chunk in wrap_plain(&d.path, inner) {
+                            let pad = inner.saturating_sub(unicode_width::UnicodeWidthStr::width(chunk.as_str()));
+                            out.push(vec![
+                                Span::styled("│ ⤷ ".to_string(), t::plain(th.hairline)),
+                                Span::styled(chunk, t::plain(th.code_fg)),
+                                Span::styled(" ".repeat(pad), t::plain(color)),
+                                Span::styled(" │".to_string(), t::plain(color)),
+                            ]);
+                        }
+                    }
+                    for (side, marker, style) in [(&d.old, "│ - ", th.err), (&d.new, "│ + ", th.ok)] {
+                        if side.is_empty() {
+                            continue;
+                        }
+                        let shown = side.len().min(MAX_SIDE);
+                        for line in &side[..shown] {
+                            let inner = cw.saturating_sub(4).max(2);
+                            for (i, chunk) in wrap_plain(line, inner).into_iter().enumerate() {
+                                let prefix = if i == 0 { marker } else { "│   " };
+                                let pad = cw
+                                    .saturating_sub(2)
+                                    .saturating_sub(unicode_width::UnicodeWidthStr::width(chunk.as_str()));
+                                out.push(vec![
+                                    Span::styled(
+                                        prefix.to_string(),
+                                        t::plain(if i == 0 { style } else { th.hairline }),
+                                    ),
+                                    Span::styled(chunk, t::plain(style)),
+                                    Span::styled(" ".repeat(pad), t::plain(color)),
+                                    Span::styled(" │".to_string(), t::plain(color)),
+                                ]);
+                            }
+                        }
+                        if side.len() > shown {
+                            let note = format!("…（还有 {} 行）", side.len() - shown);
+                            out.push(vec![
+                                Span::styled("│   ".to_string(), t::plain(th.hairline)),
+                                Span::styled(note, t::plain(th.dim).add_modifier(Modifier::ITALIC)),
+                                Span::styled(" │".to_string(), t::plain(color)),
+                            ]);
+                        }
+                    }
+                } else if let Some(detail) = &e.detail {
                     for chunk in wrap_plain(detail, cw.saturating_sub(2).max(2)) {
                         let pad = cw
                             .saturating_sub(2)
@@ -1010,12 +1185,18 @@ fn entry_block(
 fn markdown_spans(text: &str, th: &crate::theme::Theme) -> Vec<Vec<Span<'static>>> {
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut in_code = false;
+    let mut code_lang: Option<String> = None;
     for raw in text.split('\n') {
         let line = raw.trim_end();
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
             in_code = !in_code;
             let lang = trimmed.trim_start_matches('`').trim();
+            code_lang = if in_code && !lang.is_empty() {
+                Some(lang.to_string())
+            } else {
+                None
+            };
             let edge = if in_code { "╭" } else { "╰" };
             let label = if in_code && !lang.is_empty() {
                 format!("{edge}─── {lang} ", )
@@ -1026,10 +1207,9 @@ fn markdown_spans(text: &str, th: &crate::theme::Theme) -> Vec<Vec<Span<'static>
             continue;
         }
         if in_code {
-            out.push(vec![
-                Span::styled("  │ ".to_string(), t::plain(th.hairline)),
-                Span::styled(line.to_string(), t::plain(th.code_fg)),
-            ]);
+            let mut spans = vec![Span::styled("  │ ".to_string(), t::plain(th.hairline))];
+            spans.extend(code_line_spans(line, code_lang.as_deref(), th));
+            out.push(spans);
             continue;
         }
         if trimmed.starts_with('#') {
@@ -1107,6 +1287,158 @@ fn inline_spans(s: &str, base: Style, th: &crate::theme::Theme) -> Vec<Span<'sta
     out
 }
 
+// ---------------------------------------------------------------------------
+// Fenced-code syntax highlighting (Phase 2): per-line token coloring, small
+// hand-rolled keyword sets — readable contrast, not full grammar parsing.
+// ---------------------------------------------------------------------------
+
+struct LangProfile {
+    keywords: &'static [&'static str],
+    /// Prefixes that comment out the rest of the line (`//`, `#`, `--`).
+    line_comments: &'static [&'static str],
+    /// Quote characters opening a string literal (backslash escapes honored).
+    quotes: &'static [char],
+    /// Treat `"…":` strings as object keys (JSON) — colored like types.
+    json_keys: bool,
+}
+
+fn lang_profile(lang: &str) -> Option<LangProfile> {
+    const RUST: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+        "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
+        "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait",
+        "true", "type", "unsafe", "use", "where", "while", "Some", "None", "Ok", "Err",
+    ];
+    const JS: &[&str] = &[
+        "async", "await", "break", "case", "catch", "class", "const", "continue", "default",
+        "delete", "do", "else", "export", "extends", "false", "finally", "for", "from",
+        "function", "if", "import", "in", "instanceof", "interface", "let", "new", "null", "of",
+        "private", "protected", "public", "readonly", "return", "static", "switch", "this",
+        "throw", "true", "try", "type", "typeof", "undefined", "var", "void", "while", "yield",
+    ];
+    const PY: &[&str] = &[
+        "and", "as", "assert", "async", "await", "break", "case", "class", "continue", "def",
+        "del", "elif", "else", "except", "False", "finally", "for", "from", "global", "if",
+        "import", "in", "is", "lambda", "match", "None", "nonlocal", "not", "or", "pass", "raise",
+        "return", "self", "True", "try", "while", "with", "yield",
+    ];
+    const BASH: &[&str] = &[
+        "break", "case", "cd", "continue", "do", "done", "echo", "elif", "else", "esac", "exit",
+        "export", "fi", "for", "function", "if", "in", "local", "return", "set", "source", "then",
+        "while",
+    ];
+    const SQL: &[&str] = &[
+        "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
+        "CREATE", "TABLE", "DROP", "ALTER", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "ON",
+        "GROUP", "BY", "ORDER", "LIMIT", "AND", "OR", "NOT", "NULL", "AS", "DISTINCT", "INDEX",
+        "PRIMARY", "KEY",
+    ];
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "rust" | "rs" => Some(LangProfile { keywords: RUST, line_comments: &["//"], quotes: &['"', '\''], json_keys: false }),
+        "js" | "javascript" | "ts" | "typescript" | "jsx" | "tsx" | "node" | "mjs" | "cjs" => {
+            Some(LangProfile { keywords: JS, line_comments: &["//"], quotes: &['"', '\'', '`'], json_keys: false })
+        }
+        "python" | "py" => Some(LangProfile { keywords: PY, line_comments: &["#"], quotes: &['"', '\''], json_keys: false }),
+        "json" | "jsonc" | "json5" => Some(LangProfile { keywords: &[], line_comments: &["//"], quotes: &['"'], json_keys: true }),
+        "bash" | "sh" | "shell" | "zsh" | "console" => Some(LangProfile { keywords: BASH, line_comments: &["#"], quotes: &['"', '\''], json_keys: false }),
+        "sql" => Some(LangProfile { keywords: SQL, line_comments: &["--"], quotes: &['\''], json_keys: false }),
+        "yaml" | "yml" | "toml" | "ini" | "conf" => Some(LangProfile { keywords: &[], line_comments: &["#"], quotes: &['"', '\''], json_keys: false }),
+        "html" | "xml" | "css" | "scss" => Some(LangProfile { keywords: &[], line_comments: &[], quotes: &['"', '\''], json_keys: false }),
+        _ => None,
+    }
+}
+
+/// Colorize one fenced-code line. Per-line pass (no cross-line state): line
+/// comments, string literals with backslash escapes, numbers, keywords and
+/// Capitalized types; everything else keeps the plain code color.
+fn code_line_spans(line: &str, lang: Option<&str>, th: &crate::theme::Theme) -> Vec<Span<'static>> {
+    let Some(p) = lang.and_then(lang_profile) else {
+        return vec![Span::styled(line.to_string(), t::plain(th.code_fg))];
+    };
+    let flush = |cur: &mut String, out: &mut Vec<Span<'static>>| {
+        if !cur.is_empty() {
+            out.push(Span::styled(std::mem::take(cur), t::plain(th.code_fg)));
+        }
+    };
+    let chars: Vec<char> = line.chars().collect();
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let rest: String = chars[i..].iter().collect();
+        if p.line_comments.iter().any(|c| rest.starts_with(c)) {
+            flush(&mut cur, &mut out);
+            out.push(Span::styled(rest, t::plain(th.dim).add_modifier(Modifier::ITALIC)));
+            return out;
+        }
+        let c = chars[i];
+        if p.quotes.contains(&c) {
+            let mut j = i + 1;
+            let mut lit = String::new();
+            lit.push(c);
+            while j < chars.len() {
+                lit.push(chars[j]);
+                if chars[j] == '\\' && j + 1 < chars.len() {
+                    lit.push(chars[j + 1]);
+                    j += 2;
+                    continue;
+                }
+                let closed = chars[j] == c;
+                j += 1;
+                if closed {
+                    break;
+                }
+            }
+            flush(&mut cur, &mut out);
+            let style = if p.json_keys {
+                let after: String = chars[j..].iter().collect();
+                if after.trim_start().starts_with(':') {
+                    t::plain(th.accent)
+                } else {
+                    t::plain(th.ok)
+                }
+            } else {
+                t::plain(th.ok)
+            };
+            out.push(Span::styled(lit, style));
+            i = j;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let mut j = i;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.') {
+                j += 1;
+            }
+            flush(&mut cur, &mut out);
+            out.push(Span::styled(chars[i..j].iter().collect::<String>(), t::plain(th.warn)));
+            i = j;
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            let mut j = i;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let word: String = chars[i..j].iter().collect();
+            flush(&mut cur, &mut out);
+            let style = if p.keywords.contains(&word.as_str()) {
+                t::plain(th.violet)
+            } else if word.starts_with(|ch: char| ch.is_uppercase()) {
+                t::plain(th.accent)
+            } else {
+                t::plain(th.code_fg)
+            };
+            out.push(Span::styled(word, style));
+            i = j;
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
 /// Wrap `spans` to `max` display columns and coalesce adjacent same-style
 /// chars back into styled spans; continuation lines get `cont` (style)
 /// indented by `cont_prefix`.
@@ -1171,11 +1503,26 @@ pub async fn run(
 
     let mut app = App::new();
 
-    // Create the first session in the background.
+    // Clipboard-image capture results land on this channel.
+    let (paste_tx, mut paste_rx) = mpsc::unbounded_channel::<Result<PendingImage, String>>();
+    app.paste_tx = Some(paste_tx);
+
+    // Create the first session in the background. initialize comes first —
+    // its response advertises inline image support for the boot route.
     {
         let client2 = client.clone();
         let cwd = app.cwd.clone();
         tokio::spawn(async move {
+            match client2.initialize().await {
+                Ok(r) => {
+                    let image = r
+                        .pointer("/agentCapabilities/promptCapabilities/image")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    client2.emit(AcpEvent::ImageCapable(image));
+                }
+                Err(e) => client2.emit(AcpEvent::Notice(format!("initialize 失败: {e:#}"))),
+            }
             match client2.new_session(&cwd).await {
                 Ok((sid, cfg)) => {
                     client2.emit(AcpEvent::ConfigUpdated(cfg));
@@ -1226,6 +1573,16 @@ pub async fn run(
                     }
                 }
                 None => break,
+            },
+            pr = paste_rx.recv() => match pr {
+                Some(Ok(img)) => {
+                    let n = app.pending_images.len() + 1;
+                    let (w, h) = (img.w, img.h);
+                    app.pending_images.push(img);
+                    app.sysnote(&format!("已捕获剪贴板图片（第 {n} 张，{w}×{h}，随下一条消息发送）"));
+                }
+                Some(Err(e)) => app.sysnote(&format!("读取剪贴板失败: {e}")),
+                None => {}
             },
             _ = render_tick.tick() => {
                 // Advance the typewriter reveal strictly on the render
@@ -1482,6 +1839,10 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
 
     // --- main mode ----------------------------------------------------------
     match key.code {
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Stage a clipboard image for the next prompt (Phase 2 图片粘贴).
+            paste_clipboard_image(app);
+        }
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             open_sessions(app, client).await;
         }
@@ -1523,6 +1884,9 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                 app.flush_reveal(); // show whatever the kernel already sent
             } else if !app.input.is_empty() {
                 app.input.clear();
+            } else if !app.pending_images.is_empty() {
+                app.pending_images.clear();
+                app.sysnote("已清除待发图片");
             } else if app.queue_len() > 0 {
                 app.queue.clear();
                 app.sysnote("已清空排队消息");
@@ -1536,7 +1900,7 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
         }
         KeyCode::Enter => {
             let text = app.input.trim().to_string();
-            if text.is_empty() {
+            if text.is_empty() && app.pending_images.is_empty() {
                 return Ok(());
             }
             // `!cmd` / `!!cmd` shell passthrough (pi-inspired): run the
@@ -1554,13 +1918,20 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
             }
             // Verbatim slash command (canonical name or alias); anything
             // unmatched is sent to the agent as a normal message (kimi-style).
-            if let Some(cmd) = resolve_cmd(&text) {
-                app.input.clear();
-                run_command(app, client, cmd).await;
-                return Ok(());
+            // A send that carries staged images always goes to the agent.
+            if app.pending_images.is_empty() {
+                if let Some(cmd) = resolve_cmd(&text) {
+                    app.input.clear();
+                    run_command(app, client, cmd).await;
+                    return Ok(());
+                }
             }
             if app.state == RunState::Busy {
                 // dsh allows one in-flight prompt per session; queue instead.
+                if !app.pending_images.is_empty() {
+                    app.sysnote("运行中暂不能发送图片，待本轮结束后再按 Enter");
+                    return Ok(());
+                }
                 if let Some(sid) = app.session_id.clone() {
                     note_session_title(&mut app.titles, &sid, &text);
                 }
@@ -1574,15 +1945,25 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                 app.sysnote("会话尚未就绪，请稍候…");
                 return Ok(());
             };
-            note_session_title(&mut app.titles, &sid, &text);
-            app.push_entry(EntryKind::User, &text);
+            // Ordered image blocks first, then the text (ACP preserves wire
+            // order; adjacent text concatenates on the kernel side).
+            let images = std::mem::take(&mut app.pending_images);
+            let mut blocks: Vec<Value> = images.iter().map(|img| img.to_block()).collect();
+            if !text.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            let shown = if text.is_empty() { "[图片]".to_string() } else { text.clone() };
+            if !text.is_empty() {
+                note_session_title(&mut app.titles, &sid, &text);
+            }
+            app.push_entry(EntryKind::User, &shown);
             app.push_history(&text);
             app.input.clear();
             app.state = RunState::Busy;
             app.busy_since = Some(Instant::now());
             app.scroll_from_bottom = 0; // sending snaps the view to the latest
             app.prompted = true;
-            client.prompt(sid, text);
+            client.prompt_blocks(sid, blocks);
         }
         KeyCode::Backspace => {
             app.input.pop();
@@ -2633,6 +3014,13 @@ pub(crate) fn rel_time(s: &str) -> String {
 
 fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
     match ev {
+        AcpEvent::ImageCapable(ok) => {
+            app.image_capable = ok;
+            if ok {
+                app.sysnote("已启用图片输入：Ctrl+V 粘贴剪贴板图片");
+            }
+            false
+        }
         AcpEvent::SessionCreated { session_id } => {
             app.session_id = Some(session_id.clone());
             app.fresh_session = true;
@@ -2717,17 +3105,19 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
             app.enqueue_reveal(EntryKind::Thought, &t);
             false
         }
-        AcpEvent::ToolCall { tool_call_id, title, kind, status, raw } => {
+        AcpEvent::ToolCall { tool_call_id, title, kind, status, raw, raw_full } => {
             let text = if kind.is_empty() {
                 title.clone()
             } else {
                 format!("{title} [{kind}]")
             };
+            let diff = raw_full.as_deref().and_then(parse_diff);
             app.entries.push(Entry {
                 kind: EntryKind::Tool,
                 text,
                 status: Some(status.clone()),
                 detail: raw,
+                diff,
                 tool_id: Some(tool_call_id.clone()),
             });
             app.last_tool_id = Some(tool_call_id.clone());
@@ -3077,6 +3467,7 @@ mod tests {
             text: "edit [write]".into(),
             status: Some("completed".into()),
             detail: Some("path/to/file.txt".into()),
+            diff: None,
             tool_id: Some("t1".into()),
         };
         let th = crate::theme::Theme::default();
@@ -3227,5 +3618,131 @@ mod tests {
             ticks += 1;
         }
         assert!(ticks <= 6, "one-char reveal should drain in ≤6 ticks, took {ticks}");
+    }
+
+    #[test]
+    fn parse_diff_recognizes_edit_shapes() {
+        // str_replace shape: old_str/new_str become the two sides.
+        let d = parse_diff(
+            r#"{"command":"str_replace","path":"src/lib.rs","old_str":"fn a() {}","new_str":"fn a() {\n    b();\n}"}"#,
+        )
+        .expect("str_replace parses");
+        assert_eq!(d.path, "src/lib.rs");
+        assert_eq!(d.old, vec!["fn a() {}".to_string()]);
+        assert_eq!(d.new, vec!["fn a() {".to_string(), "    b();".to_string(), "}".to_string()]);
+
+        // create shape: file_text becomes all-additions.
+        let d = parse_diff(r#"{"command":"create","path":"new.txt","file_text":"hello\nworld"}"#)
+            .expect("create parses");
+        assert!(d.old.is_empty());
+        assert_eq!(d.new, vec!["hello".to_string(), "world".to_string()]);
+
+        // content alias works too.
+        assert!(parse_diff(r#"{"path":"x","content":"a"}"#).is_some());
+
+        // Non-edit payloads (bash, read, garbage) yield None.
+        assert!(parse_diff(r#"{"command":"bash"}"#).is_none());
+        assert!(parse_diff("not json").is_none());
+    }
+
+    #[test]
+    fn diff_card_renders_colored_sides_in_box() {
+        let mut app = App::new();
+        app.entries.push(Entry {
+            kind: EntryKind::Tool,
+            text: "编辑 src/lib.rs".into(),
+            status: Some("completed".into()),
+            detail: Some(r#"{"old_str":"a"}"#.into()),
+            diff: Some(DiffView {
+                path: "src/lib.rs".into(),
+                old: vec!["fn old() {}".into()],
+                new: vec!["fn new() {".into(), "    x();".into(), "}".into()],
+            }),
+            tool_id: Some("t1".into()),
+        });
+        let lines = entry_block(
+            app.entries.last().unwrap(),
+            60,
+            true,
+            false,
+            &app.theme,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.iter().map(|s| s.content.clone()))
+            .collect();
+        assert!(text.contains("- fn old() {}"), "removal line present: {text}");
+        assert!(text.contains("+ fn new() {"), "addition line present: {text}");
+        assert!(text.contains("⤷ src/lib.rs"), "path header present: {text}");
+        // Box integrity: every line stays inside the card width.
+        for l in &lines {
+            let w: usize = l.iter().map(|s| s.content.chars().count()).sum();
+            assert!(w <= 60, "line wider than card: {w} — {text}");
+        }
+    }
+
+    #[test]
+    fn code_highlight_tokens_by_language() {
+        let th = crate::theme::load_theme();
+        // Rust: keyword / number / comment get distinct semantic colors.
+        let spans = code_line_spans("let x = 42; // note", Some("rust"), &th);
+        assert!(
+            spans.iter().any(|s| s.content == "let" && s.style.fg == Some(th.violet)),
+            "keyword colored: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|s| s.content == "42" && s.style.fg == Some(th.warn)),
+            "number colored: {spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content.starts_with("//") && s.style.fg == Some(th.dim)),
+            "comment colored: {spans:?}"
+        );
+        assert!(spans.iter().any(|s| s.content == "x" && s.style.fg == Some(th.code_fg)));
+        // JSON: keys accent, values colored as numbers.
+        let spans = code_line_spans("\"name\": 1", Some("json"), &th);
+        assert!(spans.iter().any(|s| s.content == "\"name\"" && s.style.fg == Some(th.accent)));
+        assert!(spans.iter().any(|s| s.content == "1" && s.style.fg == Some(th.warn)));
+        // Capitalized identifiers read as types.
+        let spans = code_line_spans("let v: Vec<u8> = Vec::new();", Some("rust"), &th);
+        assert!(spans.iter().filter(|s| s.content == "Vec").all(|s| s.style.fg == Some(th.accent)));
+        // Unknown language: single plain span.
+        let spans = code_line_spans("whatever !!", Some("brainfuck"), &th);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "whatever !!");
+    }
+
+    #[test]
+    fn markdown_code_fence_applies_language() {
+        let th = crate::theme::load_theme();
+        let lines = markdown_spans("```rust\nlet x = 1;\n```", &th);
+        // Fence edge + highlighted code line (keyword present as own span).
+        assert!(lines.iter().flatten().any(|s| s.content.contains("rust")));
+        assert!(lines
+            .iter()
+            .flatten()
+            .any(|s| s.content == "let" && s.style.fg == Some(th.violet)));
+        // Plain text without fences stays untouched.
+        let lines = markdown_spans("let x = 1;", &th);
+        assert_eq!(lines[0].len(), 1, "no fence → no highlighting");
+    }
+
+    #[test]
+    fn pending_image_block_matches_kernel_admission_shape() {
+        let img = PendingImage { mime: "image/png", b64: "aGk=".into(), w: 2, h: 3 };
+        let block = img.to_block();
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["mimeType"], "image/png");
+        assert_eq!(block["data"], "aGk=");
+        // Canonical base64 round-trip (the kernel rejects non-canonical data).
+        let decoded = base64_decode(block["data"].as_str().unwrap());
+        assert_eq!(decoded, b"hi");
+    }
+
+    fn base64_decode(s: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
     }
 }
