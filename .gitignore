@@ -1,3 +1,4 @@
 /target
 /design
 probe-out*.txt
+probe-hardkill.txt
