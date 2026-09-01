@@ -95,6 +95,11 @@ fn draw_top_bar(f: &mut Frame, app: &App, area: Rect) {
     left.push(Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), plain(DIM)));
 
     let mut right: Vec<Span> = Vec::new();
+    if let Some(url) = &app.web_url {
+        let port = url.rsplit(':').next().unwrap_or("");
+        right.push(theme::pill(&format!("🌐 :{port}"), OK));
+        right.push(Span::raw(" "));
+    }
     if let Some(m) = app.model_label() {
         right.push(theme::pill(&m, VIOLET));
         right.push(Span::raw(" "));

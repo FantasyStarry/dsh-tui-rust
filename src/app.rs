@@ -261,6 +261,39 @@ fn save_prefs(p: &Prefs) {
 }
 
 // ---------------------------------------------------------------------------
+// Input history (persisted to ~/.dsh-tui/history.json, capped)
+// ---------------------------------------------------------------------------
+
+const HISTORY_CAP: usize = 200;
+
+fn history_path() -> Option<PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    let dir = PathBuf::from(home).join(".dsh-tui");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("history.json"))
+}
+
+fn load_history() -> Vec<String> {
+    let Some(p) = history_path() else {
+        return Vec::new();
+    };
+    let Ok(txt) = std::fs::read_to_string(p) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&txt).unwrap_or_default()
+}
+
+fn save_history(history: &[String]) {
+    let tail: Vec<String> = history.iter().rev().take(HISTORY_CAP).cloned().collect();
+    let tail: Vec<String> = tail.into_iter().rev().collect();
+    if let Some(path) = history_path() {
+        let _ = std::fs::write(path, serde_json::to_string_pretty(&tail).unwrap_or_default());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Local session titles — the dsh acp profile disables model-generated titles
 // (ACP exposes no title surface), so the TUI keeps its own map keyed by
 // session id: the first user prompt of a session becomes its short title,
@@ -334,6 +367,8 @@ pub struct App {
     pub fatal: Option<String>,
     /// When the in-flight prompt started (drives the elapsed timer + spinner).
     pub busy_since: Option<Instant>,
+    /// Web GUI reachability (from `/web` probes): URL when up.
+    pub web_url: Option<String>,
     /// Flattened, wrapped display lines (built incrementally from
     /// [`App::disp_cache`]; see [`App::ensure_display`]).
     pub display: Vec<Vec<Span<'static>>>,
@@ -390,6 +425,7 @@ impl App {
             state: RunState::Booting,
             fatal: None,
             busy_since: Some(Instant::now()),
+            web_url: None,
             display: Vec::new(),
             quit: false,
             disp_cache: Vec::new(),
@@ -398,7 +434,7 @@ impl App {
             queue: VecDeque::new(),
             cmd_selected: 0,
             pref: load_prefs(),
-            history: Vec::new(),
+            history: load_history(),
             hist_cursor: None,
             queued_permissions: Vec::new(),
             tool_idx: HashMap::new(),
@@ -454,6 +490,20 @@ impl App {
             }),
         }
         self.invalidate(self.entries.len() - 1);
+    }
+
+    /// Remember a sent input in the (persisted) history.
+    fn push_history(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.history.last().map(String::as_str) == Some(text) {
+            self.hist_cursor = None;
+            return;
+        }
+        self.history.push(text.to_string());
+        self.hist_cursor = None;
+        save_history(&self.history);
     }
 
     /// Clear the transcript and its display caches (new session / resume /
@@ -1275,6 +1325,7 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                 let send = !rest.starts_with('!');
                 let cmd = if send { rest } else { &rest[1..] };
                 if !cmd.trim().is_empty() {
+                    app.push_history(&text);
                     app.input.clear();
                     run_shell(app, client, cmd.trim().to_string(), send);
                     return Ok(());
@@ -1293,8 +1344,7 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                     note_session_title(&mut app.titles, &sid, &text);
                 }
                 app.queue.push_back(text.clone());
-                app.history.push(text.clone());
-                app.hist_cursor = None;
+                app.push_history(&text);
                 app.input.clear();
                 app.sysnote(&format!("已排队（第 {} 条，完成后自动发送）", app.queue_len()));
                 return Ok(());
@@ -1305,11 +1355,11 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
             };
             note_session_title(&mut app.titles, &sid, &text);
             app.push_entry(EntryKind::User, &text);
-            app.history.push(text.clone());
-            app.hist_cursor = None;
+            app.push_history(&text);
             app.input.clear();
             app.state = RunState::Busy;
             app.busy_since = Some(Instant::now());
+            app.scroll_from_bottom = 0; // sending snaps the view to the latest
             client.prompt(sid, text);
         }
         KeyCode::Backspace => {
@@ -1566,6 +1616,7 @@ fn start_web(client: &AcpClient) {
     tokio::spawn(async move {
         use std::time::Duration;
         if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            c.emit(AcpEvent::WebStatus { up: true, url: url.clone() });
             c.emit(AcpEvent::Notice(format!("web 已在运行：{url}")));
             return;
         }
@@ -1575,6 +1626,7 @@ fn start_web(client: &AcpClient) {
                 for i in 0..45u32 {
                     tokio::time::sleep(Duration::from_millis(1000)).await;
                     if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                        c.emit(AcpEvent::WebStatus { up: true, url: url.clone() });
                         c.emit(AcpEvent::Notice(format!(
                             "web 已启动：{url}（浏览器已打开；退出 TUI 不影响 web）"
                         )));
@@ -1584,13 +1636,17 @@ fn start_web(client: &AcpClient) {
                         c.emit(AcpEvent::Notice(format!("等待 web 就绪…（{}s）", i)));
                     }
                 }
+                c.emit(AcpEvent::WebStatus { up: false, url: url.clone() });
                 c.emit(AcpEvent::Notice(format!(
                     "web 启动超时：{url} 未监听。请手动运行 `dsh web` 查看原因"
                 )));
             }
-            Err(e) => c.emit(AcpEvent::Notice(format!(
-                "启动 dsh web 失败: {e:#}（请手动运行 `dsh web`）"
-            ))),
+            Err(e) => {
+                c.emit(AcpEvent::WebStatus { up: false, url: url.clone() });
+                c.emit(AcpEvent::Notice(format!(
+                    "启动 dsh web 失败: {e:#}（请手动运行 `dsh web`）"
+                )));
+            }
         }
     });
 }
@@ -2536,6 +2592,7 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
                     app.push_entry(EntryKind::User, &next);
                     app.state = RunState::Busy;
                     app.busy_since = Some(Instant::now());
+                    app.scroll_from_bottom = 0;
                     client.prompt(sid, next);
                 }
             }
@@ -2570,11 +2627,17 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
                     app.push_entry(EntryKind::User, &prompt_text);
                     app.state = RunState::Busy;
                     app.busy_since = Some(Instant::now());
+                    app.scroll_from_bottom = 0;
                     client.prompt(sid, prompt_text);
                 } else {
                     app.sysnote("会话尚未就绪，shell 输出未发送");
                 }
             }
+            false
+        }
+        AcpEvent::WebStatus { up, url } => {
+            app.web_url = up.then_some(url);
+            app.dirty = true;
             false
         }
         AcpEvent::ServerGone(reason) => {

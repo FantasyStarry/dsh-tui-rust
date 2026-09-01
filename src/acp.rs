@@ -65,6 +65,8 @@ pub enum AcpEvent {
         exit_code: Option<i32>,
         send: bool,
     },
+    /// The `dsh web` probe result (up = port is listening).
+    WebStatus { up: bool, url: String },
     ServerGone(String),
     Notice(String),
 }
