@@ -50,7 +50,8 @@ struct ToolMeta {
 /// (automation-only contract) delivers assistant messages and thoughts as
 /// single committed blocks at turn end — raw provider deltas never touch the
 /// wire (verified with `scripts/acp-stream-probe.mjs`). To restore the
-/// streaming feel, committed text is typed out locally (~1s per block).
+/// streaming feel, committed text is typed out locally with length-aware
+/// pacing (`paced_ticks`): short chunks snap in, long ones stay a ≤1s wipe.
 struct Reveal {
     kind: EntryKind,
     text: String,
@@ -544,6 +545,17 @@ impl App {
 
     // -- typewriter reveal (committed chunk → streaming look) ---------------
 
+    /// Render ticks (~33ms) a reveal of `chars` chars should take: a ~0.1s
+    /// baseline plus ~3ms per char, clamped to [0.1s, 1.0s]. Short chunks
+    /// snap in almost immediately instead of burning a fixed second; long
+    /// ones stay a brisk ≤1s wipe, so the committed-burst display never
+    /// lags noticeably behind the settle.
+    fn paced_ticks(chars: usize) -> u32 {
+        const TICK_SECS: f32 = 0.033;
+        let secs = (0.10 + 0.003 * chars as f32).clamp(0.10, 1.00);
+        (secs / TICK_SECS).ceil().max(1.0) as u32
+    }
+
     /// Queue a committed assistant/thought chunk for progressive reveal.
     /// Opt out with `DSH_TUI_NO_TYPEWRITER=1` (append directly).
     fn enqueue_reveal(&mut self, kind: EntryKind, text: &str) {
@@ -555,7 +567,13 @@ impl App {
             return;
         }
         match self.reveal_queue.back_mut() {
-            Some(back) if back.kind == kind && !back.sealed => back.text.push_str(text),
+            Some(back) if back.kind == kind && !back.sealed => {
+                back.text.push_str(text);
+                // The block grew after merging: give it a larger budget so
+                // a burst-merged long text never dumps within a couple of
+                // frames.
+                back.ticks_left = back.ticks_left.max(Self::paced_ticks(back.text.chars().count()));
+            }
             _ => {
                 let force_new = self
                     .reveal_queue
@@ -564,7 +582,7 @@ impl App {
                 self.reveal_queue.push_back(Reveal {
                     kind,
                     text: text.to_string(),
-                    ticks_left: 30,
+                    ticks_left: Self::paced_ticks(text.chars().count()),
                     target: None,
                     sealed: false,
                     force_new,
@@ -1201,10 +1219,14 @@ pub async fn run(
                 }
                 None => break,
             },
-            _ = render_tick.tick() => {}
+            _ = render_tick.tick() => {
+                // Advance the typewriter reveal strictly on the render
+                // cadence: pacing it on every event-loop iteration would
+                // let bursts of key/ACP events fast-forward the queue
+                // beyond the ~30fps it is designed for.
+                app.tick_reveal();
+            }
         }
-        // Advance the typewriter reveal (paced by the 33ms render tick).
-        app.tick_reveal();
         if app.quit_requested() {
             // Cancel any in-flight prompt first: the prompt task holds a
             // client clone, so without cancellation the runtime would linger
@@ -3153,5 +3175,29 @@ mod tests {
         assert_eq!(agent_entries.len(), 2, "tool card must break the reveal");
         assert_eq!(agent_entries[0].text, "第一段");
         assert_eq!(agent_entries[1].text, "第二段");
+    }
+
+    #[test]
+    fn reveal_pacing_is_length_aware() {
+        // Monotonic in length and clamped to [0.1s, 1.0s] (~4..=31 ticks).
+        assert_eq!(
+            App::paced_ticks(5000),
+            App::paced_ticks(50_000),
+            "long reveals clamp at ~1s"
+        );
+        assert!(App::paced_ticks(20) < App::paced_ticks(200));
+        assert!(App::paced_ticks(200) <= App::paced_ticks(5000));
+        assert!(App::paced_ticks(20) <= 6, "short chunk must not burn a second");
+
+        // A one-char chunk drains within a handful of frames.
+        std::env::remove_var("DSH_TUI_NO_TYPEWRITER");
+        let mut app = App::new();
+        app.enqueue_reveal(EntryKind::Agent, "短");
+        let mut ticks = 0;
+        while app.reveal_active() {
+            app.tick_reveal();
+            ticks += 1;
+        }
+        assert!(ticks <= 6, "one-char reveal should drain in ≤6 ticks, took {ticks}");
     }
 }
