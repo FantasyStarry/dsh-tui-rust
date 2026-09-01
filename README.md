@@ -2,6 +2,10 @@
 
 基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的终端客户端（类 Claude Code 形态）。
 
+> 官方仓库默认分支是 **`master`**（本仓库持续跟踪；kimi-code / pi 为 `main`）。
+> 参考资料与设计调研见 [`docs/research/`](docs/research/)（deepseek-harness /
+> kimi-code / pi 三份研究报告）。
+
 **核心原则：Rust 只做终端前端壳，Node 内核（dsh）通过协议复用，永不修改。**
 
 ## 架构
@@ -31,6 +35,7 @@ TUI 退出不会影响内核，会话已持久化，重启后 `Ctrl+L` 可恢复
 | 隔离层 | 机制 |
 |--------|------|
 | 进程隔离 | dsh 以子进程运行（`dsh --profile acp`），TUI 崩溃不影响内核，内核崩溃可凭持久化会话 resume |
+| 优雅退出 | 退出时先对 dsh stdin 发 EOF 请求优雅关机（持久化冲刷）；实测部分 out-of-tree 插件会阻止 dsh 退出，故 3 秒宽限后**整树强杀**（Windows：`taskkill /T` + 孤儿枚举，因 `cmd /C` 包装下 node 是孙进程；Unix：直接 kill）——保证 TUI 进程永不悬挂 |
 | 协议隔离 | 只依赖官方承诺的标准 ACP v1 surface（无私有方法、无 `_meta`），上游只要保持 ACP 兼容就不会破坏 TUI |
 | 环境隔离 | dsh 自带 profile 机制：acp profile 的插件树、补丁、持久化都在 `$DSH_HOME/profiles/acp/` 独立目录，与 web profile 互不干扰 |
 | 版本契约 | 要求 `dsh >= 0.1.2-alpha.2` 在 PATH 上（或用 `DSH_BIN` 环境变量指向可执行文件） |
@@ -87,13 +92,16 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 | `Ctrl+E` / `/effort` | 推理档位切换（off/low/high/max） |
 | `Ctrl+L` 或 `/list` | 持久化会话列表 → `Enter` 恢复（session/resume，需 cwd 校验） |
 | `Ctrl+N` 或 `/new` | 新建会话（旧会话 close 后保留在持久化里） |
+| `!cmd` / `!!cmd` | **shell 直通**（借鉴 pi）：本地执行命令并展示输出；`!` 额外把输出作为上下文发给模型，`!!` 只显示不上送 |
+| `/cost` | 今日 token 用量与费用估算（读 `~/.dsh/storages/token-stats.json`，与 web 共用数据） |
+| `/status` | 当前会话 / 模型 / 上下文 / 队列信息面板 |
 | `/web` | 启动 / 打开 web 界面（见上） |
 | `鼠标滚轮` / `PgUp` / `PgDn` | 滚动历史；状态栏显示滚动标尺；回到底部自动跟随 |
 | `Home` / `End` | 跳到顶部 / 底部 |
 | `↑` / `↓` | 输入历史 |
 | `Ctrl+C` | 退出（stdin EOF 触发 dsh 优雅关机） |
 
-命令一览：`/help` `/new` `/list` `/model` `/effort` `/web` `/clear`（清屏，不影响会话）`/quit`。
+命令一览：`/help`（面板）`/new` `/list` `/model` `/effort` `/cost` `/status` `/web` `/clear`（清屏，不影响会话）`/quit`。
 
 ### 模型选择与 web 端的关系
 
@@ -161,11 +169,45 @@ web 端创建会话时由客户端显式携带 workspaceId；ACP 协议没有这
 > 已实测：TUI 新会话几秒内进入 `dsh-tui-rust` 工作区；从未注册的目录创建的会话
 > 会自动生成同名工作区并归入。
 
+### shell 直通（`!cmd` / `!!cmd`）
+
+借鉴 [pi](https://github.com/earendil-works/pi) 的 `!` 命令：在输入框以 `!` 开头
+的命令**本地执行**（以当前工作目录为 cwd），输出渲染进转写区（超长自动截断）：
+
+- `!git status` — 执行并把输出作为上下文发给模型（等价于 pi 的 BashExecutionMessage）
+- `!!git status` — 只执行并显示，不上送模型
+
+运行中 UI 不阻塞（后台任务 + `ShellDone` 事件）；模型忙时 `!` 的输出自动排队。
+
+### `/cost` 用量与费用（读共享 `~/.dsh`）
+
+`dsh-token-stats` 插件把每日用量写到 `$DSH_HOME/storages/token-stats.json`（web 与
+TUI 共用同一份）。`/cost` 汇总**今日**各提供商/模型的请求数与各类 token
+（输入/输出/缓存读/缓存写/推理），并按价目估算费用：
+
+- 内置参考价表（DeepSeek / MiniMax / GLM / GPT-5.6 等，2026-09 参考价）
+- 覆盖：`~/.dsh-tui/prices.json`，键为模型 id、**前缀匹配**（与
+  `cordis.patch.yml` 里 token-stats 的价目写法一致）：
+
+```json
+{
+  "deepseek-v4-flash": { "input": 0.14, "cacheRead": 0.028, "cacheWrite": 0.14, "output": 0.28 }
+}
+```
+
+### 本地会话标题
+
+dsh 的 acp profile 禁用了模型生成标题（ACP 面无标题 surface，只有确定性 fallback
+标题）。TUI 在**会话首条消息**时本地生成短标题（前 24 字符），持久化到
+`~/.dsh-tui/session-titles.json`；`/list` 里优先展示本地标题，其次 dsh fallback，
+最后才是 cwd。
+
 ### 已知限制（Phase 1）
 
 - 正文按纯文本渲染（markdown/高亮留给 Phase 2）；思考流为暗色文本
 - ACP `session/resume` 不回放历史内容（内核上下文已恢复，但 TUI 不显示旧消息）
-- 会话列表无标题（dsh ACP 面禁用了模型生成标题），按 cwd + 短 ID 展示
+- 会话列表标题：TUI 本地生成（首条消息前 24 字符，`~/.dsh-tui/session-titles.json`），
+  而非内核模型生成
 - 模型目录同步依赖提供商注册时机，极端情况下（settings 加载失败）会保留
   内置 DeepSeek 列表并在打开 `/model` 时重试刷新
 
@@ -178,6 +220,9 @@ web 端创建会话时由客户端显式携带 workspaceId；ACP 协议没有这
 - [x] **可用化里程碑** — 模型/推理档位热切换（`set_config_option`，probe 验证
       configId 契约）、忙时消息队列、markdown-lite 正文渲染、工具 rawInput 预览、
       模型目录与 web 同步、`/web` 启动 web、`dtr` 直达命令
+- [x] **客户端体验里程碑** — `!`/`!!` shell 直通（借鉴 pi）、`/cost` 用量费用、
+      `/status` 信息面板、`/help` 面板化、本地会话标题（首条消息）、
+      会话列表相对时间 + 当前会话标记、版本号统一（0.3.0）
 - [ ] **Phase 2** — diff 视图、完整 markdown/高亮、主题系统
 - [ ] **Phase 3** — companion 插件 bundle（`tui` profile）+ npm 分发（平台预编译二进制）
 

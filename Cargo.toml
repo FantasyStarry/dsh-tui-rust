@@ -1,8 +1,9 @@
 [package]
 name = "dsh-tui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Terminal UI client for DeepSeek Harness over the ACP protocol"
+default-run = "dsh-tui"
 
 [lib]
 name = "dsh_tui"

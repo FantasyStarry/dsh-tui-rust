@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,6 +56,15 @@ pub enum AcpEvent {
     ConfigUpdated(Vec<ConfigOptionState>),
     PermissionRequest { request_id: Value, tool_title: String, options: Vec<PermOption> },
     PromptSettled { stop_reason: String, error: Option<String> },
+    /// A locally executed `!` / `!!` shell command finished (output captured).
+    /// `send` = the output should also be submitted to the session as context.
+    ShellDone {
+        cmd: String,
+        output: String,
+        truncated: bool,
+        exit_code: Option<i32>,
+        send: bool,
+    },
     ServerGone(String),
     Notice(String),
 }
@@ -194,21 +203,28 @@ impl AcpClient {
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<AcpEvent>();
+        // Set once the outbound channel has closed (stdin EOF sent to dsh);
+        // the watcher uses it to bound dsh's graceful shutdown window.
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         // Writer: every outgoing frame funnels through here; dropping the
         // client closes the channel → stdin EOF → dsh performs its bounded
         // successful shutdown.
-        tokio::spawn(async move {
-            let mut stdin = stdin;
-            while let Some(v) = out_rx.recv().await {
-                let mut line = v.to_string();
-                line.push('\n');
-                if stdin.write_all(line.as_bytes()).await.is_err() {
-                    break;
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let mut stdin = stdin;
+                while let Some(v) = out_rx.recv().await {
+                    let mut line = v.to_string();
+                    line.push('\n');
+                    if stdin.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    let _ = stdin.flush().await;
                 }
-                let _ = stdin.flush().await;
-            }
-        });
+                shutdown.store(true, Ordering::Relaxed);
+            });
+        }
 
         // dsh logs go to stderr; stdout is protocol-only.
         {
@@ -229,11 +245,20 @@ impl AcpClient {
         });
 
         // Reader: dispatch responses / agent requests / notifications.
+        //
+        // Holds only a *weak* reference to Inner: the writer task ends when
+        // the outbound sender drops, and the sender lives inside Inner — so
+        // the reader must not pin Inner or dropping the last client would
+        // never EOF dsh's stdin (the child would linger forever). With Weak,
+        // the last client drop releases Inner → writer ends → stdin EOF →
+        // dsh performs its bounded graceful shutdown → stdout closes → this
+        // task ends on its own.
         {
-            let inner = inner.clone();
+            let inner = Arc::downgrade(&inner);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    let Some(inner) = inner.upgrade() else { break };
                     let v: Value = match serde_json::from_str(&line) {
                         Ok(v) => v,
                         Err(_) => {
@@ -243,17 +268,49 @@ impl AcpClient {
                     };
                     dispatch(&inner, v).await;
                 }
-                let _ = inner.events.send(AcpEvent::ServerGone("stdout 已关闭".into()));
+                if let Some(inner) = inner.upgrade() {
+                    let _ = inner.events.send(AcpEvent::ServerGone("stdout 已关闭".into()));
+                }
             });
         }
 
-        // Process watcher.
+        // Process watcher: reports exit; and if stdin EOF (graceful-shutdown
+        // request) does not produce a timely exit — some out-of-tree plugins
+        // keep dsh alive — force-kill the whole process tree so the runtime
+        // (and this process) can wind down instead of hanging.
         {
+            use std::time::Instant;
             let ev = ev_tx.clone();
+            let shutdown = shutdown.clone();
             tokio::spawn(async move {
                 let mut child = child;
-                let status = child.wait().await;
-                let _ = ev.send(AcpEvent::ServerGone(format!("dsh 进程退出: {status:?}")));
+                let mut grace_started: Option<Instant> = None;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let _ = ev.send(AcpEvent::ServerGone(format!("dsh 进程退出: {status:?}")));
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = ev.send(AcpEvent::ServerGone(format!("dsh wait 失败: {e}")));
+                            return;
+                        }
+                    }
+                    if let Some(start) = grace_started {
+                        if start.elapsed() >= Duration::from_secs(3) {
+                            if let Some(pid) = child.id() {
+                                kill_process_tree(pid).await;
+                            }
+                            let status = child.wait().await;
+                            let _ = ev.send(AcpEvent::ServerGone(format!("dsh 强制退出: {status:?}")));
+                            return;
+                        }
+                    } else if shutdown.load(Ordering::Relaxed) {
+                        grace_started = Some(Instant::now());
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             });
         }
 
@@ -610,5 +667,62 @@ fn dsh_command() -> Command {
     #[cfg(not(target_os = "windows"))]
     {
         Command::new("dsh")
+    }
+}
+
+/// Force-kill the dsh process tree. On Windows the launcher is
+/// `cmd /C dsh`, so the real node process is a *grandchild* — killing the
+/// cmd wrapper alone would orphan it, and its open stdio handles would keep
+/// the protocol tasks (and this process) alive forever. Two passes:
+///
+/// 1. `taskkill /T /F` on the wrapper pid while it is still alive (walks the
+///    whole live tree);
+/// 2. when the wrapper already exited on stdin EOF, node is orphaned but its
+///    `ParentProcessId` still points at the dead wrapper — enumerate direct
+///    children and kill each so the protocol pipes close.
+///
+/// On Unix dsh is spawned directly, so a plain kill suffices (dsh-owned
+/// stdio children exit on their own stdin EOF).
+async fn kill_process_tree(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let kill = |p: u32| async move {
+            let _ = tokio::process::Command::new("taskkill")
+                .args(["/PID", &p.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        };
+        kill(pid).await;
+        // Pass 2: orphaned direct children (ParentProcessId == pid).
+        let query = format!(
+            "Get-CimInstance Win32_Process -Filter 'ParentProcessId = {pid}' | ForEach-Object {{ Write-Output $_.ProcessId }}"
+        );
+        if let Ok(out) = tokio::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+            .stdin(Stdio::null())
+            .output()
+            .await
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Ok(cpid) = line.trim().parse::<u32>() {
+                    if cpid != pid {
+                        kill(cpid).await;
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
     }
 }

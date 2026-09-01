@@ -63,6 +63,12 @@ pub enum Dialog {
         choices: Vec<ConfigChoice>,
         selected: usize,
     },
+    /// Generic scrollable text panel (/help, /status, /cost, …).
+    Info {
+        title: String,
+        lines: Vec<String>,
+        selected: usize,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,6 +93,8 @@ pub const COMMANDS: &[Cmd] = &[
     Cmd { name: "/list", desc: "历史会话列表" },
     Cmd { name: "/model", desc: "切换模型" },
     Cmd { name: "/effort", desc: "切换推理档位" },
+    Cmd { name: "/cost", desc: "今日 token 用量与费用" },
+    Cmd { name: "/status", desc: "当前会话 / 配置信息" },
     Cmd { name: "/web", desc: "启动/打开 web 界面" },
     Cmd { name: "/clear", desc: "清屏（不影响会话上下文）" },
     Cmd { name: "/quit", desc: "退出" },
@@ -134,6 +142,68 @@ fn save_prefs(p: &Prefs) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Local session titles — the dsh acp profile disables model-generated titles
+// (ACP exposes no title surface), so the TUI keeps its own map keyed by
+// session id: the first user prompt of a session becomes its short title,
+// shown in the session list next to dsh's deterministic fallback.
+// ---------------------------------------------------------------------------
+
+fn titles_path() -> Option<PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    let dir = PathBuf::from(home).join(".dsh-tui");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("session-titles.json"))
+}
+
+fn load_titles() -> HashMap<String, String> {
+    let Some(p) = titles_path() else {
+        return HashMap::new();
+    };
+    let Ok(txt) = std::fs::read_to_string(p) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&txt).unwrap_or_default()
+}
+
+fn save_titles(titles: &HashMap<String, String>) {
+    if let Some(path) = titles_path() {
+        let _ = std::fs::write(path, serde_json::to_string_pretty(titles).unwrap_or_default());
+    }
+}
+
+/// Remember a short title for a session from its first user prompt.
+fn note_session_title(titles: &mut HashMap<String, String>, session_id: &str, prompt: &str) {
+    if session_id.is_empty() || prompt.trim().is_empty() {
+        return;
+    }
+    if titles.contains_key(session_id) {
+        return;
+    }
+    let one_line: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title: String = one_line.chars().take(24).collect();
+    if !title.is_empty() {
+        titles.insert(session_id.to_string(), title);
+        save_titles(titles);
+    }
+}
+
+/// Resolve the Harness home directory (`$DSH_HOME` > `~/.dsh`), used for
+/// reading shared host-side data (token stats, profile patch, …).
+fn dsh_home() -> Option<PathBuf> {
+    if let Ok(h) = std::env::var("DSH_HOME") {
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
+        }
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".dsh"))
+}
+
 pub struct App {
     pub entries: Vec<Entry>,
     pub input: String,
@@ -164,6 +234,10 @@ pub struct App {
     tool_idx: HashMap<String, usize>,
     tool_meta: HashMap<String, ToolMeta>,
     debug_log: VecDeque<String>,
+    /// Locally generated session titles (first user prompt → short title),
+    /// persisted in `~/.dsh-tui/session-titles.json`. The dsh acp profile
+    /// disables model-generated titles, so the TUI keeps its own.
+    titles: HashMap<String, String>,
     cwd: PathBuf,
     dirty: bool,
     last_width: u16,
@@ -194,11 +268,15 @@ impl App {
             tool_idx: HashMap::new(),
             tool_meta: HashMap::new(),
             debug_log: VecDeque::new(),
+            titles: load_titles(),
             cwd,
             dirty: true,
             last_width: 0,
         };
-        app.sysnote("dsh-tui v0.1.0 — 正在连接 dsh 内核…");
+        app.sysnote(&format!(
+            "dsh-tui v{} — 正在连接 dsh 内核…",
+            env!("CARGO_PKG_VERSION")
+        ));
         app
     }
 
@@ -240,6 +318,11 @@ impl App {
 
     pub fn queue_len(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Locally generated title for a session (if any).
+    pub fn local_title(&self, session_id: &str) -> Option<String> {
+        self.titles.get(session_id).cloned()
     }
 
     /// Slash commands matching the current input (menu is shown when the
@@ -608,6 +691,14 @@ pub async fn run(
             _ = tick.tick() => {}
         }
         if app.quit_requested() {
+            // Cancel any in-flight prompt first: the prompt task holds a
+            // client clone, so without cancellation the runtime would linger
+            // until the (possibly very long) prompt settles.
+            if app.state == RunState::Busy {
+                if let Some(sid) = app.session_id.clone() {
+                    client.cancel(&sid);
+                }
+            }
             break;
         }
         ui::draw(&mut terminal, &mut app)?;
@@ -738,6 +829,38 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
         return Ok(());
     }
 
+    // --- info panel (/help /status /cost) ----------------------------------
+    if let Dialog::Info { lines, selected, .. } = &mut app.dialog {
+        match key.code {
+            KeyCode::Up => {
+                *selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if *selected + 1 < lines.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::PageUp => {
+                *selected = selected.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                *selected = (*selected + 10).min(lines.len().saturating_sub(1));
+            }
+            KeyCode::Home => {
+                *selected = 0;
+            }
+            KeyCode::End => {
+                *selected = lines.len().saturating_sub(1);
+            }
+            KeyCode::Esc => {
+                app.dialog = Dialog::None;
+                advance_permission_queue(app);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // --- slash command menu -------------------------------------------------
     let menu: Vec<&'static Cmd> = app.cmd_matches();
     let menu_active = app.input.starts_with('/') && !app.input.contains(' ') && !menu.is_empty();
@@ -820,6 +943,18 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
             if text.is_empty() {
                 return Ok(());
             }
+            // `!cmd` / `!!cmd` shell passthrough (pi-inspired): run the
+            // command locally; `!` sends its output to the model as context,
+            // `!!` just shows the result in the transcript.
+            if let Some(rest) = text.strip_prefix('!') {
+                let send = !rest.starts_with('!');
+                let cmd = if send { rest } else { &rest[1..] };
+                if !cmd.trim().is_empty() {
+                    app.input.clear();
+                    run_shell(app, client, cmd.trim().to_string(), send);
+                    return Ok(());
+                }
+            }
             match text.as_str() {
                 "/quit" => {
                     app.request_quit();
@@ -845,6 +980,16 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                     open_config(app, client, "reasoning_effort", "推理档位").await;
                     return Ok(());
                 }
+                "/cost" => {
+                    app.input.clear();
+                    open_info(app, "今日用量与费用", cost_report());
+                    return Ok(());
+                }
+                "/status" => {
+                    app.input.clear();
+                    open_info(app, "状态", status_lines(app));
+                    return Ok(());
+                }
                 "/web" => {
                     app.input.clear();
                     start_web(client);
@@ -854,6 +999,9 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
             }
             if app.state == RunState::Busy {
                 // dsh allows one in-flight prompt per session; queue instead.
+                if let Some(sid) = app.session_id.clone() {
+                    note_session_title(&mut app.titles, &sid, &text);
+                }
                 app.queue.push_back(text.clone());
                 app.history.push(text.clone());
                 app.hist_cursor = None;
@@ -865,6 +1013,7 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                 app.sysnote("会话尚未就绪，请稍候…");
                 return Ok(());
             };
+            note_session_title(&mut app.titles, &sid, &text);
             app.push_entry(EntryKind::User, &text);
             app.history.push(text.clone());
             app.hist_cursor = None;
@@ -927,6 +1076,8 @@ async fn run_command(app: &mut App, client: &AcpClient, name: &str) {
         "/list" => open_sessions(app, client).await,
         "/model" => open_config(app, client, "model", "模型").await,
         "/effort" => open_config(app, client, "reasoning_effort", "推理档位").await,
+        "/cost" => open_info(app, "今日用量与费用", cost_report()),
+        "/status" => open_info(app, "状态", status_lines(app)),
         "/web" => start_web(client),
         "/clear" => {
             app.entries.clear();
@@ -936,12 +1087,26 @@ async fn run_command(app: &mut App, client: &AcpClient, name: &str) {
             app.sysnote("已清屏（会话上下文不受影响）");
         }
         "/help" => {
+            let mut lines = vec![
+                "斜杠命令".to_string(),
+                format!("dsh-tui v{} — ACP v1 客户端（内核 dsh 只读复用）", env!("CARGO_PKG_VERSION")),
+                String::new(),
+            ];
             for c in COMMANDS {
-                app.sysnote(&format!("{:<8} — {}", c.name, c.desc));
+                lines.push(format!("  {:<8} — {}", c.name, c.desc));
             }
+            lines.push(String::new());
+            lines.push("在输入框输入 !cmd 执行本地命令（!!cmd 只显示结果，不发给模型）".to_string());
+            lines.push("按键：↑↓ 滚动 · Esc 关闭".to_string());
+            open_info(app, "帮助", lines);
         }
         other => app.sysnote(&format!("未知命令 {other}（输入 / 查看命令菜单）")),
     }
+}
+
+/// Open the generic scrollable info panel.
+fn open_info(app: &mut App, title: &str, lines: Vec<String>) {
+    app.dialog = Dialog::Info { title: title.to_string(), lines, selected: 0 };
 }
 
 /// Open the model / reasoning-effort picker from the advertised config state.
@@ -1155,6 +1320,101 @@ fn spawn_web(port: u16) -> std::io::Result<std::process::Child> {
         .spawn()
 }
 
+// ---------------------------------------------------------------------------
+// `!` / `!!` shell passthrough (pi-inspired): commands run locally with the
+// TUI's cwd; `!cmd` also forwards the captured output to the model as a
+// prompt (context), `!!cmd` only prints the result in the transcript.
+// ---------------------------------------------------------------------------
+
+const SHELL_OUTPUT_LIMIT: usize = 8000;
+
+struct ShellResult {
+    output: String,
+    truncated: bool,
+    exit_code: Option<i32>,
+}
+
+/// Kick off a local shell command in the background; the result arrives as
+/// [`AcpEvent::ShellDone`] so the UI keeps rendering while it runs.
+fn run_shell(app: &mut App, client: &AcpClient, cmd: String, send: bool) {
+    app.sysnote(&format!("$ {cmd}（运行中…）"));
+    let c = client.clone();
+    tokio::spawn(async move {
+        let r = run_shell_cmd(&cmd).await;
+        c.emit(AcpEvent::ShellDone {
+            cmd,
+            output: r.output,
+            truncated: r.truncated,
+            exit_code: r.exit_code,
+            send,
+        });
+    });
+}
+
+async fn run_shell_cmd(cmd: &str) -> ShellResult {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    let mut builder = if cfg!(target_os = "windows") {
+        let mut b = tokio::process::Command::new("cmd");
+        b.args(["/C", cmd]);
+        b
+    } else {
+        let mut b = tokio::process::Command::new("sh");
+        b.args(["-c", cmd]);
+        b
+    };
+    builder
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match builder.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ShellResult {
+                output: format!("无法启动 shell: {e}"),
+                truncated: false,
+                exit_code: None,
+            };
+        }
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    let out_task = async {
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_end(&mut out_buf).await;
+        }
+    };
+    let err_task = async {
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_end(&mut err_buf).await;
+        }
+    };
+    let (status, _, _) = tokio::join!(child.wait(), out_task, err_task);
+
+    let mut text = String::from_utf8_lossy(&out_buf).into_owned();
+    let err = String::from_utf8_lossy(&err_buf).into_owned();
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    let truncated = text.chars().count() > SHELL_OUTPUT_LIMIT;
+    if truncated {
+        text = crate::acp::clip(&text, SHELL_OUTPUT_LIMIT);
+    }
+    ShellResult {
+        output: text,
+        truncated,
+        exit_code: status.as_ref().ok().and_then(|s| s.code()),
+    }
+}
+
 fn advance_permission_queue(app: &mut App) {
     if !app.queued_permissions.is_empty() {
         let (request_id, tool_title, options) = app.queued_permissions.remove(0);
@@ -1195,6 +1455,325 @@ fn provider_group_count(cfg: &[ConfigOptionState]) -> usize {
         }
     }
     seen.len()
+}
+
+// ---------------------------------------------------------------------------
+// /status — current session / configuration summary
+// ---------------------------------------------------------------------------
+
+fn status_lines(app: &App) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(format!("工作目录: {}", app.cwd.display()));
+    match &app.session_id {
+        Some(sid) => {
+            out.push(format!("会话: {}（{}）", short_id(sid), sid));
+            out.push(format!(
+                "本地标题: {}",
+                app.local_title(sid).unwrap_or_else(|| "（未记录，发送首条消息后生成）".into())
+            ));
+        }
+        None => out.push("会话: （尚未创建）".into()),
+    }
+    if let Some(m) = app.model_label() {
+        out.push(format!("模型: {m}"));
+    }
+    if let Some(opt) = app.config.iter().find(|c| c.id == "reasoning_effort") {
+        if !opt.current.is_empty() {
+            out.push(format!("推理档位: {}", opt.current));
+        }
+    }
+    if let Some((used, size)) = app.usage {
+        let pct = if size > 0 { (used as f64 / size as f64) * 100.0 } else { 0.0 };
+        out.push(format!("上下文: {} / {} tokens（{pct:.0}%）", used, size));
+    } else {
+        out.push("上下文: （尚无 usage 事件）".into());
+    }
+    let models = app
+        .config
+        .iter()
+        .find(|c| c.id == "model")
+        .map(|m| m.options.len())
+        .unwrap_or(0);
+    out.push(format!("模型目录: {} 个提供商分组 / {} 个模型", provider_group_count(&app.config), models));
+    out.push(format!(
+        "状态: {} · 排队 {} 条",
+        match app.state {
+            RunState::Booting => "启动中",
+            RunState::Idle => "就绪",
+            RunState::Busy => "运行中",
+        },
+        app.queue_len()
+    ));
+    out.push(format!("内核: dsh（ACP v1，要求 >= 0.1.2-alpha.2，可用 DSH_BIN 指定）"));
+    out.push(String::new());
+    out.push("提示: /cost 看今日用量 · !cmd 执行本地命令 · /web 打开 web".into());
+    out
+}
+
+// ---------------------------------------------------------------------------
+// /cost — today's token usage and estimated cost from the shared token-stats
+// plugin storage (`$DSH_HOME/storages/token-stats.json`, same file the web
+// GUI's token stats read). Prices: built-in reference table, overridable via
+// `~/.dsh-tui/prices.json` (keys are model ids, prefix matching).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct Price {
+    input: f64,
+    cache_read: f64,
+    cache_write: f64,
+    output: f64,
+}
+
+fn cost_report() -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(home) = dsh_home() else {
+        return vec!["无法解析 DSH home（$DSH_HOME 或 ~/.dsh）".into()];
+    };
+    let path = home.join("storages").join("token-stats.json");
+    let Ok(txt) = std::fs::read_to_string(&path) else {
+        return vec![
+            "未找到 token-stats.json".into(),
+            format!("期望位置: {}", path.display()),
+            "需要 dsh-token-stats 插件（已挂载在 acp profile 的 cordis.patch.yml）".into(),
+        ];
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+        return vec!["token-stats.json 解析失败".into()];
+    };
+
+    let today = today_iso();
+    let day = v.get("days").and_then(|d| d.get(&today)).and_then(|d| d.as_object());
+    let Some(day) = day else {
+        return vec![
+            format!("今日（{today}）暂无用量记录"),
+            "提示: token 统计由 dsh-token-stats 插件写入，TUI/web 共用".into(),
+        ];
+    };
+
+    let prices = load_prices();
+    struct Row {
+        provider: String,
+        model: String,
+        requests: u64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cost: f64,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for (provider, models) in day {
+        for (model, stats) in models.as_object().unwrap_or(&serde_json::Map::new()) {
+            let get = |k: &str| stats.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            let (input, output, cache_read, cache_write) = (get("inputTokens"), get("outputTokens"), get("cacheReadTokens"), get("cacheWriteTokens"));
+            let price = price_for(&prices, model);
+            let cost = match price {
+                Some(p) => {
+                    input as f64 * p.input
+                        + output as f64 * p.output
+                        + cache_read as f64 * p.cache_read
+                        + cache_write as f64 * if p.cache_write > 0.0 { p.cache_write } else { p.input }
+                }
+                None => 0.0,
+            };
+            rows.push(Row {
+                provider: provider.clone(),
+                model: model.clone(),
+                requests: get("requests"),
+                input,
+                output,
+                cache_read,
+                cache_write,
+                cost,
+            });
+        }
+    }
+    rows.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+
+    out.push(format!("今日 {} 用量（dsh-token-stats）", today));
+    out.push(String::new());
+    let mut total_cost = 0.0f64;
+    let mut total_req = 0u64;
+    for r in &rows {
+        total_cost += r.cost;
+        total_req += r.requests;
+        out.push(format!(
+            "  {} · {}  req={}  ↑{} ↓{}  cache {}  ≈{}",
+            r.provider,
+            r.model,
+            r.requests,
+            fmt_tokens(r.input),
+            fmt_tokens(r.output),
+            fmt_tokens(r.cache_read),
+            if r.cost > 0.0 { fmt_usd(r.cost) } else { "—".to_string() }
+        ));
+    }
+    if rows.is_empty() {
+        out.push("  （今日无记录）".into());
+    }
+    out.push(String::new());
+    let total_tokens = rows.iter().map(|r| r.input + r.output + r.cache_read + r.cache_write).sum::<u64>();
+    out.push(format!(
+        "合计: {} 次请求 · {} tokens · ≈{}",
+        total_req,
+        fmt_tokens(total_tokens),
+        fmt_usd(total_cost)
+    ));
+    out.push("价格: 内置参考价，可被 ~/.dsh-tui/prices.json 覆盖（模型 id 前缀匹配）".into());
+    out
+}
+
+fn load_prices() -> Vec<(String, Price)> {
+    let mut v: Vec<(String, Price)> = vec![
+        ("deepseek-v4-flash".into(), Price { input: 0.14, cache_read: 0.028, cache_write: 0.14, output: 0.28 }),
+        ("deepseek-v4-flash-0731".into(), Price { input: 0.14, cache_read: 0.028, cache_write: 0.14, output: 0.28 }),
+        ("deepseek-v4-flash-vision-exp".into(), Price { input: 0.14, cache_read: 0.028, cache_write: 0.14, output: 0.28 }),
+        ("MiniMaxAI/MiniMax-M2.5".into(), Price { input: 0.30, cache_read: 0.03, cache_write: 0.30, output: 1.20 }),
+        ("MiniMaxAI/MiniMax-M2.7".into(), Price { input: 0.30, cache_read: 0.06, cache_write: 0.30, output: 1.20 }),
+        ("MiniMaxAI/MiniMax-M3".into(), Price { input: 0.30, cache_read: 0.06, cache_write: 0.30, output: 1.20 }),
+        ("minimax-m3".into(), Price { input: 0.30, cache_read: 0.06, cache_write: 0.30, output: 1.20 }),
+        ("glm-5.2".into(), Price { input: 0.10, cache_read: 0.02, cache_write: 0.10, output: 0.20 }),
+        ("glm-5.3-flash".into(), Price { input: 0.10, cache_read: 0.02, cache_write: 0.10, output: 0.20 }),
+        ("gpt-5.6".into(), Price { input: 1.25, cache_read: 0.125, cache_write: 1.25, output: 10.0 }),
+        ("qwen3.8-max".into(), Price { input: 0.40, cache_read: 0.08, cache_write: 0.40, output: 0.80 }),
+    ];
+    // Overrides: ~/.dsh-tui/prices.json
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok();
+    if let Some(home) = home {
+        let p = PathBuf::from(home).join(".dsh-tui").join("prices.json");
+        if let Ok(txt) = std::fs::read_to_string(p) {
+            if let Ok(obj) = serde_json::from_str::<Value>(&txt) {
+                if let Some(map) = obj.as_object() {
+                    for (k, pv) in map {
+                        let get = |f: &str| pv.get(f).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                        v.push((
+                            k.clone(),
+                            Price {
+                                input: get("input"),
+                                cache_read: get("cacheRead"),
+                                cache_write: get("cacheWrite"),
+                                output: get("output"),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    v
+}
+
+fn price_for<'a>(prices: &'a [(String, Price)], model: &str) -> Option<&'a Price> {
+    if let Some((_, p)) = prices.iter().find(|(k, _)| k == model) {
+        return Some(p);
+    }
+    prices
+        .iter()
+        .filter(|(k, _)| model.starts_with(k.as_str()))
+        .max_by_key(|(k, _)| k.len())
+        .map(|(_, p)| p)
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
+}
+
+fn fmt_usd(v: f64) -> String {
+    if v <= 0.0 {
+        "$0".to_string()
+    } else if v < 0.01 {
+        format!("${:.4}", v)
+    } else {
+        format!("${:.3}", v)
+    }
+}
+
+/// Local calendar date `YYYY-MM-DD` (Howard Hinnant civil algorithms; no
+/// chrono dependency needed).
+fn today_iso() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Human-friendly relative time for a session's `updated_at` (RFC3339 string
+/// or epoch milliseconds), falling back to the raw value.
+pub(crate) fn rel_time(s: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let s = s.trim();
+    let epoch = if let Ok(ms) = s.parse::<i64>() {
+        Some(ms / 1000)
+    } else if s.len() >= 19 && s.as_bytes().get(4) == Some(&b'-') {
+        let parse = |a: usize, b: usize| s.get(a..b).and_then(|v| v.parse::<i64>().ok());
+        let y = parse(0, 4).unwrap_or(0);
+        let mo = parse(5, 7).unwrap_or(1);
+        let d = parse(8, 10).unwrap_or(1);
+        let h = parse(11, 13).unwrap_or(0);
+        let mi = parse(14, 16).unwrap_or(0);
+        let sec = parse(17, 19).unwrap_or(0);
+        Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec)
+    } else {
+        None
+    };
+    let Some(epoch) = epoch else {
+        return s.to_string();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let diff = now - epoch;
+    if diff < 60 {
+        "刚刚".to_string()
+    } else if diff < 3600 {
+        format!("{} 分钟前", diff / 60)
+    } else if diff < 86400 {
+        format!("{} 小时前", diff / 3600)
+    } else if diff < 86400 * 7 {
+        format!("{} 天前", diff / 86400)
+    } else {
+        let (y, m, d) = civil_from_days(epoch.div_euclid(86400));
+        format!("{y:04}-{m:02}-{d:02}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,6 +1943,42 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
             }
             false
         }
+        AcpEvent::ShellDone { cmd, output, truncated, exit_code, send } => {
+            if truncated {
+                app.sysnote(&format!("$ {cmd}（输出过长，已截断）"));
+            } else {
+                app.sysnote(&format!("$ {cmd}"));
+            }
+            if !output.is_empty() {
+                for line in output.lines() {
+                    app.sysnote(line);
+                }
+            } else {
+                app.sysnote("（无输出）");
+            }
+            if let Some(code) = exit_code {
+                if code != 0 {
+                    app.sysnote(&format!("exit {code}"));
+                }
+            }
+            if send {
+                // `!cmd`: hand the captured output to the model as context
+                // (pi-style BashExecutionMessage mapping).
+                let prompt_text = format!("[shell] $ {cmd}\n\n{output}");
+                if app.state == RunState::Busy {
+                    app.queue.push_back(prompt_text.clone());
+                    app.sysnote(&format!("shell 输出已排队（第 {} 条，完成后自动发送）", app.queue_len()));
+                } else if let Some(sid) = app.session_id.clone() {
+                    app.push_entry(EntryKind::User, &prompt_text);
+                    app.state = RunState::Busy;
+                    app.busy_since = Some(Instant::now());
+                    client.prompt(sid, prompt_text);
+                } else {
+                    app.sysnote("会话尚未就绪，shell 输出未发送");
+                }
+            }
+            false
+        }
         AcpEvent::ServerGone(reason) => {
             if app.quit_requested() {
                 false
@@ -1376,5 +1991,105 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
             app.note_line(&line);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn today_iso_is_date_shaped() {
+        let s = today_iso();
+        assert_eq!(s.len(), 10);
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[7], b'-');
+        let (y, m, d) = (&s[0..4], &s[5..7], &s[8..10]);
+        let y: i64 = y.parse().unwrap();
+        let m: i64 = m.parse().unwrap();
+        let d: i64 = d.parse().unwrap();
+        assert!((2024..=2100).contains(&y));
+        assert!((1..=12).contains(&m));
+        assert!((1..=31).contains(&d));
+    }
+
+    #[test]
+    fn rel_time_formats_epoch_and_rfc3339() {
+        assert_eq!(rel_time("刚刚"), "刚刚"); // unknown → raw
+        // epoch milliseconds ~1 minute ago
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let s = rel_time(&(now_ms - 90_000).to_string());
+        assert!(s.contains("分钟前"), "got {s}");
+        // RFC3339 today
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+        let rfc = format!("{y:04}-{m:02}-{d:02}T00:00:00Z");
+        assert!(!rel_time(&rfc).is_empty());
+        // ancient epoch → calendar date
+        let old = rel_time("1000000");
+        assert_eq!(old.len(), 10, "got {old}");
+    }
+
+    #[test]
+    fn price_for_matches_exact_and_prefix() {
+        let prices = load_prices();
+        assert!(price_for(&prices, "deepseek-v4-flash").is_some());
+        assert!(price_for(&prices, "gpt-5.6-sol").is_some()); // prefix "gpt-5.6"
+        assert!(price_for(&prices, "unknown-model-xyz").is_none());
+    }
+
+    #[test]
+    fn fmt_tokens_scales() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(12_345), "12.3K");
+        assert_eq!(fmt_tokens(2_000_000), "2.0M");
+    }
+
+    #[test]
+    fn cost_report_reads_token_stats() {
+        // Point DSH_HOME at a temp dir with a synthetic token-stats.json.
+        let tmp = std::env::temp_dir().join(format!("dsh-tui-test-{}", std::process::id()));
+        let storages = tmp.join("storages");
+        std::fs::create_dir_all(&storages).unwrap();
+        let stats = serde_json::json!({
+            "days": {
+                today_iso(): {
+                    "my-api": {
+                        "deepseek-v4-flash": {
+                            "requests": 2, "inputTokens": 1000, "outputTokens": 500,
+                            "cacheReadTokens": 9000, "cacheWriteTokens": 0, "reasoningTokens": 0
+                        }
+                    }
+                }
+            },
+            "sessions": {}
+        });
+        std::fs::write(storages.join("token-stats.json"), serde_json::to_string(&stats).unwrap()).unwrap();
+        std::env::set_var("DSH_HOME", &tmp);
+
+        let lines = cost_report();
+        let joined = lines.join("\n");
+        assert!(joined.contains("my-api · deepseek-v4-flash"), "{joined}");
+        assert!(joined.contains("合计"), "{joined}");
+        assert!(joined.contains("$"), "{joined}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_cmd_captures_output_and_exit_code() {
+        let r = run_shell_cmd("echo hello-from-dsh-tui").await;
+        assert!(r.output.contains("hello-from-dsh-tui"), "{}", r.output);
+        assert_eq!(r.exit_code, Some(0));
+
+        let fail = run_shell_cmd("exit 3").await;
+        assert_eq!(fail.exit_code, Some(3));
     }
 }

@@ -42,7 +42,7 @@ pub async fn probe() -> Result<()> {
     use std::time::Duration;
 
     println!("probe: 启动 `dsh --profile acp` …");
-    let (client, _rx) = acp::AcpClient::spawn().await?;
+    let (client, mut rx) = acp::AcpClient::spawn().await?;
 
     let init = client.initialize().await?;
     println!(
@@ -134,10 +134,24 @@ pub async fn probe() -> Result<()> {
 
     println!("probe 通过 ✔");
 
-    // Release the protocol client: closing the outbound channel EOFs dsh's
-    // stdin, dsh shuts down, and the watcher task completes — otherwise the
-    // lingering child keeps the runtime (and this process) alive forever.
+    // Release the protocol client: dropping the last AcpClient releases
+    // Inner, which closes the outbound channel → stdin EOF → dsh's bounded
+    // graceful shutdown. Wait (bounded) for the kernel to actually exit so
+    // every spawned task ends and the runtime can shut down cleanly.
     drop(client);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    {
+        use std::time::Duration;
+        let deadline = tokio::time::sleep(Duration::from_secs(15));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(acp::AcpEvent::ServerGone(_)) => break,
+                    _ => {}
+                },
+                _ = &mut deadline => break,
+            }
+        }
+    }
     Ok(())
 }

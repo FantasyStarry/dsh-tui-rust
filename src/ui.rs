@@ -11,6 +11,7 @@ use ratatui::Frame;
 use std::time::Instant;
 
 use crate::acp::short_id;
+use crate::app::rel_time;
 use crate::app::{App, Dialog, RunState};
 use crate::theme::{self, *};
 
@@ -42,6 +43,7 @@ fn render(f: &mut Frame, app: &mut App) {
         Dialog::Permission { .. } => draw_permission(f, app),
         Dialog::Sessions { .. } => draw_sessions(f, app),
         Dialog::Config { .. } => draw_config(f, app),
+        Dialog::Info { .. } => draw_info(f, app),
         Dialog::None => {}
     }
 }
@@ -58,7 +60,7 @@ fn draw_top_bar(f: &mut Frame, app: &App, area: Rect) {
     left.push(Span::styled("🐋", Style::new()));
     left.push(Span::raw(" "));
     left.extend(theme::gradient_word("DSH·TUI"));
-    left.push(Span::styled("  v0.1", plain(DIM)));
+    left.push(Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), plain(DIM)));
 
     let mut right: Vec<Span> = Vec::new();
     if let Some(m) = app.model_label() {
@@ -222,7 +224,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let mut spans: Vec<Span> = vec![Span::raw(" "), Span::styled("❯ ", bold(ACCENT))];
     if app.input.is_empty() {
         spans.push(Span::styled(
-            "输入消息…（/list 会话 · /new 新建 · Esc 清空）",
+            "输入消息…（/ 命令菜单 · !cmd 执行 shell · /list 会话）",
             plain(DIM),
         ));
     } else {
@@ -363,16 +365,22 @@ fn draw_sessions(f: &mut Frame, app: &App) {
     }
     for i in top..end {
         let it = &items[i];
-        let desc = it
-            .title
-            .clone()
+        let is_current = app.session_id.as_deref() == Some(it.session_id.as_str());
+        // Prefer the TUI's own title (first prompt), then dsh's deterministic
+        // fallback title, then the cwd as a last resort.
+        let desc = app
+            .local_title(&it.session_id)
+            .or_else(|| it.title.clone())
             .unwrap_or_else(|| if it.cwd.is_empty() { "-".into() } else { it.cwd.clone() });
+        let desc = crate::acp::clip(&desc, inner.width.saturating_sub(30) as usize);
         let time = it
             .updated_at
             .as_deref()
+            .map(rel_time)
             .map(|s| format!("  ·  {s}"))
             .unwrap_or_default();
-        let base = format!("{}  {desc}{time}", short_id(&it.session_id));
+        let mark = if is_current { "● " } else { "" };
+        let base = format!("{mark}{}  {desc}{time}", short_id(&it.session_id));
         if i == *selected {
             let bar = pad_to_width(&format!(" ❯ {base} "), inner.width.saturating_sub(1) as usize);
             lines.push(Line::from(Span::styled(
@@ -536,6 +544,66 @@ fn draw_config(f: &mut Frame, app: &App) {
         Span::styled("Esc 取消", plain(MUTED)),
     ]));
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Info panel (/help /status /cost) — scrollable text
+// ---------------------------------------------------------------------------
+
+fn draw_info(f: &mut Frame, app: &App) {
+    let Dialog::Info { title, lines, selected } = &app.dialog else {
+        return;
+    };
+
+    let screen = f.area();
+    let height = (lines.len() as u16 + 5).clamp(10, screen.height.saturating_sub(2));
+    let width = (screen.width * 74 / 100).clamp(52, screen.width.saturating_sub(2));
+    let area = centered(screen, width, height);
+
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(plain(ACCENT))
+        .title(Line::from(vec![
+            Span::styled(" ⬥ ", bold(ACCENT)),
+            Span::styled(format!("{title} "), bold(ACCENT)),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let total = lines.len();
+    let overflow = total + 3 > inner.height as usize;
+    let footer = if overflow { 3 } else { 2 };
+    let visible = (inner.height as usize).saturating_sub(footer).max(1);
+    let top = if *selected < visible { 0 } else { *selected - visible + 1 };
+    let end = (top + visible).min(total);
+
+    let mut text_lines: Vec<Line> = Vec::new();
+    for i in top..end {
+        let line = &lines[i];
+        let styled: Line = if line.starts_with("  ") {
+            Line::from(Span::styled(line.clone(), plain(MUTED)))
+        } else {
+            Line::from(Span::styled(line.clone(), plain(FG)))
+        };
+        text_lines.push(styled);
+    }
+    if total > visible {
+        let pct = ((*selected + 1) * 100) / total;
+        text_lines.push(Line::from(Span::styled(
+            format!("   · 第 {}/{} 行（{pct}%）", *selected + 1, total),
+            plain(HAIRLINE),
+        )));
+    }
+    text_lines.push(Line::from(""));
+    text_lines.push(Line::from(vec![
+        Span::styled(" ↑↓ 滚动", plain(MUTED)),
+        Span::styled(" · ", plain(HAIRLINE)),
+        Span::styled("PgUp/PgDn 翻页", plain(MUTED)),
+        Span::styled(" · ", plain(HAIRLINE)),
+        Span::styled("Esc 关闭", plain(MUTED)),
+    ]));
+    f.render_widget(Paragraph::new(Text::from(text_lines)), inner);
 }
 
 // ---------------------------------------------------------------------------
