@@ -1,5 +1,5 @@
 {
-  "name": "@fantasystarry/dsh-tui",
+  "name": "@spongzi/dsh-tui",
   "version": "0.3.0",
   "description": "Terminal UI client for DeepSeek Harness over the ACP protocol (ratatui)",
   "license": "MIT",

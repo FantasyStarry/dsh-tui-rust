@@ -325,8 +325,8 @@ dsh 的 acp profile 禁用了模型生成标题（ACP 面无标题 surface，只
 - **npm 分发**：`scripts/build-release.ps1` / `.sh` 构建并暂存平台预编译二进制到
   `npm/dist/<平台键>/`；`npm/bin/*.js` shim 按 `DSH_TUI_BIN` → 包内 dist →
   `~/.dsh-tui/bin` → PATH 解析二进制并透传参数/退出码；`npm login` 后
-  `cd npm && npm publish` 发布为 **`@fantasystarry/dsh-tui`**（无 scope 的
-  `dsh-tui` 名已被他人占用）。发布后 `npm i -g @fantasystarry/dsh-tui` 即得
+  `cd npm && npm publish` 发布为 **`@spongzi/dsh-tui`**（无 scope 的
+  `dsh-tui` 名已被他人占用）。发布后 `npm i -g @spongzi/dsh-tui` 即得
   `dsh-tui` / `dtr` 命令
 
 ## Roadmap
