@@ -91,28 +91,28 @@ fn draw_top_bar(f: &mut Frame, app: &App, area: Rect) {
     let mut left: Vec<Span> = vec![Span::raw(" ")];
     left.push(Span::styled("🐋", Style::new()));
     left.push(Span::raw(" "));
-    left.extend(theme::gradient_word("DSH·TUI"));
-    left.push(Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), plain(DIM)));
+    left.extend(theme::gradient_word("DSH·TUI", app.theme.accent, app.theme.violet));
+    left.push(Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), plain(app.theme.dim)));
 
     let mut right: Vec<Span> = Vec::new();
     if let Some(url) = &app.web_url {
         let port = url.rsplit(':').next().unwrap_or("");
-        right.push(theme::pill(&format!("🌐 :{port}"), OK));
+        right.push(theme::pill(&format!("🌐 :{port}"), app.theme.ok, &app.theme));
         right.push(Span::raw(" "));
     }
     if let Some(m) = app.model_label() {
-        right.push(theme::pill(&m, VIOLET));
+        right.push(theme::pill(&m, app.theme.violet, &app.theme));
         right.push(Span::raw(" "));
     }
     if let Some(opt) = app.config.iter().find(|c| c.id == "reasoning_effort") {
         if !opt.current.is_empty() {
-            right.push(theme::pill(&format!("⚡{}", opt.current), WARN));
+            right.push(theme::pill(&format!("⚡{}", opt.current), app.theme.warn, &app.theme));
             right.push(Span::raw(" "));
         }
     }
     if let Some((used, size)) = app.usage {
-        right.push(Span::styled("ctx", plain(MUTED)));
-        right.extend(theme::ctx_bar(used, size, 10));
+        right.push(Span::styled("ctx", plain(app.theme.muted)));
+        right.extend(theme::ctx_bar(used, size, 10, &app.theme));
         right.push(Span::raw(" "));
     }
 
@@ -152,13 +152,13 @@ fn draw_splash(f: &mut Frame, app: &App, area: Rect) {
     };
 
     put(f, -3, Line::from(""), true);
-    put(f, -2, Line::from(gradient_word("D S H · T U I")), true);
-    put(f, -1, Line::from(Span::styled("～ deep agents in your terminal ～", plain(DIM))), true);
+    put(f, -2, Line::from(gradient_word("D S H · T U I", app.theme.accent, app.theme.violet)), true);
+    put(f, -1, Line::from(Span::styled("～ deep agents in your terminal ～", plain(app.theme.dim))), true);
     put(f, 1, Line::from(vec![
-        Span::styled(format!("{spinner} "), plain(VIOLET)),
-        Span::styled("正在连接 dsh 内核（--profile acp）…", plain(MUTED)),
+        Span::styled(format!("{spinner} "), plain(app.theme.violet)),
+        Span::styled("正在连接 dsh 内核（--profile acp）…", plain(app.theme.muted)),
     ]), true);
-    put(f, 2, Line::from(Span::styled("输入消息后回车发送 · /list 会话 · /new 新会话 · Ctrl+C 退出", plain(DIM))), true);
+    put(f, 2, Line::from(Span::styled("输入消息后回车发送 · /list 会话 · /new 新会话 · Ctrl+C 退出", plain(app.theme.dim))), true);
 }
 
 // ---------------------------------------------------------------------------
@@ -199,41 +199,41 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let mut left: Vec<Span> = vec![Span::raw(" ")];
     let (dot, label) = match app.state {
-        RunState::Booting => (DIM, "启动中"),
-        RunState::Idle => (OK, "就绪"),
-        RunState::Busy => (WARN, "运行中"),
+        RunState::Booting => (app.theme.dim, "启动中"),
+        RunState::Idle => (app.theme.ok, "就绪"),
+        RunState::Busy => (app.theme.warn, "运行中"),
     };
     left.push(Span::styled("● ", plain(dot)));
     if app.state == RunState::Busy {
         let elapsed = app.busy_since.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
         let spinner = SPINNER[((elapsed * 8.0) as usize) % SPINNER.len()];
-        left.push(Span::styled(format!("{spinner} "), plain(VIOLET)));
-        left.push(Span::styled(format!("{label} {:.0}s", elapsed), bold(WARN)));
-        left.push(Span::styled(" · Esc 取消", plain(MUTED)));
+        left.push(Span::styled(format!("{spinner} "), plain(app.theme.violet)));
+        left.push(Span::styled(format!("{label} {:.0}s", elapsed), bold(app.theme.warn)));
+        left.push(Span::styled(" · Esc 取消", plain(app.theme.muted)));
     } else {
-        left.push(Span::styled(label, plain(FG)));
+        left.push(Span::styled(label, plain(app.theme.fg)));
     }
     if app.scroll_from_bottom > 0 {
-        left.push(Span::styled(format!(" · ↑{} 行", app.scroll_from_bottom), plain(WARN)));
+        left.push(Span::styled(format!(" · ↑{} 行", app.scroll_from_bottom), plain(app.theme.warn)));
     }
     if app.queue_len() > 0 {
-        left.push(Span::styled(format!(" · 队列 {}", app.queue_len()), plain(WARN)));
+        left.push(Span::styled(format!(" · 队列 {}", app.queue_len()), plain(app.theme.warn)));
     }
     if let Some(sid) = &app.session_id {
-        left.push(Span::styled(format!(" · {}", short_id(sid)), plain(DIM)));
+        left.push(Span::styled(format!(" · {}", short_id(sid)), plain(app.theme.dim)));
     }
 
     let mut right: Vec<Span> = if app.state == RunState::Busy {
-        theme::keycap("Esc", "取消")
+        theme::keycap("Esc", "取消", &app.theme)
             .into_iter()
-            .chain(theme::keycap("Ctrl+C", "退出"))
+            .chain(theme::keycap("Ctrl+C", "退出", &app.theme))
             .collect()
     } else {
-        theme::keycap("PgUp", "历史")
+        theme::keycap("PgUp", "历史", &app.theme)
             .into_iter()
-            .chain(theme::keycap("Ctrl+L", "会话"))
-            .chain(theme::keycap("Ctrl+N", "新建"))
-            .chain(theme::keycap("Ctrl+C", "退出"))
+            .chain(theme::keycap("Ctrl+L", "会话", &app.theme))
+            .chain(theme::keycap("Ctrl+N", "新建", &app.theme))
+            .chain(theme::keycap("Ctrl+C", "退出", &app.theme))
             .collect()
     };
 
@@ -263,7 +263,7 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(plain(if app.state == RunState::Busy { WARN } else { VIOLET }));
+        .border_style(plain(if app.state == RunState::Busy { app.theme.warn } else { app.theme.violet }));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -277,19 +277,19 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     for (i, raw) in all_lines.iter().enumerate().skip(start) {
         let disp = tail_by_width(raw, avail);
         let mut spans: Vec<Span> = if i == 0 {
-            vec![Span::raw(" "), Span::styled("❯ ", bold(ACCENT))]
+            vec![Span::raw(" "), Span::styled("❯ ", bold(app.theme.accent))]
         } else {
-            vec![Span::styled("   ", plain(FG))]
+            vec![Span::styled("   ", plain(app.theme.fg))]
         };
         if i == 0 && app.input.is_empty() {
             spans.push(Span::styled(
                 "输入消息…（/ 命令 · !cmd 执行 shell · Shift+Enter 换行）",
-                plain(DIM),
+                plain(app.theme.dim),
             ));
         } else if disp.is_empty() && i != 0 {
-            spans.push(Span::styled(" ", plain(FG)));
+            spans.push(Span::styled(" ", plain(app.theme.fg)));
         } else {
-            spans.push(Span::styled(disp.clone(), plain(FG)));
+            spans.push(Span::styled(disp.clone(), plain(app.theme.fg)));
         }
         if i == all_lines.len() - 1 {
             cursor_col = inner.x
@@ -348,22 +348,22 @@ fn draw_permission(f: &mut Frame, app: &App) {
     f.render_widget(Clear, area);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(plain(VIOLET))
+        .border_style(plain(app.theme.violet))
         .title(Line::from(vec![
-            Span::styled(" ⬡ ", bold(VIOLET)),
-            Span::styled("权限请求 ", bold(VIOLET)),
+            Span::styled(" ⬡ ", bold(app.theme.violet)),
+            Span::styled("权限请求 ", bold(app.theme.violet)),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let w = inner.width as usize;
     let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(tool_title.clone(), plain(FG).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled("─".repeat(w.saturating_sub(1)), plain(HAIRLINE))),
+        Line::from(Span::styled(tool_title.clone(), plain(app.theme.fg).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("─".repeat(w.saturating_sub(1)), plain(app.theme.hairline))),
         Line::from(""),
     ];
     if options.is_empty() {
-        lines.push(Line::from(Span::styled("（无选项 — Esc 拒绝）", plain(DIM))));
+        lines.push(Line::from(Span::styled("（无选项 — Esc 拒绝）", plain(app.theme.dim))));
     }
     for (i, o) in options.iter().enumerate() {
         if i == *selected {
@@ -372,23 +372,23 @@ fn draw_permission(f: &mut Frame, app: &App) {
             let bar = pad_to_width(&text, w.saturating_sub(1));
             lines.push(Line::from(Span::styled(
                 bar,
-                Style::new().bg(VIOLET).fg(BAR_BG).add_modifier(Modifier::BOLD),
+                Style::new().bg(app.theme.violet).fg(app.theme.bar_bg).add_modifier(Modifier::BOLD),
             )));
         } else {
             lines.push(Line::from(Span::styled(
                 format!("   {} ({})", o.name, kind_label(&o.kind)),
-                plain(MUTED),
+                plain(app.theme.muted),
             )));
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("─".repeat(w.saturating_sub(1)), plain(HAIRLINE))));
+    lines.push(Line::from(Span::styled("─".repeat(w.saturating_sub(1)), plain(app.theme.hairline))));
     lines.push(Line::from(vec![
-        Span::styled(" ↑↓ 选择", plain(MUTED)),
-        Span::styled(" · ", plain(HAIRLINE)),
-        Span::styled("Enter 确认", plain(MUTED)),
-        Span::styled(" · ", plain(HAIRLINE)),
-        Span::styled("Esc 拒绝", plain(MUTED)),
+        Span::styled(" ↑↓ 选择", plain(app.theme.muted)),
+        Span::styled(" · ", plain(app.theme.hairline)),
+        Span::styled("Enter 确认", plain(app.theme.muted)),
+        Span::styled(" · ", plain(app.theme.hairline)),
+        Span::styled("Esc 拒绝", plain(app.theme.muted)),
     ]));
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -410,10 +410,10 @@ fn draw_sessions(f: &mut Frame, app: &App) {
     f.render_widget(Clear, area);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(plain(ACCENT))
+        .border_style(plain(app.theme.accent))
         .title(Line::from(vec![
-            Span::styled(" ⬥ ", bold(ACCENT)),
-            Span::styled(format!("会话列表（{}） ", items.len()), bold(ACCENT)),
+            Span::styled(" ⬥ ", bold(app.theme.accent)),
+            Span::styled(format!("会话列表（{}） ", items.len()), bold(app.theme.accent)),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -428,7 +428,7 @@ fn draw_sessions(f: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     if items.is_empty() {
-        lines.push(Line::from(Span::styled("（还没有持久化会话）", plain(DIM))));
+        lines.push(Line::from(Span::styled("（还没有持久化会话）", plain(app.theme.dim))));
     }
     for i in top..end {
         let it = &items[i];
@@ -452,26 +452,26 @@ fn draw_sessions(f: &mut Frame, app: &App) {
             let bar = pad_to_width(&format!(" ❯ {base} "), inner.width.saturating_sub(1) as usize);
             lines.push(Line::from(Span::styled(
                 bar,
-                Style::new().bg(VIOLET).fg(BAR_BG).add_modifier(Modifier::BOLD),
+                Style::new().bg(app.theme.violet).fg(app.theme.bar_bg).add_modifier(Modifier::BOLD),
             )));
         } else {
-            lines.push(Line::from(Span::styled(format!("   {base}"), plain(MUTED))));
+            lines.push(Line::from(Span::styled(format!("   {base}"), plain(app.theme.muted))));
         }
     }
     if total > visible {
         let pct = ((*selected + 1) * 100) / total;
         lines.push(Line::from(Span::styled(
             format!("   · 第 {}/{} 项（{pct}%） ↑↓ 滚动", *selected + 1, total),
-            plain(HAIRLINE),
+            plain(app.theme.hairline),
         )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" ↑↓ 选择", plain(MUTED)),
-        Span::styled(" · ", plain(HAIRLINE)),
-        Span::styled("Enter 恢复", plain(MUTED)),
-        Span::styled(" · ", plain(HAIRLINE)),
-        Span::styled("Esc 关闭", plain(MUTED)),
+        Span::styled(" ↑↓ 选择", plain(app.theme.muted)),
+        Span::styled(" · ", plain(app.theme.hairline)),
+        Span::styled("Enter 恢复", plain(app.theme.muted)),
+        Span::styled(" · ", plain(app.theme.hairline)),
+        Span::styled("Esc 关闭", plain(app.theme.muted)),
     ]));
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -525,8 +525,8 @@ fn draw_cmd_menu(f: &mut Frame, app: &App, input_area: Rect) {
     f.render_widget(Clear, area);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(plain(ACCENT))
-        .title(Span::styled(" 命令 ", bold(ACCENT)));
+        .border_style(plain(app.theme.accent))
+        .title(Span::styled(" 命令 ", bold(app.theme.accent)));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -542,7 +542,7 @@ fn draw_cmd_menu(f: &mut Frame, app: &App, input_area: Rect) {
             crate::app::MenuRow::Header(h) => {
                 lines.push(Line::from(Span::styled(
                     format!("  {} ", h),
-                    plain(HAIRLINE).add_modifier(Modifier::BOLD),
+                    plain(app.theme.hairline).add_modifier(Modifier::BOLD),
                 )));
             }
             crate::app::MenuRow::Cmd(c) => {
@@ -555,14 +555,14 @@ fn draw_cmd_menu(f: &mut Frame, app: &App, input_area: Rect) {
                     );
                     lines.push(Line::from(Span::styled(
                         bar,
-                        Style::new().bg(VIOLET).fg(BAR_BG).add_modifier(Modifier::BOLD),
+                        Style::new().bg(app.theme.violet).fg(app.theme.bar_bg).add_modifier(Modifier::BOLD),
                     )));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("   {}", c.name), plain(FG)),
+                        Span::styled(format!("   {}", c.name), plain(app.theme.fg)),
                         Span::styled(
                             format!("  {}{}", c.desc, busy_mark),
-                            plain(if c.idle_only && app.state == RunState::Busy { DIM } else { MUTED }),
+                            plain(if c.idle_only && app.state == RunState::Busy { app.theme.dim } else { app.theme.muted }),
                         ),
                     ]));
                 }
@@ -589,10 +589,10 @@ fn draw_config(f: &mut Frame, app: &App) {
     f.render_widget(Clear, area);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(plain(VIOLET))
+        .border_style(plain(app.theme.violet))
         .title(Line::from(vec![
-            Span::styled(" ⬡ ", bold(VIOLET)),
-            Span::styled(format!("{title}（{}） ", choices.len()), bold(VIOLET)),
+            Span::styled(" ⬡ ", bold(app.theme.violet)),
+            Span::styled(format!("{title}（{}） ", choices.len()), bold(app.theme.violet)),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -623,13 +623,13 @@ fn draw_config(f: &mut Frame, app: &App) {
             );
             lines.push(Line::from(Span::styled(
                 bar,
-                Style::new().bg(VIOLET).fg(BAR_BG).add_modifier(Modifier::BOLD),
+                Style::new().bg(app.theme.violet).fg(app.theme.bar_bg).add_modifier(Modifier::BOLD),
             )));
         } else {
             let name = if is_current { format!("{}（当前）", c.name) } else { c.name.clone() };
             lines.push(Line::from(Span::styled(
                 format!("   {name}{desc}"),
-                plain(MUTED),
+                plain(app.theme.muted),
             )));
         }
     }
@@ -637,16 +637,16 @@ fn draw_config(f: &mut Frame, app: &App) {
         let pct = ((*selected + 1) * 100) / total;
         lines.push(Line::from(Span::styled(
             format!("   · 第 {}/{} 项（{pct}%） ↑↓ 滚动", *selected + 1, total),
-            plain(HAIRLINE),
+            plain(app.theme.hairline),
         )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" ↑↓ 选择", plain(MUTED)),
-        Span::styled(" · ", plain(HAIRLINE)),
-        Span::styled("Enter 应用", plain(MUTED)),
-        Span::styled(" · ", plain(HAIRLINE)),
-        Span::styled("Esc 取消", plain(MUTED)),
+        Span::styled(" ↑↓ 选择", plain(app.theme.muted)),
+        Span::styled(" · ", plain(app.theme.hairline)),
+        Span::styled("Enter 应用", plain(app.theme.muted)),
+        Span::styled(" · ", plain(app.theme.hairline)),
+        Span::styled("Esc 取消", plain(app.theme.muted)),
     ]));
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -668,10 +668,10 @@ fn draw_info(f: &mut Frame, app: &App) {
     f.render_widget(Clear, area);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(plain(ACCENT))
+        .border_style(plain(app.theme.accent))
         .title(Line::from(vec![
-            Span::styled(" ⬥ ", bold(ACCENT)),
-            Span::styled(format!("{title} "), bold(ACCENT)),
+            Span::styled(" ⬥ ", bold(app.theme.accent)),
+            Span::styled(format!("{title} "), bold(app.theme.accent)),
         ]));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -687,9 +687,9 @@ fn draw_info(f: &mut Frame, app: &App) {
     for i in top..end {
         let line = &lines[i];
         let styled: Line = if line.starts_with("  ") {
-            Line::from(Span::styled(line.clone(), plain(MUTED)))
+            Line::from(Span::styled(line.clone(), plain(app.theme.muted)))
         } else {
-            Line::from(Span::styled(line.clone(), plain(FG)))
+            Line::from(Span::styled(line.clone(), plain(app.theme.fg)))
         };
         text_lines.push(styled);
     }
@@ -697,16 +697,16 @@ fn draw_info(f: &mut Frame, app: &App) {
         let pct = ((*selected + 1) * 100) / total;
         text_lines.push(Line::from(Span::styled(
             format!("   · 第 {}/{} 行（{pct}%）", *selected + 1, total),
-            plain(HAIRLINE),
+            plain(app.theme.hairline),
         )));
     }
     text_lines.push(Line::from(""));
     text_lines.push(Line::from(vec![
-        Span::styled(" ↑↓ 滚动", plain(MUTED)),
-        Span::styled(" · ", plain(HAIRLINE)),
-        Span::styled("PgUp/PgDn 翻页", plain(MUTED)),
-        Span::styled(" · ", plain(HAIRLINE)),
-        Span::styled("Esc 关闭", plain(MUTED)),
+        Span::styled(" ↑↓ 滚动", plain(app.theme.muted)),
+        Span::styled(" · ", plain(app.theme.hairline)),
+        Span::styled("PgUp/PgDn 翻页", plain(app.theme.muted)),
+        Span::styled(" · ", plain(app.theme.hairline)),
+        Span::styled("Esc 关闭", plain(app.theme.muted)),
     ]));
     f.render_widget(Paragraph::new(Text::from(text_lines)), inner);
 }

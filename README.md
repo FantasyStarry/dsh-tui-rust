@@ -134,6 +134,20 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 
 启动时后台检查 `dsh --version`（≥ 0.1.2-alpha.2 契约），过低或缺失会在状态区警告。
 
+### 主题系统（`~/.dsh-tui/theme.json`，pi themes 风格）
+
+全部渲染从语义 token（accent/violet/ok/warn/err/fg/muted/dim/codeFg/hairline/pillBg/barBg）
+取色，默认调色板即设计稿配色。可选用 `~/.dsh-tui/theme.json` 覆盖任意子集
+（启动时读取一次，`#RRGGBB` 十六进制，非法键忽略）：
+
+```json
+{
+  "accent": "#61afef",
+  "violet": "#a78bfa",
+  "ok": "#4ade80"
+}
+```
+
 ### 流式渲染与帧率（ratatui）
 
 - **事件门控渲染**：只有 dirty 或忙碌（spinner 动画）才重绘；空闲零绘制。
@@ -267,7 +281,11 @@ dsh 的 acp profile 禁用了模型生成标题（ACP 面无标题 surface，只
 - [x] **客户端体验里程碑** — `!`/`!!` shell 直通（借鉴 pi）、`/cost` 用量费用、
       `/status` 信息面板、`/help` 面板化、本地会话标题（首条消息）、
       会话列表相对时间 + 当前会话标记、版本号统一（0.3.0）
-- [ ] **Phase 2** — diff 视图、完整 markdown/高亮、主题系统
+- [x] **流畅渲染里程碑** — 事件门控渲染（忙 30fps / 闲按需）、增量显示缓存、
+      CSI 2026 同步输出、`--render-bench` 基准（~500fps）、工具调用状态卡片、
+      多行输入（Shift+Enter）、kimi 式命令体系（别名/分组/忙时门控）、
+      `/doctor` `/preset` `/usage` `/permission`、主题系统（theme.json）
+- [ ] **Phase 2** — diff 视图（受 ACP 限制：无工具结果流）、图片粘贴、语法高亮
 - [ ] **Phase 3** — companion 插件 bundle（`tui` profile）+ npm 分发（平台预编译二进制）
 
 ## 协议速查（dsh acp surface 实测）

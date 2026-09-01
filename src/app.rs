@@ -369,6 +369,8 @@ pub struct App {
     pub busy_since: Option<Instant>,
     /// Web GUI reachability (from `/web` probes): URL when up.
     pub web_url: Option<String>,
+    /// Active color theme (default palette or ~/.dsh-tui/theme.json override).
+    pub theme: crate::theme::Theme,
     /// Flattened, wrapped display lines (built incrementally from
     /// [`App::disp_cache`]; see [`App::ensure_display`]).
     pub display: Vec<Vec<Span<'static>>>,
@@ -426,6 +428,7 @@ impl App {
             fatal: None,
             busy_since: Some(Instant::now()),
             web_url: None,
+            theme: crate::theme::load_theme(),
             display: Vec::new(),
             quit: false,
             disp_cache: Vec::new(),
@@ -625,7 +628,7 @@ impl App {
                 .and_then(|id| self.tool_collapsed.get(id))
                 .copied()
                 .unwrap_or(false);
-            let block = entry_block(e, w, seen_content, collapsed);
+            let block = entry_block(e, w, seen_content, collapsed, &self.theme);
             seen_content |= matches!(e.kind, EntryKind::User | EntryKind::Agent | EntryKind::Tool);
             self.disp_cache[i] = block;
             self.block_start[i] = idx;
@@ -695,31 +698,37 @@ fn wrap_spans(spans: &[Span<'static>], max: usize) -> Vec<Vec<(char, Style)>> {
 /// hairline separator. `had_content` tells whether any previous entry was
 /// content-bearing (User/Agent/Tool) — that decides the separator.
 /// `collapsed` hides tool-call detail previews (Ctrl+O).
-fn entry_block(e: &Entry, w: usize, had_content: bool, collapsed: bool) -> Vec<Vec<Span<'static>>> {
+fn entry_block(
+    e: &Entry,
+    w: usize,
+    had_content: bool,
+    collapsed: bool,
+    th: &crate::theme::Theme,
+) -> Vec<Vec<Span<'static>>> {
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     match e.kind {
         EntryKind::User => {
             if had_content {
-                out.push(vec![Span::styled("─".repeat(w), t::plain(t::HAIRLINE))]);
+                out.push(vec![Span::styled("─".repeat(w), t::plain(th.hairline))]);
                 out.push(vec![]);
             }
             for (i, seg) in e.text.split('\n').enumerate() {
                 let mut spans = Vec::new();
                 if i == 0 {
-                    spans.push(Span::styled("❯ ".to_string(), t::bold(t::ACCENT)));
+                    spans.push(Span::styled("❯ ".to_string(), t::bold(th.accent)));
                 } else {
-                    spans.push(Span::styled("  ".to_string(), t::bold(t::FG)));
+                    spans.push(Span::styled("  ".to_string(), t::bold(th.fg)));
                 }
-                spans.push(Span::styled(seg.to_string(), t::bold(t::FG)));
-                push_wrapped(&mut out, &spans, "  ", t::bold(t::FG), w);
+                spans.push(Span::styled(seg.to_string(), t::bold(th.fg)));
+                push_wrapped(&mut out, &spans, "  ", t::bold(th.fg), w);
             }
         }
         EntryKind::Agent => {
-            for line in markdown_spans(&e.text) {
+            for line in markdown_spans(&e.text, th) {
                 if line.is_empty() {
                     out.push(vec![]);
                 } else {
-                    push_wrapped(&mut out, &line, "  ", t::plain(t::FG), w);
+                    push_wrapped(&mut out, &line, "  ", t::plain(th.fg), w);
                 }
             }
         }
@@ -729,26 +738,26 @@ fn entry_block(e: &Entry, w: usize, had_content: bool, collapsed: bool) -> Vec<V
                 if i == 0 {
                     spans.push(Span::styled(
                         "✻ ".to_string(),
-                        t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                        t::plain(th.dim).add_modifier(Modifier::ITALIC),
                     ));
                 } else {
                     spans.push(Span::styled(
                         "  ".to_string(),
-                        t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                        t::plain(th.dim).add_modifier(Modifier::ITALIC),
                     ));
                 }
                 spans.push(Span::styled(
                     seg.to_string(),
-                    t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                    t::plain(th.dim).add_modifier(Modifier::ITALIC),
                 ));
-                push_wrapped(&mut out, &spans, "  ", t::plain(t::DIM), w);
+                push_wrapped(&mut out, &spans, "  ", t::plain(th.dim), w);
             }
         }
         EntryKind::Tool => {
             // Boxed tool card (pi ToolExecutionComponent style): a status-
             // colored rounded border, title + Chinese status label on the
             // top edge, optional rawInput preview inside (Ctrl+O collapses).
-            let (label, color) = t::status_label(e.status.as_deref().unwrap_or("pending"));
+            let (label, color) = th.status_label(e.status.as_deref().unwrap_or("pending"));
             let cw = w.saturating_sub(4).max(2);
             let head = format!("{} ● {label}", e.text);
             let chunks = wrap_plain(&head, cw);
@@ -757,7 +766,7 @@ fn entry_block(e: &Entry, w: usize, had_content: bool, collapsed: bool) -> Vec<V
 
             out.push(vec![
                 Span::styled("╭─".to_string(), t::plain(color)),
-                Span::styled(first, t::plain(t::FG).add_modifier(Modifier::BOLD)),
+                Span::styled(first, t::plain(th.fg).add_modifier(Modifier::BOLD)),
                 Span::styled("─".repeat(cw.saturating_sub(first_w)), t::plain(color)),
                 Span::styled("─╮".to_string(), t::plain(color)),
             ]);
@@ -765,7 +774,7 @@ fn entry_block(e: &Entry, w: usize, had_content: bool, collapsed: bool) -> Vec<V
                 let pad = cw.saturating_sub(unicode_width::UnicodeWidthStr::width(chunk.as_str()));
                 out.push(vec![
                     Span::styled("│ ".to_string(), t::plain(color)),
-                    Span::styled(chunk.clone(), t::plain(t::FG)),
+                    Span::styled(chunk.clone(), t::plain(th.fg)),
                     Span::styled(" ".repeat(pad), t::plain(color)),
                     Span::styled(" │".to_string(), t::plain(color)),
                 ]);
@@ -777,8 +786,8 @@ fn entry_block(e: &Entry, w: usize, had_content: bool, collapsed: bool) -> Vec<V
                             .saturating_sub(2)
                             .saturating_sub(unicode_width::UnicodeWidthStr::width(chunk.as_str()));
                         out.push(vec![
-                            Span::styled("│ ⤷ ".to_string(), t::plain(t::HAIRLINE)),
-                            Span::styled(chunk, t::plain(t::DIM)),
+                            Span::styled("│ ⤷ ".to_string(), t::plain(th.hairline)),
+                            Span::styled(chunk, t::plain(th.dim)),
                             Span::styled(" ".repeat(pad), t::plain(color)),
                             Span::styled(" │".to_string(), t::plain(color)),
                         ]);
@@ -793,12 +802,12 @@ fn entry_block(e: &Entry, w: usize, had_content: bool, collapsed: bool) -> Vec<V
             for (i, seg) in e.text.split('\n').enumerate() {
                 let mut spans = Vec::new();
                 if i == 0 {
-                    spans.push(Span::styled("· ".to_string(), t::plain(t::DIM)));
+                    spans.push(Span::styled("· ".to_string(), t::plain(th.dim)));
                 } else {
-                    spans.push(Span::styled("  ".to_string(), t::plain(t::DIM)));
+                    spans.push(Span::styled("  ".to_string(), t::plain(th.dim)));
                 }
-                spans.push(Span::styled(seg.to_string(), t::plain(t::DIM)));
-                push_wrapped(&mut out, &spans, "  ", t::plain(t::DIM), w);
+                spans.push(Span::styled(seg.to_string(), t::plain(th.dim)));
+                push_wrapped(&mut out, &spans, "  ", t::plain(th.dim), w);
             }
         }
     }
@@ -806,7 +815,7 @@ fn entry_block(e: &Entry, w: usize, had_content: bool, collapsed: bool) -> Vec<V
     out
 }
 
-fn markdown_spans(text: &str) -> Vec<Vec<Span<'static>>> {
+fn markdown_spans(text: &str, th: &crate::theme::Theme) -> Vec<Vec<Span<'static>>> {
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     let mut in_code = false;
     for raw in text.split('\n') {
@@ -821,21 +830,21 @@ fn markdown_spans(text: &str) -> Vec<Vec<Span<'static>>> {
             } else {
                 format!("{edge}───")
             };
-            out.push(vec![Span::styled(label, t::plain(t::HAIRLINE))]);
+            out.push(vec![Span::styled(label, t::plain(th.hairline))]);
             continue;
         }
         if in_code {
             out.push(vec![
-                Span::styled("  │ ".to_string(), t::plain(t::HAIRLINE)),
-                Span::styled(line.to_string(), t::plain(t::CODE_FG)),
+                Span::styled("  │ ".to_string(), t::plain(th.hairline)),
+                Span::styled(line.to_string(), t::plain(th.code_fg)),
             ]);
             continue;
         }
         if trimmed.starts_with('#') {
             let stripped = trimmed.trim_start_matches('#').trim_start();
             out.push(vec![
-                Span::styled("  ".to_string(), t::plain(t::FG)),
-                Span::styled(stripped.to_string(), t::bold(t::ACCENT)),
+                Span::styled("  ".to_string(), t::plain(th.fg)),
+                Span::styled(stripped.to_string(), t::bold(th.accent)),
             ]);
             continue;
         }
@@ -844,14 +853,16 @@ fn markdown_spans(text: &str) -> Vec<Vec<Span<'static>>> {
             let indent = " ".repeat(indent_len.min(6));
             out.push(inline_spans(
                 &format!("{indent}• {}", &trimmed[2..]),
-                t::plain(t::FG),
+                t::plain(th.fg),
+                th,
             ));
             continue;
         }
         if let Some(quoted) = trimmed.strip_prefix("> ") {
             out.push(inline_spans(
                 &format!("▌ {quoted}"),
-                t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                t::plain(th.dim).add_modifier(Modifier::ITALIC),
+                th,
             ));
             continue;
         }
@@ -859,14 +870,14 @@ fn markdown_spans(text: &str) -> Vec<Vec<Span<'static>>> {
             out.push(vec![]);
             continue;
         }
-        out.push(inline_spans(line, t::plain(t::FG)));
+        out.push(inline_spans(line, t::plain(th.fg), th));
     }
     out
 }
 
 /// Inline markdown: `code` → accent, **bold** → bold. Unclosed markers stay
 /// literal (streaming-friendly: partial chunks render as plain text).
-fn inline_spans(s: &str, base: Style) -> Vec<Span<'static>> {
+fn inline_spans(s: &str, base: Style, th: &crate::theme::Theme) -> Vec<Span<'static>> {
     let chars: Vec<char> = s.chars().collect();
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut cur = String::new();
@@ -881,7 +892,7 @@ fn inline_spans(s: &str, base: Style) -> Vec<Span<'static>> {
             if let Some(end) = (i + 1..chars.len()).find(|&j| chars[j] == '`') {
                 flush(&mut cur, &mut out, base);
                 let code: String = chars[i + 1..end].iter().collect();
-                out.push(Span::styled(code, t::plain(t::CODE_FG)));
+                out.push(Span::styled(code, t::plain(th.code_fg)));
                 i = end + 1;
                 continue;
             }
@@ -2841,12 +2852,13 @@ mod tests {
             detail: Some("path/to/file.txt".into()),
             tool_id: Some("t1".into()),
         };
-        let open = block_text(&entry_block(&e, 60, true, false));
+        let th = crate::theme::Theme::default();
+        let open = block_text(&entry_block(&e, 60, true, false, &th));
         assert!(open.contains("已完成"), "{open}");
         assert!(open.contains("path/to/file.txt"), "{open}");
         assert!(open.starts_with("╭─"), "{open}");
 
-        let closed = block_text(&entry_block(&e, 60, true, true));
+        let closed = block_text(&entry_block(&e, 60, true, true, &th));
         assert!(closed.contains("已完成"), "{closed}");
         assert!(!closed.contains("path/to/file.txt"), "{closed}");
     }
@@ -2877,6 +2889,30 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("梁神模式"), "{joined}");
         assert!(joined.contains("1 个 agent preset"), "{joined}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn theme_override_loads_and_applies() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("dsh-tui-theme-{}", std::process::id()));
+        let dsh_tui = tmp.join(".dsh-tui");
+        std::fs::create_dir_all(&dsh_tui).unwrap();
+        std::fs::write(
+            dsh_tui.join("theme.json"),
+            r##"{"accent": "#ff0000", "violet": "#00ff00", "bogus": "not-a-color"}"##,
+        )
+        .unwrap();
+        std::env::set_var("USERPROFILE", &tmp);
+        std::env::set_var("HOME", &tmp);
+
+        let th = crate::theme::load_theme();
+        assert_eq!(th.accent, ratatui::style::Color::Rgb(255, 0, 0));
+        assert_eq!(th.violet, ratatui::style::Color::Rgb(0, 255, 0));
+        // Untouched tokens keep the default palette.
+        assert_eq!(th.ok, ratatui::style::Color::Rgb(74, 222, 128));
+        // Invalid keys are ignored (parse failure), no panic.
 
         std::fs::remove_dir_all(&tmp).ok();
     }
