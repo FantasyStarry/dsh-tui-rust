@@ -35,6 +35,8 @@ pub struct Entry {
     pub status: Option<String>,
     /// Tool entries only: clipped rawInput preview (the actual command/args).
     pub detail: Option<String>,
+    /// Tool entries only: the ACP tool_call_id (drives Ctrl+O collapse).
+    pub tool_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -125,6 +127,7 @@ pub const COMMANDS: &[Cmd] = &[
     Cmd { name: "/usage", aliases: &[], desc: "当前会话用量明细", group: CmdGroup::Info, idle_only: false },
     Cmd { name: "/status", aliases: &[], desc: "当前会话 / 配置信息", group: CmdGroup::Info, idle_only: false },
     Cmd { name: "/doctor", aliases: &["/diag"], desc: "环境自检（dsh/插件/配置）", group: CmdGroup::Info, idle_only: false },
+    Cmd { name: "/preset", aliases: &[], desc: "列出 agent presets", group: CmdGroup::Info, idle_only: false },
     Cmd { name: "/permission", aliases: &["/perm"], desc: "本地权限规则", group: CmdGroup::Info, idle_only: false },
     Cmd { name: "/help", aliases: &["/h", "/?"], desc: "显示所有命令", group: CmdGroup::Info, idle_only: false },
     Cmd { name: "/web", aliases: &[], desc: "启动/打开 web 界面", group: CmdGroup::System, idle_only: false },
@@ -357,6 +360,10 @@ pub struct App {
     queued_permissions: Vec<(Value, String, Vec<PermOption>)>,
     tool_idx: HashMap<String, usize>,
     tool_meta: HashMap<String, ToolMeta>,
+    /// Ctrl+O collapse state per tool_call_id (detail preview hidden).
+    tool_collapsed: HashMap<String, bool>,
+    /// Most recent tool_call_id (Ctrl+O toggles this one).
+    last_tool_id: Option<String>,
     debug_log: VecDeque<String>,
     /// Locally generated session titles (first user prompt → short title),
     /// persisted in `~/.dsh-tui/session-titles.json`. The dsh acp profile
@@ -396,6 +403,8 @@ impl App {
             queued_permissions: Vec::new(),
             tool_idx: HashMap::new(),
             tool_meta: HashMap::new(),
+            tool_collapsed: HashMap::new(),
+            last_tool_id: None,
             debug_log: VecDeque::new(),
             titles: load_titles(),
             perm_rules: load_permission_rules(),
@@ -423,7 +432,13 @@ impl App {
     }
 
     pub(crate) fn push_entry(&mut self, kind: EntryKind, text: &str) {
-        self.entries.push(Entry { kind, text: text.to_string(), status: None, detail: None });
+        self.entries.push(Entry {
+            kind,
+            text: text.to_string(),
+            status: None,
+            detail: None,
+            tool_id: None,
+        });
         self.invalidate(self.entries.len() - 1);
     }
 
@@ -435,6 +450,7 @@ impl App {
                 text: text.to_string(),
                 status: None,
                 detail: None,
+                tool_id: None,
             }),
         }
         self.invalidate(self.entries.len() - 1);
@@ -449,6 +465,8 @@ impl App {
         self.clean_from = 0;
         self.tool_idx.clear();
         self.tool_meta.clear();
+        self.tool_collapsed.clear();
+        self.last_tool_id = None;
         self.usage = None;
         self.scroll_from_bottom = 0;
         self.dirty = true;
@@ -551,7 +569,13 @@ impl App {
             .any(|e| matches!(e.kind, EntryKind::User | EntryKind::Agent | EntryKind::Tool));
         for i in clean..self.entries.len() {
             let e = &self.entries[i];
-            let block = entry_block(e, w, seen_content);
+            let collapsed = e
+                .tool_id
+                .as_deref()
+                .and_then(|id| self.tool_collapsed.get(id))
+                .copied()
+                .unwrap_or(false);
+            let block = entry_block(e, w, seen_content, collapsed);
             seen_content |= matches!(e.kind, EntryKind::User | EntryKind::Agent | EntryKind::Tool);
             self.disp_cache[i] = block;
             self.block_start[i] = idx;
@@ -562,6 +586,27 @@ impl App {
         self.clean_from = self.entries.len();
         self.dirty = false;
     }
+}
+
+/// Plain display-width-aware wrap (no styling) — used for tool-card borders.
+fn wrap_plain(s: &str, max: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if cur_w + cw > max && cur_w > 0 {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(ch);
+        cur_w += cw;
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Char-level wrap that preserves per-span styling (CJK aware).
@@ -599,7 +644,8 @@ fn wrap_spans(spans: &[Span<'static>], max: usize) -> Vec<Vec<(char, Style)>> {
 /// the trailing blank line and, for user turns after earlier content, the
 /// hairline separator. `had_content` tells whether any previous entry was
 /// content-bearing (User/Agent/Tool) — that decides the separator.
-fn entry_block(e: &Entry, w: usize, had_content: bool) -> Vec<Vec<Span<'static>>> {
+/// `collapsed` hides tool-call detail previews (Ctrl+O).
+fn entry_block(e: &Entry, w: usize, had_content: bool, collapsed: bool) -> Vec<Vec<Span<'static>>> {
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
     match e.kind {
         EntryKind::User => {
@@ -649,25 +695,49 @@ fn entry_block(e: &Entry, w: usize, had_content: bool) -> Vec<Vec<Span<'static>>
             }
         }
         EntryKind::Tool => {
-            let mut spans = vec![
-                Span::styled("❯ ".to_string(), t::plain(t::ACCENT)),
-                Span::styled(format!("{} ", e.text), t::plain(t::FG)),
-            ];
-            match &e.status {
-                Some(s) => spans.push(Span::styled(
-                    format!("● {s}"),
-                    t::plain(t::status_color(s)),
-                )),
-                None => spans.push(Span::styled("● …", t::plain(t::MUTED))),
+            // Boxed tool card (pi ToolExecutionComponent style): a status-
+            // colored rounded border, title + Chinese status label on the
+            // top edge, optional rawInput preview inside (Ctrl+O collapses).
+            let (label, color) = t::status_label(e.status.as_deref().unwrap_or("pending"));
+            let cw = w.saturating_sub(4).max(2);
+            let head = format!("{} ● {label}", e.text);
+            let chunks = wrap_plain(&head, cw);
+            let first = chunks.first().cloned().unwrap_or_default();
+            let first_w = unicode_width::UnicodeWidthStr::width(first.as_str());
+
+            out.push(vec![
+                Span::styled("╭─".to_string(), t::plain(color)),
+                Span::styled(first, t::plain(t::FG).add_modifier(Modifier::BOLD)),
+                Span::styled("─".repeat(cw.saturating_sub(first_w)), t::plain(color)),
+                Span::styled("─╮".to_string(), t::plain(color)),
+            ]);
+            for chunk in chunks.iter().skip(1) {
+                let pad = cw.saturating_sub(unicode_width::UnicodeWidthStr::width(chunk.as_str()));
+                out.push(vec![
+                    Span::styled("│ ".to_string(), t::plain(color)),
+                    Span::styled(chunk.clone(), t::plain(t::FG)),
+                    Span::styled(" ".repeat(pad), t::plain(color)),
+                    Span::styled(" │".to_string(), t::plain(color)),
+                ]);
             }
-            push_wrapped(&mut out, &spans, "  ", t::plain(t::FG), w);
-            if let Some(detail) = &e.detail {
-                let d = vec![
-                    Span::styled("  ⤷ ".to_string(), t::plain(t::HAIRLINE)),
-                    Span::styled(detail.clone(), t::plain(t::DIM)),
-                ];
-                push_wrapped(&mut out, &d, "    ", t::plain(t::DIM), w);
+            if !collapsed {
+                if let Some(detail) = &e.detail {
+                    for chunk in wrap_plain(detail, cw.saturating_sub(2).max(2)) {
+                        let pad = cw
+                            .saturating_sub(2)
+                            .saturating_sub(unicode_width::UnicodeWidthStr::width(chunk.as_str()));
+                        out.push(vec![
+                            Span::styled("│ ⤷ ".to_string(), t::plain(t::HAIRLINE)),
+                            Span::styled(chunk, t::plain(t::DIM)),
+                            Span::styled(" ".repeat(pad), t::plain(color)),
+                            Span::styled(" │".to_string(), t::plain(color)),
+                        ]);
+                    }
+                }
             }
+            out.push(vec![
+                Span::styled(format!("╰─{}─╯", "─".repeat(cw)), t::plain(color)),
+            ]);
         }
         EntryKind::System => {
             for (i, seg) in e.text.split('\n').enumerate() {
@@ -1154,6 +1224,14 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             open_config(app, client, "reasoning_effort", "推理档位").await;
         }
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Toggle the detail preview of the most recent tool call (pi
+            // `tools.expand` analog).
+            if let Some(id) = app.last_tool_id.clone() {
+                let v = app.tool_collapsed.entry(id).or_insert(false);
+                *v = !*v;
+            }
+        }
         KeyCode::PageUp => {
             app.scroll_by(10);
         }
@@ -1178,6 +1256,12 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                 app.queue.clear();
                 app.sysnote("已清空排队消息");
             }
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            // Multi-line editing (pi editor convention): Shift+Enter inserts
+            // a newline, plain Enter submits.
+            app.input.push('\n');
+            app.cmd_selected = 0;
         }
         KeyCode::Enter => {
             let text = app.input.trim().to_string();
@@ -1290,6 +1374,7 @@ async fn run_command(app: &mut App, client: &AcpClient, cmd: &Cmd) {
         "/usage" => open_info(app, "会话用量", usage_report(app)),
         "/status" => open_info(app, "状态", status_lines(app)),
         "/doctor" => open_info(app, "环境自检", doctor_report()),
+        "/preset" => open_info(app, "Agent Presets", preset_report()),
         "/permission" => open_info(app, "本地权限规则", permission_report(app)),
         "/web" => start_web(client),
         "/clear" => {
@@ -2032,6 +2117,57 @@ fn doctor_report() -> Vec<String> {
     out
 }
 
+/// /preset — list agent presets discovered in the Harness home roster
+/// (`$DSH_HOME/.agent-presets/*/preset.yml`). Informational only: the ACP
+/// surface has no preset-selection method, so switching presets happens on
+/// the web/headless side (or via a custom profile composition).
+fn preset_report() -> Vec<String> {
+    let Some(home) = dsh_home() else {
+        return vec!["无法解析 DSH home（$DSH_HOME 或 ~/.dsh）".into()];
+    };
+    let dir = home.join(".agent-presets");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return vec![format!("未找到 agent presets 目录: {}", dir.display())];
+    };
+    let mut presets: Vec<(String, String)> = Vec::new();
+    for e in entries.flatten() {
+        if !e.path().is_dir() {
+            continue;
+        }
+        let yml = e.path().join("preset.yml");
+        let Ok(txt) = std::fs::read_to_string(&yml) else { continue };
+        let name = txt
+            .lines()
+            .find_map(|l| l.strip_prefix("name:").map(|s| s.trim().trim_matches('"').to_string()))
+            .unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
+        let desc = txt
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("description:")
+                    .map(|s| s.trim().trim_matches('"').to_string())
+            })
+            .unwrap_or_default();
+        presets.push((name, desc));
+    }
+    presets.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::new();
+    if presets.is_empty() {
+        out.push(format!("{} 下没有 preset.yml", dir.display()));
+    } else {
+        out.push(format!("发现 {} 个 agent preset：", presets.len()));
+        for (n, d) in presets {
+            if d.is_empty() {
+                out.push(format!("  {n}"));
+            } else {
+                out.push(format!("  {n} — {d}"));
+            }
+        }
+    }
+    out.push(String::new());
+    out.push("ACP 面无 preset 切换方法；preset 由 web/headless 端的 profile 组合决定。".into());
+    out
+}
+
 /// /permission — show the locally loaded auto-answer rules.
 fn permission_report(app: &App) -> Vec<String> {
     let mut out = Vec::new();
@@ -2308,7 +2444,9 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
                 text,
                 status: Some(status.clone()),
                 detail: raw,
+                tool_id: Some(tool_call_id.clone()),
             });
+            app.last_tool_id = Some(tool_call_id.clone());
             app.tool_idx.insert(tool_call_id.clone(), app.entries.len() - 1);
             app.tool_meta.insert(
                 tool_call_id,
@@ -2458,6 +2596,17 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
 mod tests {
     use super::*;
 
+    /// Serialize tests that mutate process env vars (DSH_HOME / USERPROFILE).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn block_text(block: &[Vec<Span<'static>>]) -> String {
+        block
+            .iter()
+            .map(|l| l.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn today_iso_is_date_shaped() {
         let s = today_iso();
@@ -2514,6 +2663,7 @@ mod tests {
 
     #[test]
     fn cost_report_reads_token_stats() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Point DSH_HOME at a temp dir with a synthetic token-stats.json.
         let tmp = std::env::temp_dir().join(format!("dsh-tui-test-{}", std::process::id()));
         let storages = tmp.join("storages");
@@ -2586,6 +2736,7 @@ mod tests {
 
     #[test]
     fn permission_rules_load_and_report() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("dsh-tui-perm-{}", std::process::id()));
         let dsh_tui = tmp.join(".dsh-tui");
         std::fs::create_dir_all(&dsh_tui).unwrap();
@@ -2616,5 +2767,54 @@ mod tests {
         let lines = doctor_report();
         assert!(!lines.is_empty());
         assert!(lines[0].contains("环境自检"), "{lines:?}");
+    }
+
+    #[test]
+    fn tool_card_renders_status_and_collapse() {
+        let e = Entry {
+            kind: EntryKind::Tool,
+            text: "edit [write]".into(),
+            status: Some("completed".into()),
+            detail: Some("path/to/file.txt".into()),
+            tool_id: Some("t1".into()),
+        };
+        let open = block_text(&entry_block(&e, 60, true, false));
+        assert!(open.contains("已完成"), "{open}");
+        assert!(open.contains("path/to/file.txt"), "{open}");
+        assert!(open.starts_with("╭─"), "{open}");
+
+        let closed = block_text(&entry_block(&e, 60, true, true));
+        assert!(closed.contains("已完成"), "{closed}");
+        assert!(!closed.contains("path/to/file.txt"), "{closed}");
+    }
+
+    #[test]
+    fn wrap_plain_respects_display_width() {
+        use unicode_width::UnicodeWidthStr;
+        let text = "你好world测试一二三";
+        let lines = wrap_plain(text, 6);
+        assert_eq!(lines.join(""), text);
+        assert!(lines.iter().all(|l| UnicodeWidthStr::width(l.as_str()) <= 6), "{lines:?}");
+    }
+
+    #[test]
+    fn preset_report_lists_presets() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("dsh-tui-preset-{}", std::process::id()));
+        let preset = tmp.join(".agent-presets/liangshen");
+        std::fs::create_dir_all(&preset).unwrap();
+        std::fs::write(
+            preset.join("preset.yml"),
+            "name: 梁神模式\ndescription: 主 Agent 与子 Agent 首轮 Minimal\n",
+        )
+        .unwrap();
+        std::env::set_var("DSH_HOME", &tmp);
+
+        let lines = preset_report();
+        let joined = lines.join("\n");
+        assert!(joined.contains("梁神模式"), "{joined}");
+        assert!(joined.contains("1 个 agent preset"), "{joined}");
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

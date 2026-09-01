@@ -51,11 +51,13 @@ pub fn draw<B: Backend>(
 }
 
 pub(crate) fn render(f: &mut Frame, app: &mut App) {
+    // The input box grows with the number of lines (Shift+Enter editing).
+    let input_h = input_height(&app.input).min(8);
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(input_h),
     ])
     .split(f.area());
 
@@ -242,8 +244,14 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Input box (rounded, violet; placeholder when empty)
+// Input box (rounded, violet; grows with Shift+Enter lines)
 // ---------------------------------------------------------------------------
+
+/// Input box height: 2 border rows + visible text lines, 3..=8 rows.
+fn input_height(input: &str) -> u16 {
+    let lines = input.lines().count().max(1);
+    (2 + lines.min(6)).clamp(3, 8) as u16
+}
 
 fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     use unicode_width::UnicodeWidthStr;
@@ -254,24 +262,42 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let all_lines: Vec<&str> = app.input.split('\n').collect();
+    let visible = (inner.height as usize).max(1);
+    let start = all_lines.len().saturating_sub(visible);
     let avail = inner.width.saturating_sub(3) as usize;
-    let disp = tail_by_width(&app.input, avail);
 
-    let mut spans: Vec<Span> = vec![Span::raw(" "), Span::styled("❯ ", bold(ACCENT))];
-    if app.input.is_empty() {
-        spans.push(Span::styled(
-            "输入消息…（/ 命令菜单 · !cmd 执行 shell · /list 会话）",
-            plain(DIM),
-        ));
-    } else {
-        spans.push(Span::styled(disp.clone(), plain(FG)));
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cursor_col = inner.x + 2;
+    for (i, raw) in all_lines.iter().enumerate().skip(start) {
+        let disp = tail_by_width(raw, avail);
+        let mut spans: Vec<Span> = if i == 0 {
+            vec![Span::raw(" "), Span::styled("❯ ", bold(ACCENT))]
+        } else {
+            vec![Span::styled("   ", plain(FG))]
+        };
+        if i == 0 && app.input.is_empty() {
+            spans.push(Span::styled(
+                "输入消息…（/ 命令 · !cmd 执行 shell · Shift+Enter 换行）",
+                plain(DIM),
+            ));
+        } else if disp.is_empty() && i != 0 {
+            spans.push(Span::styled(" ", plain(FG)));
+        } else {
+            spans.push(Span::styled(disp.clone(), plain(FG)));
+        }
+        if i == all_lines.len() - 1 {
+            cursor_col = inner.x
+                + 3
+                + (UnicodeWidthStr::width(disp.as_str()) as u16).min(inner.width.saturating_sub(4));
+        }
+        lines.push(Line::from(spans));
     }
-    f.render_widget(Paragraph::new(Text::from(Line::from(spans))), inner);
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 
     if matches!(app.dialog, Dialog::None) {
-        let text_w: usize = UnicodeWidthStr::width(disp.as_str());
-        let cx = inner.x + 3 + (text_w as u16).min(inner.width.saturating_sub(4));
-        f.set_cursor_position((cx, inner.y));
+        let cy = inner.y + (all_lines.len().saturating_sub(start)).saturating_sub(1) as u16;
+        f.set_cursor_position((cursor_col, cy));
     }
 }
 

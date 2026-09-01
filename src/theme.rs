@@ -36,6 +36,16 @@ pub fn status_color(status: &str) -> Color {
     }
 }
 
+/// Tool status → (Chinese label, color) for the tool-call cards.
+pub fn status_label(status: &str) -> (String, Color) {
+    match status {
+        "completed" | "success" | "done" | "finished" => ("已完成".to_string(), OK),
+        "failed" | "error" | "errored" => ("失败".to_string(), ERR),
+        "pending" | "running" | "in_progress" | "started" => ("进行中".to_string(), WARN),
+        other => (other.to_string(), MUTED),
+    }
+}
+
 /// Per-character accent→violet gradient for the wordmark.
 pub fn gradient_word(text: &str) -> Vec<Span<'static>> {
     let n = text.chars().count().saturating_sub(1).max(1);
