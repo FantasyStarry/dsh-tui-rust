@@ -64,8 +64,14 @@ function log(msg) {
   } catch {}
 }
 
-/** Sessions younger than this are never archived (a live TUI session is always fresh). */
-const ARCHIVE_MIN_AGE_MS = 60 * 60 * 1000;
+/**
+ * Age floor for archiving. With the never-attach rule in force, a fresh TUI
+ * session never reaches a workspace's sessionIds while empty, so this only
+ * guards the attach↔archive race (a session attached by the live first-event
+ * path whose user content has not flushed yet). One minute is plenty; the
+ * residue this fix targets is hours old.
+ */
+const ARCHIVE_MIN_AGE_MS = 60 * 1000;
 /** Unattached ACP sessions examined per sweep pass (bounds persistence reads). */
 const SWEEP_BUDGET = 25;
 

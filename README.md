@@ -246,12 +246,13 @@ web 端创建会话时由客户端显式携带 workspaceId；ACP 协议没有这
   与 web registry 首次 bootstrap 的行为一致——TUI 在任意新目录启动的会话
   也会出现在 web 侧边栏对应项目分组下，不再落"未分组"
 - 子代理会话跳过；home 目录不建组（避免把 `C:\Users\<你>` 变成工作区）
-- **空会话隔离**：零事件的 ACP 会话（TUI/探针残留，header 无 `agentPreset`）
-  **永不归组**，且每次启动归档一批已挂载的同类残留（`registry.archiveSession`，
-  只清 header、零数据损失，且仅限创建超过 1 小时的）——否则 web 新会话界面会
-  复用这种残留空白作为"暂存会话"，而它没有 `agentPreset` 投影，会让整个工作区
-  的**模式选择器（标准/PTC/极简/创造）消失**。web 创建的会话（header 带
-  `agentPreset`）不受影响，维持原语义
+- **空会话隔离**：零内容事件的 ACP 会话（TUI/探针残留，header 无 `agentPreset`；
+  注意内核会给每个会话写 3-4 条生命周期事件，空白判定按白名单排除它们）
+  **永不归组**，且每次启动归档已挂载的同类残留（`registry.archiveSession`，
+  只清空日志、零数据损失，创建超过 1 分钟即可归档、已归档 id 跳过）——否则 web
+  新会话界面会复用这种残留空白作为"暂存会话"，而它没有 `agentPreset` 投影，
+  会让整个工作区的**模式选择器（标准/PTC/极简/创造）消失**。web 创建的会话
+  （header 带 `agentPreset`）不受影响，维持原语义
 
 > 已实测：TUI 新会话几秒内进入 `dsh-tui-rust` 工作区；从未注册的目录创建的会话
 > 会自动生成同名工作区并归入。
