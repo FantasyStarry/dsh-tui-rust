@@ -96,6 +96,8 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 | `/cost` | 今日 token 用量与费用估算（读 `~/.dsh/storages/token-stats.json`，与 web 共用数据） |
 | `/usage` | 当前会话的用量明细（请求数 / 输入 / 输出 / 缓存 / 推理 tokens） |
 | `/status` | 当前会话 / 模型 / 上下文 / 队列信息面板 |
+| `/doctor` | 环境自检：dsh 版本、`~/.dsh` 关键文件、acp patch 插件行、TUI 配置 |
+| `/permission` | 本地权限规则（见下） |
 | `/web` | 启动 / 打开 web 界面（见上） |
 
 **命令别名**（kimi 风格，菜单过滤与逐字输入均生效）：`/sessions`→`/list`、`/s`→`/list`、
@@ -108,7 +110,26 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 | `Ctrl+C` | 退出（stdin EOF 触发 dsh 优雅关机） |
 
 命令一览：`/help`（面板）`/new` `/list` `/model` `/effort` `/cost` `/usage` `/status`
-`/web` `/clear`（清屏，不影响会话）`/quit`。
+`/doctor` `/permission` `/web` `/clear`（清屏，不影响会话）`/quit`。
+
+### 本地权限规则（`~/.dsh-tui/permission.json`）
+
+内核的 `session/request_permission` 弹窗可被**客户端规则**自动应答（借鉴 kimi
+`permission.rules`，纯本地，内核无感知）。规则按工具标题做不区分大小写子串匹配：
+
+```json
+{
+  "rules": [
+    { "pattern": "read",  "decision": "allow" },
+    { "pattern": "bash",  "decision": "deny" }
+  ]
+}
+```
+
+`allow` 自动选择允许选项、`deny` 直接取消，转写区记录 `[权限规则]` 日志；
+未匹配的请求照常弹窗。`/permission` 查看已加载规则。
+
+启动时后台检查 `dsh --version`（≥ 0.1.2-alpha.2 契约），过低或缺失会在状态区警告。
 
 ### 流式渲染与帧率（ratatui）
 

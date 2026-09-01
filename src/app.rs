@@ -124,6 +124,8 @@ pub const COMMANDS: &[Cmd] = &[
     Cmd { name: "/cost", aliases: &[], desc: "今日 token 用量与费用", group: CmdGroup::Info, idle_only: false },
     Cmd { name: "/usage", aliases: &[], desc: "当前会话用量明细", group: CmdGroup::Info, idle_only: false },
     Cmd { name: "/status", aliases: &[], desc: "当前会话 / 配置信息", group: CmdGroup::Info, idle_only: false },
+    Cmd { name: "/doctor", aliases: &["/diag"], desc: "环境自检（dsh/插件/配置）", group: CmdGroup::Info, idle_only: false },
+    Cmd { name: "/permission", aliases: &["/perm"], desc: "本地权限规则", group: CmdGroup::Info, idle_only: false },
     Cmd { name: "/help", aliases: &["/h", "/?"], desc: "显示所有命令", group: CmdGroup::Info, idle_only: false },
     Cmd { name: "/web", aliases: &[], desc: "启动/打开 web 界面", group: CmdGroup::System, idle_only: false },
     Cmd { name: "/clear", aliases: &["/c"], desc: "清屏（不影响会话上下文）", group: CmdGroup::System, idle_only: false },
@@ -176,6 +178,50 @@ fn nav_cmd(rows: &[MenuRow], from: usize, dir: i16) -> usize {
 pub struct Prefs {
     pub model: Option<String>,
     pub effort: Option<String>,
+}
+
+/// Local permission rule (kimi `permission.rules`-style, client-side only):
+/// auto-answer `session/request_permission` prompts whose tool title matches
+/// `pattern` (case-insensitive substring). The kernel is never involved.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PermDecision {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Debug)]
+pub struct PermRule {
+    pub pattern: String,
+    pub decision: PermDecision,
+}
+
+fn load_permission_rules() -> Vec<PermRule> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok();
+    let Some(home) = home else { return Vec::new() };
+    let p = PathBuf::from(home).join(".dsh-tui").join("permission.json");
+    let Ok(txt) = std::fs::read_to_string(p) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+        return Vec::new();
+    };
+    let Some(rules) = v.get("rules").and_then(|r| r.as_array()) else {
+        return Vec::new();
+    };
+    rules
+        .iter()
+        .filter_map(|r| {
+            let pattern = r.get("pattern").and_then(|x| x.as_str())?.to_string();
+            let decision = match r.get("decision").and_then(|x| x.as_str()) {
+                Some("allow") => PermDecision::Allow,
+                Some("deny") => PermDecision::Deny,
+                _ => return None,
+            };
+            Some(PermRule { pattern, decision })
+        })
+        .collect()
 }
 
 fn prefs_path() -> Option<PathBuf> {
@@ -316,6 +362,8 @@ pub struct App {
     /// persisted in `~/.dsh-tui/session-titles.json`. The dsh acp profile
     /// disables model-generated titles, so the TUI keeps its own.
     titles: HashMap<String, String>,
+    /// Auto-answer rules for kernel permission prompts (see `PermRule`).
+    perm_rules: Vec<PermRule>,
     cwd: PathBuf,
     pub(crate) dirty: bool,
     last_width: u16,
@@ -350,6 +398,7 @@ impl App {
             tool_meta: HashMap::new(),
             debug_log: VecDeque::new(),
             titles: load_titles(),
+            perm_rules: load_permission_rules(),
             cwd,
             dirty: true,
             last_width: 0,
@@ -814,6 +863,26 @@ pub async fn run(
         });
     }
 
+    // Background kernel version check (non-blocking; a short-lived `dsh
+    // --version` process). Warns when the installed kernel predates the
+    // ACP surface the TUI relies on.
+    {
+        let c2 = client.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), kernel_version()).await {
+                Ok(Some(v)) if !version_ok(&v) => {
+                    c2.emit(AcpEvent::Notice(format!(
+                        "警告: dsh {v} 低于要求的 0.1.2-alpha.2（ACP 面可能不完整），请 npm i -g @deepseek-ai/dsh 升级"
+                    )));
+                }
+                Ok(Some(_)) => {}
+                _ => c2.emit(AcpEvent::Notice(
+                    "警告: 无法获取 dsh 版本（dsh 不在 PATH？用 DSH_BIN 指定）".into(),
+                )),
+            }
+        });
+    }
+
     // Render cadence: while busy the spinner animates at ~30fps; idle frames
     // only happen on demand (dirty) — see the gate below.
     let mut render_tick = tokio::time::interval(std::time::Duration::from_millis(33));
@@ -1220,6 +1289,8 @@ async fn run_command(app: &mut App, client: &AcpClient, cmd: &Cmd) {
         "/cost" => open_info(app, "今日用量与费用", cost_report()),
         "/usage" => open_info(app, "会话用量", usage_report(app)),
         "/status" => open_info(app, "状态", status_lines(app)),
+        "/doctor" => open_info(app, "环境自检", doctor_report()),
+        "/permission" => open_info(app, "本地权限规则", permission_report(app)),
         "/web" => start_web(client),
         "/clear" => {
             app.reset_transcript();
@@ -1552,6 +1623,37 @@ async fn run_shell_cmd(cmd: &str) -> ShellResult {
     }
 }
 
+/// Version of the installed kernel (`dsh --version` first line), if any.
+async fn kernel_version() -> Option<String> {
+    let out = if cfg!(target_os = "windows") {
+        tokio::process::Command::new("cmd")
+            .args(["/C", "dsh --version"])
+            .output()
+            .await
+            .ok()?
+    } else {
+        tokio::process::Command::new("dsh")
+            .arg("--version")
+            .output()
+            .await
+            .ok()?
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty())
+}
+
+/// Whether the kernel version satisfies the TUI's contract (>= 0.1.2).
+fn version_ok(v: &str) -> bool {
+    let nums: Vec<u32> = v
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let maj = nums.first().copied().unwrap_or(0);
+    let min = nums.get(1).copied().unwrap_or(0);
+    let pat = nums.get(2).copied().unwrap_or(0);
+    (maj, min, pat) >= (0, 1, 2)
+}
+
 fn advance_permission_queue(app: &mut App) {
     if !app.queued_permissions.is_empty() {
         let (request_id, tool_title, options) = app.queued_permissions.remove(0);
@@ -1829,6 +1931,129 @@ fn usage_report(app: &App) -> Vec<String> {
     out.push(format!("缓存写: {} tokens", fmt_tokens(cw)));
     out.push(format!("推理: {} tokens", fmt_tokens(reasoning)));
     out.push(format!("合计: {} tokens", fmt_tokens(input + output + cr + cw)));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// /doctor — local environment diagnostics: dsh binary, shared ~/.dsh state,
+// acp profile patch, TUI prefs. Everything is read-only local checks; the
+// kernel is never touched. Run when the TUI misbehaves to locate the gap.
+// ---------------------------------------------------------------------------
+
+fn doctor_report() -> Vec<String> {
+    let mut out = Vec::new();
+    out.push(format!("dsh-tui v{} 环境自检", env!("CARGO_PKG_VERSION")));
+    out.push(String::new());
+
+    match std::env::var("DSH_BIN").ok().filter(|s| !s.is_empty()) {
+        Some(b) => out.push(format!("DSH_BIN: {b}（自定义 dsh 路径）")),
+        None => out.push("dsh 解析: PATH（Windows 经 cmd /C 包装）".into()),
+    }
+    let version = {
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "dsh --version"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::process::Command::new("dsh")
+                .arg("--version")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        }
+    };
+    let v = version.trim().lines().next().unwrap_or("（无输出）").to_string();
+    if v.is_empty() {
+        out.push("✘ dsh --version 无输出 — dsh 不在 PATH？（npm i -g @deepseek-ai/dsh）".into());
+    } else {
+        out.push(format!("dsh --version: {v}"));
+    }
+    out.push(String::new());
+
+    let Some(home) = dsh_home() else {
+        out.push("✘ 无法解析 DSH home（DSH_HOME 或 USERPROFILE/HOME 缺失）".into());
+        return out;
+    };
+    let mut mark = |name: &str, sub: &str| {
+        let p = home.join(sub);
+        out.push(if p.exists() {
+            format!("✔ {name}: {}", p.display())
+        } else {
+            format!("✘ {name}: {}（缺失）", p.display())
+        });
+    };
+    mark("settings.yaml", "settings.yaml");
+    mark("acp profile", "profiles/acp");
+    mark("cordis.patch.yml", "profiles/acp/cordis.patch.yml");
+    mark("token-stats.json", "storages/token-stats.json");
+    mark("workspace.json", "storages/workspace.json");
+
+    let patch = home.join("profiles/acp/cordis.patch.yml");
+    if let Ok(txt) = std::fs::read_to_string(&patch) {
+        let ids: Vec<&str> = txt
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l.starts_with("- id:"))
+            .map(|l| l.trim_start_matches("- id:").trim())
+            .collect();
+        if ids.is_empty() {
+            out.push("acp patch: 无 insert 插件行".into());
+        } else {
+            out.push(format!("acp patch 插件行: {}", ids.join(", ")));
+        }
+    }
+    out.push(String::new());
+
+    let tui_dir = {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .ok();
+        home.map(|h| PathBuf::from(h).join(".dsh-tui"))
+    };
+    if let Some(dir) = tui_dir {
+        for f in ["prefs.json", "session-titles.json", "prices.json", "permission.json"] {
+            let p = dir.join(f);
+            out.push(if p.exists() {
+                format!("✔ ~/.dsh-tui/{f}")
+            } else {
+                format!("· ~/.dsh-tui/{f}（可选，未创建）")
+            });
+        }
+    }
+    out.push(String::new());
+    out.push("全部 ✔ 即环境就绪；✘ 项参考 install.ps1 / install.sh 与 README 安装与启动".into());
+    out
+}
+
+/// /permission — show the locally loaded auto-answer rules.
+fn permission_report(app: &App) -> Vec<String> {
+    let mut out = Vec::new();
+    if app.perm_rules.is_empty() {
+        out.push("未配置本地权限规则（内核权限弹窗全部手动确认）".into());
+        out.push(String::new());
+        out.push("在 ~/.dsh-tui/permission.json 添加规则：".into());
+        out.push(r#"  { "rules": [ { "pattern": "read", "decision": "allow" } ] }"#.into());
+        out.push("pattern 对工具标题做不区分大小写子串匹配；decision 为 allow/deny".into());
+        out.push("allow 自动选择允许选项，deny 直接取消——纯客户端行为，内核无感知".into());
+        return out;
+    }
+    out.push(format!("已加载 {} 条规则：", app.perm_rules.len()));
+    for r in &app.perm_rules {
+        let d = match r.decision {
+            PermDecision::Allow => "allow",
+            PermDecision::Deny => "deny",
+        };
+        out.push(format!("  {:<20} → {}", r.pattern, d));
+    }
+    out.push(String::new());
+    out.push("编辑 ~/.dsh-tui/permission.json 后重启生效".into());
     out
 }
 
@@ -2126,6 +2351,30 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
             false
         }
         AcpEvent::PermissionRequest { request_id, tool_title, options } => {
+            // Local auto-answer rules (kimi permission.rules style): a
+            // matching rule responds immediately instead of popping the
+            // dialog. Allow picks the first allow-kind option; deny cancels.
+            let rule = app.perm_rules.iter().find(|r| {
+                tool_title.to_lowercase().contains(&r.pattern.to_lowercase())
+            });
+            if let Some(rule) = rule {
+                match rule.decision {
+                    PermDecision::Allow => {
+                        let oid = options
+                            .iter()
+                            .find(|o| o.kind.starts_with("allow"))
+                            .map(|o| o.option_id.clone());
+                        client.respond_permission(request_id, oid);
+                        app.sysnote(&format!("[权限规则] 自动允许：{tool_title}"));
+                    }
+                    PermDecision::Deny => {
+                        client.respond_permission(request_id, None);
+                        app.sysnote(&format!("[权限规则] 自动拒绝：{tool_title}"));
+                    }
+                }
+                app.dirty = true;
+                return false;
+            }
             if matches!(app.dialog, Dialog::None) {
                 app.dialog = Dialog::Permission { request_id, tool_title, options, selected: 0 };
             } else {
@@ -2333,5 +2582,39 @@ mod tests {
         assert_eq!(nav_cmd(&rows, header, 1), header + 1);
         let last_cmd = rows.iter().rposition(|r| matches!(r, MenuRow::Cmd(_))).unwrap();
         assert_eq!(nav_cmd(&rows, last_cmd, 1), last_cmd); // clamps
+    }
+
+    #[test]
+    fn permission_rules_load_and_report() {
+        let tmp = std::env::temp_dir().join(format!("dsh-tui-perm-{}", std::process::id()));
+        let dsh_tui = tmp.join(".dsh-tui");
+        std::fs::create_dir_all(&dsh_tui).unwrap();
+        std::fs::write(
+            dsh_tui.join("permission.json"),
+            r#"{"rules": [{"pattern": "read", "decision": "allow"}, {"pattern": "bash", "decision": "deny"}]}"#,
+        )
+        .unwrap();
+        std::env::set_var("USERPROFILE", &tmp);
+        std::env::set_var("HOME", &tmp);
+
+        let rules = load_permission_rules();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].pattern, "read");
+        assert_eq!(rules[0].decision, PermDecision::Allow);
+        assert_eq!(rules[1].decision, PermDecision::Deny);
+
+        // Case-insensitive matching helper used by the handler.
+        let title = "Bash(rm -rf *)";
+        let hit = rules.iter().find(|r| title.to_lowercase().contains(&r.pattern.to_lowercase()));
+        assert_eq!(hit.map(|r| &r.decision), Some(&PermDecision::Deny));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn doctor_report_is_shaped() {
+        let lines = doctor_report();
+        assert!(!lines.is_empty());
+        assert!(lines[0].contains("环境自检"), "{lines:?}");
     }
 }

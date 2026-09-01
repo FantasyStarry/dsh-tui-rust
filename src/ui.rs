@@ -97,6 +97,12 @@ fn draw_top_bar(f: &mut Frame, app: &App, area: Rect) {
         right.push(theme::pill(&m, VIOLET));
         right.push(Span::raw(" "));
     }
+    if let Some(opt) = app.config.iter().find(|c| c.id == "reasoning_effort") {
+        if !opt.current.is_empty() {
+            right.push(theme::pill(&format!("⚡{}", opt.current), WARN));
+            right.push(Span::raw(" "));
+        }
+    }
     if let Some((used, size)) = app.usage {
         right.push(Span::styled("ctx", plain(MUTED)));
         right.extend(theme::ctx_bar(used, size, 10));
