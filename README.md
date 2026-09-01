@@ -50,7 +50,18 @@ fork 的问题：会把整个 Node monorepo（100+ 包）复制进来，从此�
 
 前置条件：`dsh` 在 PATH 上（`npm i -g @deepseek-ai/dsh`），Rust 工具链。
 
-### 一键安装（推荐）
+### 开发模式（默认用法）
+
+```sh
+cargo run --release --bin dsh-tui   # 交互式 TUI（需要真实终端 TTY，如 Windows Terminal）
+cargo run --bin dsh-tui -- --probe  # 非 TTY 自检：initialize / new / list / resume / 模型同步
+cargo run --bin dsh-tui -- --render-bench  # 无 TTY 渲染基准
+DSH_BIN=/path/to/dsh cargo run --bin dsh-tui  # 指定 dsh 路径
+```
+
+不需要先启动任何 dsh 服务——TUI 会自己拉起 `dsh --profile acp` 子进程。
+
+### 全局安装（可选）
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1    # Windows
@@ -64,15 +75,8 @@ sh install.sh                                           # macOS / Linux
 dtr          # 或 dsh-tui / dsh-tui-rust，三者等价
 ```
 
-不需要先启动任何 dsh 服务——TUI 会自己拉起 `dsh --profile acp` 子进程。
-
-### 开发模式
-
-```sh
-cargo run                          # 交互式 TUI（需要真实终端 TTY，如 Windows Terminal）
-cargo run -- --probe              # 非 TTY 自检：initialize / new / list / resume / 模型同步
-DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
-```
+**卸载**：`powershell -ExecutionPolicy Bypass -File uninstall.ps1`（或 `sh uninstall.sh`）——
+删除可执行文件并清理 PATH，保留 `~/.dsh-tui` 用户数据。
 
 ### 在 TUI 内启动 web 界面
 
