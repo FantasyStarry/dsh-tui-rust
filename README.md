@@ -94,14 +94,33 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 | `Ctrl+N` 或 `/new` | 新建会话（旧会话 close 后保留在持久化里） |
 | `!cmd` / `!!cmd` | **shell 直通**（借鉴 pi）：本地执行命令并展示输出；`!` 额外把输出作为上下文发给模型，`!!` 只显示不上送 |
 | `/cost` | 今日 token 用量与费用估算（读 `~/.dsh/storages/token-stats.json`，与 web 共用数据） |
+| `/usage` | 当前会话的用量明细（请求数 / 输入 / 输出 / 缓存 / 推理 tokens） |
 | `/status` | 当前会话 / 模型 / 上下文 / 队列信息面板 |
 | `/web` | 启动 / 打开 web 界面（见上） |
+
+**命令别名**（kimi 风格，菜单过滤与逐字输入均生效）：`/sessions`→`/list`、`/s`→`/list`、
+`/m`→`/model`、`/e`→`/effort`、`/c`→`/clear`、`/h` `/?`→`/help`、`/exit` `/q`→`/quit`。
+菜单按 会话 / 模型 / 信息 / 系统 分组显示；忙时禁用的命令标注 `[忙时禁用]`（如
+`/new` `/list`，Esc 取消任务后恢复）；未匹配的 `/xxx` 作为普通消息发给模型。
 | `鼠标滚轮` / `PgUp` / `PgDn` | 滚动历史；状态栏显示滚动标尺；回到底部自动跟随 |
 | `Home` / `End` | 跳到顶部 / 底部 |
 | `↑` / `↓` | 输入历史 |
 | `Ctrl+C` | 退出（stdin EOF 触发 dsh 优雅关机） |
 
-命令一览：`/help`（面板）`/new` `/list` `/model` `/effort` `/cost` `/status` `/web` `/clear`（清屏，不影响会话）`/quit`。
+命令一览：`/help`（面板）`/new` `/list` `/model` `/effort` `/cost` `/usage` `/status`
+`/web` `/clear`（清屏，不影响会话）`/quit`。
+
+### 流式渲染与帧率（ratatui）
+
+- **事件门控渲染**：只有 dirty 或忙碌（spinner 动画）才重绘；空闲零绘制。
+  忙碌时 ~30fps（33ms 合并窗口把流式 chunk 突发合并成帧），空闲按键 ≤8ms 响应。
+- **增量显示缓存**：每条消息的换行块按条目缓存（`disp_cache`），流式只重排
+  被修改的尾部条目——O(尾) 而非 O(全文)。
+- **CSI 2026 同步输出**：每帧包裹 `\x1b[?2026h/l`（Windows Terminal / kitty /
+  WezTerm 原子刷帧，消除流式闪烁；不支持则忽略；`DSH_TUI_NO_SYNC_OUTPUT=1` 关闭）。
+- **`--render-bench` 无 TTY 基准**：`dsh-tui --render-bench` 用 TestBackend 实测
+  （1201 条长转写）：流式 508 fps（1.97ms/帧）、增量重排 287µs、全帧 2.23ms —
+  30fps 预算 33ms 内富余 15 倍。
 
 ### 模型选择与 web 端的关系
 

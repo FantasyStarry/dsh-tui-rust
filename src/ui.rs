@@ -3,6 +3,7 @@
 //! tool lines with colored status dots, hairline turn separators,
 //! rounded violet input box, violet selection bars in dialogs.
 
+use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -15,12 +16,41 @@ use crate::app::rel_time;
 use crate::app::{App, Dialog, RunState};
 use crate::theme::{self, *};
 
-/// Draw one frame. Call from the event loop after each batch of events.
-pub fn draw(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Result<()> {
-    terminal.draw(|f| render(f, app)).map(|_| ())
+/// Draw one frame. Call from the event loop — but only when the frame would
+/// actually change something (see `app::should_draw`), otherwise the cell
+/// diff and escape output are wasted.
+///
+/// Generic over the backend so tests and the `--render-bench` benchmark can
+/// drive the exact same render path against a `TestBackend` with no TTY.
+pub fn draw<B: Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+) -> std::io::Result<()> {
+    // CSI 2026 synchronized output: bracket the frame so terminals that
+    // support it (Windows Terminal, kitty, WezTerm, …) apply the whole frame
+    // atomically instead of painting it progressively — the classic fix for
+    // streaming flicker. Unsupported terminals ignore the unknown CSI. Opt
+    // out with DSH_TUI_NO_SYNC_OUTPUT=1 if a terminal misbehaves. Only emit
+    // when stdout is actually a terminal (skip under --render-bench/redir).
+    use std::io::IsTerminal;
+    let sync = std::env::var("DSH_TUI_NO_SYNC_OUTPUT").is_err() && std::io::stdout().is_terminal();
+    if sync {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[?2026h");
+        let _ = out.flush();
+    }
+    let r = terminal.draw(|f| render(f, app));
+    if sync {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[?2026l");
+        let _ = out.flush();
+    }
+    r.map(|_| ())
 }
 
-fn render(f: &mut Frame, app: &mut App) {
+pub(crate) fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -420,17 +450,34 @@ fn draw_cmd_menu(f: &mut Frame, app: &App, input_area: Rect) {
     if items.is_empty() || !matches!(app.dialog, Dialog::None) {
         return;
     }
-    let sel = app.cmd_selected.min(items.len() - 1);
+    let rows = crate::app::grouped_menu(&items);
+    if rows.is_empty() {
+        return;
+    }
+    let sel = {
+        let s = app.cmd_selected.min(rows.len() - 1);
+        if matches!(rows[s], crate::app::MenuRow::Cmd(_)) {
+            s
+        } else {
+            rows.iter()
+                .position(|r| matches!(r, crate::app::MenuRow::Cmd(_)))
+                .unwrap_or(0)
+        }
+    };
 
     let screen = f.area();
-    let w = (items
+    let max_w = rows
         .iter()
-        .map(|c| c.name.len() + UnicodeWidthStr::width(c.desc) + 6)
+        .map(|r| match r {
+            crate::app::MenuRow::Header(h) => UnicodeWidthStr::width(*h) + 4,
+            crate::app::MenuRow::Cmd(c) => {
+                c.name.len() + UnicodeWidthStr::width(c.desc) + 6
+            }
+        })
         .max()
-        .unwrap_or(30) as u16)
-        .clamp(24, 60)
-        .min(screen.width.saturating_sub(2));
-    let h = (items.len() as u16 + 2).min(9);
+        .unwrap_or(30);
+    let w = (max_w as u16).clamp(28, 60).min(screen.width.saturating_sub(2));
+    let h = (rows.len() as u16 + 2).min(11);
     let x = (input_area.x + 1).min(screen.width.saturating_sub(w));
     let y = input_area.y.saturating_sub(h);
     if y < screen.y || h < 3 {
@@ -446,22 +493,43 @@ fn draw_cmd_menu(f: &mut Frame, app: &App, input_area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Scroll window so the selection stays visible in a tall menu.
+    let total = rows.len();
+    let visible = (inner.height as usize).saturating_sub(2).max(1);
+    let top = if sel < visible { 0 } else { sel - visible + 1 };
+    let end = (top + visible).min(total);
+
     let mut lines: Vec<Line> = Vec::new();
-    for (i, c) in items.iter().enumerate() {
-        if i == sel {
-            let bar = pad_to_width(
-                &format!(" ❯ {:<8} {} ", c.name, c.desc),
-                inner.width.saturating_sub(1) as usize,
-            );
-            lines.push(Line::from(Span::styled(
-                bar,
-                Style::new().bg(VIOLET).fg(BAR_BG).add_modifier(Modifier::BOLD),
-            )));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(format!("   {}", c.name), plain(FG)),
-                Span::styled(format!("  {}", c.desc), plain(DIM)),
-            ]));
+    for (i, row) in rows.iter().enumerate().skip(top).take(end - top) {
+        match row {
+            crate::app::MenuRow::Header(h) => {
+                lines.push(Line::from(Span::styled(
+                    format!("  {} ", h),
+                    plain(HAIRLINE).add_modifier(Modifier::BOLD),
+                )));
+            }
+            crate::app::MenuRow::Cmd(c) => {
+                let busy_mark =
+                    if c.idle_only && app.state == RunState::Busy { " [忙时禁用]" } else { "" };
+                if i == sel {
+                    let bar = pad_to_width(
+                        &format!(" ❯ {:<8} {}{} ", c.name, c.desc, busy_mark),
+                        inner.width.saturating_sub(1) as usize,
+                    );
+                    lines.push(Line::from(Span::styled(
+                        bar,
+                        Style::new().bg(VIOLET).fg(BAR_BG).add_modifier(Modifier::BOLD),
+                    )));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("   {}", c.name), plain(FG)),
+                        Span::styled(
+                            format!("  {}{}", c.desc, busy_mark),
+                            plain(if c.idle_only && app.state == RunState::Busy { DIM } else { MUTED }),
+                        ),
+                    ]));
+                }
+            }
         }
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);

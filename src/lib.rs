@@ -155,3 +155,83 @@ pub async fn probe() -> Result<()> {
     }
     Ok(())
 }
+
+/// Non-interactive rendering benchmark: drives the real render path against a
+/// `TestBackend` (no TTY) to verify the streaming frame budget and the
+/// incremental display cache. Run with `dsh-tui --render-bench`.
+pub fn render_bench() -> anyhow::Result<()> {
+    use std::time::Instant;
+    use ratatui::backend::TestBackend;
+
+    println!("render-bench: TestBackend 120x40，模拟长转写 + 流式增量渲染");
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40))?;
+    let mut app = app::App::new();
+    app.state = app::RunState::Idle;
+    app.busy_since = None;
+
+    // Build a realistic long transcript (mixed entry kinds, CJK + markdown).
+    for i in 0..400 {
+        app.push_entry(app::EntryKind::User, &format!("第 {i} 轮：请分析这个项目并给出改进建议"));
+        app.push_entry(app::EntryKind::Tool, &format!("read 项目文件 {}", i));
+        app.push_entry(
+            app::EntryKind::Agent,
+            &format!(
+                "第 {i} 轮回复：包含 **markdown**、`inline code`、```rust\nlet x = {i};\n```、\
+                列表项、以及一段用于 CJK 换行测试的中文文本内容，字数尽量多一点以模拟真实回复的长度。"
+            ),
+        );
+    }
+    println!("转写条目: {}（模拟 400 轮对话）", app.entries.len());
+
+    // 1) Streaming simulation: append a chunk + full draw each frame.
+    const FRAMES: usize = 300;
+    let t0 = Instant::now();
+    for f in 0..FRAMES {
+        app.append_chunk(app::EntryKind::Agent, &format!(" 流式增量片段{f}"));
+        ui::draw(&mut terminal, &mut app)?;
+    }
+    let stream = t0.elapsed();
+    println!(
+        "流式渲染 {FRAMES} 帧: {:?} → {:.0} fps（{:.2} ms/帧）",
+        stream,
+        FRAMES as f64 / stream.as_secs_f64(),
+        stream.as_secs_f64() * 1000.0 / FRAMES as f64
+    );
+
+    // 2) Incremental ensure_display cost (tail re-wrap only).
+    let t1 = Instant::now();
+    for _ in 0..500 {
+        app.append_chunk(app::EntryKind::Agent, "x");
+        app.ensure_display(118);
+    }
+    let inc = t1.elapsed() / 500;
+    println!("增量 ensure_display（尾条目）: {inc:?}/帧");
+
+    // 3) Full re-wrap cost (width flip forces everything to rebuild).
+    let t2 = Instant::now();
+    for i in 0..20 {
+        let w = if i % 2 == 0 { 118 } else { 88 };
+        app.ensure_display(w);
+    }
+    let full = t2.elapsed() / 20;
+    println!("全量 ensure_display（~{} 条目重排）: {full:?}/帧", app.entries.len());
+
+    // 4) Full-frame draw on the final long transcript (worst case).
+    let t3 = Instant::now();
+    for _ in 0..50 {
+        app.dirty = true;
+        ui::draw(&mut terminal, &mut app)?;
+    }
+    let frame = t3.elapsed() / 50;
+    println!(
+        "长转写全帧绘制: {frame:?}/帧（{:.2} ms；30fps 预算 = 33.3 ms）",
+        frame.as_secs_f64() * 1000.0
+    );
+
+    let ok = stream.as_secs_f64() / FRAMES as f64 <= 0.033 && frame.as_secs_f64() <= 0.033;
+    println!(
+        "结论: {}（预算内 = 单帧 ≤ 33.3ms）",
+        if ok { "✔ 流式帧率达标" } else { "✘ 超过 30fps 预算，需要优化" }
+    );
+    Ok(())
+}

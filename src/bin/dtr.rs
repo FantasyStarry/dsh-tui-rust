@@ -8,6 +8,9 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--probe") {
         return dsh_tui::probe().await;
     }
+    if args.iter().any(|a| a == "--render-bench") {
+        return dsh_tui::render_bench();
+    }
 
     match dsh_tui::run_tui().await? {
         None => Ok(()),

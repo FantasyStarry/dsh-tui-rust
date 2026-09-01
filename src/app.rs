@@ -82,23 +82,92 @@ pub enum RunState {
 // Slash commands
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CmdGroup {
+    Session,
+    Model,
+    Info,
+    System,
+}
+
+impl CmdGroup {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CmdGroup::Session => "会话",
+            CmdGroup::Model => "模型",
+            CmdGroup::Info => "信息",
+            CmdGroup::System => "系统",
+        }
+    }
+
+    /// Canonical menu order.
+    pub const ORDER: [CmdGroup; 4] =
+        [CmdGroup::Session, CmdGroup::Model, CmdGroup::Info, CmdGroup::System];
+}
+
 pub struct Cmd {
     pub name: &'static str,
+    /// Extra spellings that match the menu filter and verbatim dispatch
+    /// (e.g. `/sessions` → `/list`). Aliases never show as canonical names.
+    pub aliases: &'static [&'static str],
     pub desc: &'static str,
+    pub group: CmdGroup,
+    /// Blocked while a prompt is in flight (must cancel first).
+    pub idle_only: bool,
 }
 
 pub const COMMANDS: &[Cmd] = &[
-    Cmd { name: "/help", desc: "显示所有命令" },
-    Cmd { name: "/new", desc: "新建会话" },
-    Cmd { name: "/list", desc: "历史会话列表" },
-    Cmd { name: "/model", desc: "切换模型" },
-    Cmd { name: "/effort", desc: "切换推理档位" },
-    Cmd { name: "/cost", desc: "今日 token 用量与费用" },
-    Cmd { name: "/status", desc: "当前会话 / 配置信息" },
-    Cmd { name: "/web", desc: "启动/打开 web 界面" },
-    Cmd { name: "/clear", desc: "清屏（不影响会话上下文）" },
-    Cmd { name: "/quit", desc: "退出" },
+    Cmd { name: "/new", aliases: &["/n"], desc: "新建会话", group: CmdGroup::Session, idle_only: true },
+    Cmd { name: "/list", aliases: &["/sessions", "/s"], desc: "历史会话列表", group: CmdGroup::Session, idle_only: true },
+    Cmd { name: "/model", aliases: &["/m"], desc: "切换模型", group: CmdGroup::Model, idle_only: false },
+    Cmd { name: "/effort", aliases: &["/e"], desc: "切换推理档位", group: CmdGroup::Model, idle_only: false },
+    Cmd { name: "/cost", aliases: &[], desc: "今日 token 用量与费用", group: CmdGroup::Info, idle_only: false },
+    Cmd { name: "/usage", aliases: &[], desc: "当前会话用量明细", group: CmdGroup::Info, idle_only: false },
+    Cmd { name: "/status", aliases: &[], desc: "当前会话 / 配置信息", group: CmdGroup::Info, idle_only: false },
+    Cmd { name: "/help", aliases: &["/h", "/?"], desc: "显示所有命令", group: CmdGroup::Info, idle_only: false },
+    Cmd { name: "/web", aliases: &[], desc: "启动/打开 web 界面", group: CmdGroup::System, idle_only: false },
+    Cmd { name: "/clear", aliases: &["/c"], desc: "清屏（不影响会话上下文）", group: CmdGroup::System, idle_only: false },
+    Cmd { name: "/quit", aliases: &["/exit", "/q"], desc: "退出", group: CmdGroup::System, idle_only: false },
 ];
+
+/// Resolve a verbatim `/input` to its canonical command (name or alias).
+fn resolve_cmd(input: &str) -> Option<&'static Cmd> {
+    COMMANDS.iter().find(|c| c.name == input || c.aliases.contains(&input))
+}
+
+/// Menu rows: matched commands flattened into group headers + commands, in
+/// canonical group order. Headers are non-selectable display rows.
+pub enum MenuRow {
+    Header(&'static str),
+    Cmd(&'static Cmd),
+}
+
+pub fn grouped_menu(items: &[&'static Cmd]) -> Vec<MenuRow> {
+    let mut rows = Vec::new();
+    for group in CmdGroup::ORDER {
+        let group_items: Vec<&'static Cmd> = items.iter().copied().filter(|c| c.group == group).collect();
+        if group_items.is_empty() {
+            continue;
+        }
+        rows.push(MenuRow::Header(group.label()));
+        rows.extend(group_items.into_iter().map(MenuRow::Cmd));
+    }
+    rows
+}
+
+/// Next/previous selectable command row, skipping group headers; clamps at
+/// the ends.
+fn nav_cmd(rows: &[MenuRow], from: usize, dir: i16) -> usize {
+    let mut i = from as i64 + dir as i64;
+    while i >= 0 && (i as usize) < rows.len() && !matches!(rows[i as usize], MenuRow::Cmd(_)) {
+        i += dir as i64;
+    }
+    if i < 0 || (i as usize) >= rows.len() {
+        from
+    } else {
+        i as usize
+    }
+}
 
 /// Persisted user preferences (`~/.dsh-tui/prefs.json`): the last model /
 /// effort choice is re-applied automatically to every new session, because
@@ -216,10 +285,19 @@ pub struct App {
     pub fatal: Option<String>,
     /// When the in-flight prompt started (drives the elapsed timer + spinner).
     pub busy_since: Option<Instant>,
-    /// Flattened, wrapped display lines (rebuilt lazily on change/resize).
+    /// Flattened, wrapped display lines (built incrementally from
+    /// [`App::disp_cache`]; see [`App::ensure_display`]).
     pub display: Vec<Vec<Span<'static>>>,
 
     quit: bool,
+
+    /// Per-entry wrapped display blocks (parallel to `entries`), so streaming
+    /// only re-wraps the mutated tail instead of the whole transcript.
+    disp_cache: Vec<Vec<Vec<Span<'static>>>>,
+    /// `display` index where each entry's block begins (len == entries.len()+1).
+    block_start: Vec<usize>,
+    /// First entry index whose cache is stale; entries[..clean_from] are valid.
+    clean_from: usize,
 
     /// Messages typed while a prompt is in flight; drained on settlement.
     queue: VecDeque<String>,
@@ -239,12 +317,12 @@ pub struct App {
     /// disables model-generated titles, so the TUI keeps its own.
     titles: HashMap<String, String>,
     cwd: PathBuf,
-    dirty: bool,
+    pub(crate) dirty: bool,
     last_width: u16,
 }
 
 impl App {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut app = App {
             entries: Vec::new(),
@@ -259,6 +337,9 @@ impl App {
             busy_since: Some(Instant::now()),
             display: Vec::new(),
             quit: false,
+            disp_cache: Vec::new(),
+            block_start: Vec::new(),
+            clean_from: 0,
             queue: VecDeque::new(),
             cmd_selected: 0,
             pref: load_prefs(),
@@ -284,12 +365,20 @@ impl App {
         self.push_entry(EntryKind::System, msg);
     }
 
-    fn push_entry(&mut self, kind: EntryKind, text: &str) {
-        self.entries.push(Entry { kind, text: text.to_string(), status: None, detail: None });
+    /// Mark entry `from` (and everything after it) as needing a display
+    /// rebuild, and request a redraw. Streaming only ever mutates the tail,
+    /// so the incremental cache stays cheap even on long transcripts.
+    fn invalidate(&mut self, from: usize) {
+        self.clean_from = self.clean_from.min(from);
         self.dirty = true;
     }
 
-    fn append_chunk(&mut self, kind: EntryKind, text: &str) {
+    pub(crate) fn push_entry(&mut self, kind: EntryKind, text: &str) {
+        self.entries.push(Entry { kind, text: text.to_string(), status: None, detail: None });
+        self.invalidate(self.entries.len() - 1);
+    }
+
+    pub(crate) fn append_chunk(&mut self, kind: EntryKind, text: &str) {
         match self.entries.last_mut() {
             Some(e) if e.kind == kind => e.text.push_str(text),
             _ => self.entries.push(Entry {
@@ -299,6 +388,20 @@ impl App {
                 detail: None,
             }),
         }
+        self.invalidate(self.entries.len() - 1);
+    }
+
+    /// Clear the transcript and its display caches (new session / resume /
+    /// /clear). The kernel-side conversation is unaffected.
+    pub(crate) fn reset_transcript(&mut self) {
+        self.entries.clear();
+        self.disp_cache.clear();
+        self.block_start.clear();
+        self.clean_from = 0;
+        self.tool_idx.clear();
+        self.tool_meta.clear();
+        self.usage = None;
+        self.scroll_from_bottom = 0;
         self.dirty = true;
     }
 
@@ -326,7 +429,8 @@ impl App {
     }
 
     /// Slash commands matching the current input (menu is shown when the
-    /// input is a bare `/prefix` with no space).
+    /// input is a bare `/prefix` with no space). Both canonical names and
+    /// aliases participate in the filter.
     pub fn cmd_matches(&self) -> Vec<&'static Cmd> {
         let Some(q) = self.input.strip_prefix('/') else {
             return Vec::new();
@@ -336,7 +440,10 @@ impl App {
         }
         COMMANDS
             .iter()
-            .filter(|c| c.name[1..].starts_with(q))
+            .filter(|c| {
+                c.name[1..].starts_with(q)
+                    || c.aliases.iter().any(|a| a[1..].starts_with(q))
+            })
             .collect()
     }
 
@@ -357,109 +464,54 @@ impl App {
         } else {
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub((-delta) as u16);
         }
+        self.dirty = true;
     }
 
     /// Rebuild the wrapped display lines when dirty or on resize.
-    /// Each entry becomes a set of span lines; visual hints (hairline rule
-    /// before a user turn) are inserted here too. Agent text goes through a
-    /// markdown-lite pass (fences, headings, bullets, inline code/bold).
+    ///
+    /// Each entry's wrapped block is cached in `disp_cache` and only rebuilt
+    /// from `clean_from` onward — streaming appends to the last entry, so a
+    /// normal chunk redraw re-wraps just that entry and splices it into the
+    /// existing `display` (O(tail) instead of O(whole transcript)). Visual
+    /// hints (hairline rule before a user turn) live inside the entry block;
+    /// agent text goes through a markdown-lite pass.
     pub fn ensure_display(&mut self, width: u16) {
         let w = width.max(10) as usize;
         if !self.dirty && self.last_width == width {
             return;
         }
-        let mut out: Vec<Vec<Span<'static>>> = Vec::new();
-        let mut seen_content = false;
-        for e in &self.entries {
-            match e.kind {
-                EntryKind::User => {
-                    if seen_content {
-                        out.push(vec![Span::styled("─".repeat(w), t::plain(t::HAIRLINE))]);
-                        out.push(vec![]);
-                    }
-                    seen_content = true;
-                    for (i, seg) in e.text.split('\n').enumerate() {
-                        let mut spans = Vec::new();
-                        if i == 0 {
-                            spans.push(Span::styled("❯ ".to_string(), t::bold(t::ACCENT)));
-                        } else {
-                            spans.push(Span::styled("  ".to_string(), t::bold(t::FG)));
-                        }
-                        spans.push(Span::styled(seg.to_string(), t::bold(t::FG)));
-                        push_wrapped(&mut out, &spans, "  ", t::bold(t::FG), w);
-                    }
-                }
-                EntryKind::Agent => {
-                    seen_content = true;
-                    for line in markdown_spans(&e.text) {
-                        if line.is_empty() {
-                            out.push(vec![]);
-                        } else {
-                            push_wrapped(&mut out, &line, "  ", t::plain(t::FG), w);
-                        }
-                    }
-                }
-                EntryKind::Thought => {
-                    for (i, seg) in e.text.split('\n').enumerate() {
-                        let mut spans = Vec::new();
-                        if i == 0 {
-                            spans.push(Span::styled(
-                                "✻ ".to_string(),
-                                t::plain(t::DIM).add_modifier(Modifier::ITALIC),
-                            ));
-                        } else {
-                            spans.push(Span::styled(
-                                "  ".to_string(),
-                                t::plain(t::DIM).add_modifier(Modifier::ITALIC),
-                            ));
-                        }
-                        spans.push(Span::styled(
-                            seg.to_string(),
-                            t::plain(t::DIM).add_modifier(Modifier::ITALIC),
-                        ));
-                        push_wrapped(&mut out, &spans, "  ", t::plain(t::DIM), w);
-                    }
-                }
-                EntryKind::Tool => {
-                    seen_content = true;
-                    let mut spans = vec![
-                        Span::styled("❯ ".to_string(), t::plain(t::ACCENT)),
-                        Span::styled(format!("{} ", e.text), t::plain(t::FG)),
-                    ];
-                    match &e.status {
-                        Some(s) => spans.push(Span::styled(
-                            format!("● {s}"),
-                            t::plain(t::status_color(s)),
-                        )),
-                        None => spans.push(Span::styled("● …", t::plain(t::MUTED))),
-                    }
-                    push_wrapped(&mut out, &spans, "  ", t::plain(t::FG), w);
-                    if let Some(detail) = &e.detail {
-                        let d = vec![
-                            Span::styled("  ⤷ ".to_string(), t::plain(t::HAIRLINE)),
-                            Span::styled(detail.clone(), t::plain(t::DIM)),
-                        ];
-                        push_wrapped(&mut out, &d, "    ", t::plain(t::DIM), w);
-                    }
-                }
-                EntryKind::System => {
-                    for (i, seg) in e.text.split('\n').enumerate() {
-                        let mut spans = Vec::new();
-                        if i == 0 {
-                            spans.push(Span::styled("· ".to_string(), t::plain(t::DIM)));
-                        } else {
-                            spans.push(Span::styled("  ".to_string(), t::plain(t::DIM)));
-                        }
-                        spans.push(Span::styled(seg.to_string(), t::plain(t::DIM)));
-                        push_wrapped(&mut out, &spans, "  ", t::plain(t::DIM), w);
-                    }
-                }
-            }
-            out.push(vec![]);
+        if self.last_width != width {
+            self.clean_from = 0; // width changed → everything re-wraps
         }
-        self.display = out;
-        self.dirty = false;
         self.last_width = width;
+
+        if self.disp_cache.len() < self.entries.len() {
+            self.disp_cache.resize(self.entries.len(), Vec::new());
+            self.block_start.resize(self.entries.len() + 1, 0);
+        }
+        let clean = self.clean_from.min(self.entries.len());
+
+        // Cut `display` back to the first stale block; everything before it
+        // is reused as-is.
+        let cut = self.block_start[clean];
+        self.display.truncate(cut);
+
+        let mut idx = cut;
+        let mut seen_content = self.entries[..clean]
+            .iter()
+            .any(|e| matches!(e.kind, EntryKind::User | EntryKind::Agent | EntryKind::Tool));
+        for i in clean..self.entries.len() {
+            let e = &self.entries[i];
+            let block = entry_block(e, w, seen_content);
+            seen_content |= matches!(e.kind, EntryKind::User | EntryKind::Agent | EntryKind::Tool);
+            self.disp_cache[i] = block;
+            self.block_start[i] = idx;
+            idx += self.disp_cache[i].len();
+            self.display.extend_from_slice(&self.disp_cache[i]);
+        }
+        self.block_start[self.entries.len()] = idx;
+        self.clean_from = self.entries.len();
+        self.dirty = false;
     }
 }
 
@@ -493,6 +545,97 @@ fn wrap_spans(spans: &[Span<'static>], max: usize) -> Vec<Vec<(char, Style)>> {
 // quotes, inline `code` and **bold**. Deliberately conservative — anything
 // unrecognized renders as plain text.
 // ---------------------------------------------------------------------------
+
+/// Wrap one entry into its display block (a list of span-lines), including
+/// the trailing blank line and, for user turns after earlier content, the
+/// hairline separator. `had_content` tells whether any previous entry was
+/// content-bearing (User/Agent/Tool) — that decides the separator.
+fn entry_block(e: &Entry, w: usize, had_content: bool) -> Vec<Vec<Span<'static>>> {
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    match e.kind {
+        EntryKind::User => {
+            if had_content {
+                out.push(vec![Span::styled("─".repeat(w), t::plain(t::HAIRLINE))]);
+                out.push(vec![]);
+            }
+            for (i, seg) in e.text.split('\n').enumerate() {
+                let mut spans = Vec::new();
+                if i == 0 {
+                    spans.push(Span::styled("❯ ".to_string(), t::bold(t::ACCENT)));
+                } else {
+                    spans.push(Span::styled("  ".to_string(), t::bold(t::FG)));
+                }
+                spans.push(Span::styled(seg.to_string(), t::bold(t::FG)));
+                push_wrapped(&mut out, &spans, "  ", t::bold(t::FG), w);
+            }
+        }
+        EntryKind::Agent => {
+            for line in markdown_spans(&e.text) {
+                if line.is_empty() {
+                    out.push(vec![]);
+                } else {
+                    push_wrapped(&mut out, &line, "  ", t::plain(t::FG), w);
+                }
+            }
+        }
+        EntryKind::Thought => {
+            for (i, seg) in e.text.split('\n').enumerate() {
+                let mut spans = Vec::new();
+                if i == 0 {
+                    spans.push(Span::styled(
+                        "✻ ".to_string(),
+                        t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        "  ".to_string(),
+                        t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                    ));
+                }
+                spans.push(Span::styled(
+                    seg.to_string(),
+                    t::plain(t::DIM).add_modifier(Modifier::ITALIC),
+                ));
+                push_wrapped(&mut out, &spans, "  ", t::plain(t::DIM), w);
+            }
+        }
+        EntryKind::Tool => {
+            let mut spans = vec![
+                Span::styled("❯ ".to_string(), t::plain(t::ACCENT)),
+                Span::styled(format!("{} ", e.text), t::plain(t::FG)),
+            ];
+            match &e.status {
+                Some(s) => spans.push(Span::styled(
+                    format!("● {s}"),
+                    t::plain(t::status_color(s)),
+                )),
+                None => spans.push(Span::styled("● …", t::plain(t::MUTED))),
+            }
+            push_wrapped(&mut out, &spans, "  ", t::plain(t::FG), w);
+            if let Some(detail) = &e.detail {
+                let d = vec![
+                    Span::styled("  ⤷ ".to_string(), t::plain(t::HAIRLINE)),
+                    Span::styled(detail.clone(), t::plain(t::DIM)),
+                ];
+                push_wrapped(&mut out, &d, "    ", t::plain(t::DIM), w);
+            }
+        }
+        EntryKind::System => {
+            for (i, seg) in e.text.split('\n').enumerate() {
+                let mut spans = Vec::new();
+                if i == 0 {
+                    spans.push(Span::styled("· ".to_string(), t::plain(t::DIM)));
+                } else {
+                    spans.push(Span::styled("  ".to_string(), t::plain(t::DIM)));
+                }
+                spans.push(Span::styled(seg.to_string(), t::plain(t::DIM)));
+                push_wrapped(&mut out, &spans, "  ", t::plain(t::DIM), w);
+            }
+        }
+    }
+    out.push(vec![]);
+    out
+}
 
 fn markdown_spans(text: &str) -> Vec<Vec<Span<'static>>> {
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
@@ -671,7 +814,11 @@ pub async fn run(
         });
     }
 
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+    // Render cadence: while busy the spinner animates at ~30fps; idle frames
+    // only happen on demand (dirty) — see the gate below.
+    let mut render_tick = tokio::time::interval(std::time::Duration::from_millis(33));
+    render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_draw = Instant::now();
 
     ui::draw(&mut terminal, &mut app)?;
     loop {
@@ -688,7 +835,7 @@ pub async fn run(
                 }
                 None => break,
             },
-            _ = tick.tick() => {}
+            _ = render_tick.tick() => {}
         }
         if app.quit_requested() {
             // Cancel any in-flight prompt first: the prompt task holds a
@@ -701,7 +848,20 @@ pub async fn run(
             }
             break;
         }
-        ui::draw(&mut terminal, &mut app)?;
+        // Gate: redraw only when (a) something changed and enough time passed
+        // to coalesce bursts of streaming chunks, or (b) busy — the spinner
+        // is time-based and needs the ~30fps cadence. Idle + clean = zero
+        // draw work per tick.
+        let busy = matches!(app.state, RunState::Busy | RunState::Booting);
+        let min_gap = if busy {
+            std::time::Duration::from_millis(33)
+        } else {
+            std::time::Duration::from_millis(8)
+        };
+        if (app.dirty || busy) && last_draw.elapsed() >= min_gap {
+            ui::draw(&mut terminal, &mut app)?;
+            last_draw = Instant::now();
+        }
     }
 
     Ok(app.fatal.take())
@@ -731,7 +891,10 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
             }
             return Ok(());
         }
-        Event::Key(k) if k.kind == KeyEventKind::Press => k,
+        Event::Key(k) if k.kind == KeyEventKind::Press => {
+            app.dirty = true; // any keypress deserves immediate feedback
+            k
+        }
         Event::Resize(_, _) => {
             app.dirty = true;
             return Ok(());
@@ -865,29 +1028,38 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
     let menu: Vec<&'static Cmd> = app.cmd_matches();
     let menu_active = app.input.starts_with('/') && !app.input.contains(' ') && !menu.is_empty();
     if menu_active {
-        let sel = app.cmd_selected.min(menu.len() - 1);
+        let rows = grouped_menu(&menu);
+        // Snap the selection onto the first selectable command row (rows
+        // begin with a group header).
+        let sel = {
+            let s = app.cmd_selected.min(rows.len() - 1);
+            if matches!(rows[s], MenuRow::Cmd(_)) {
+                s
+            } else {
+                rows.iter().position(|r| matches!(r, MenuRow::Cmd(_))).unwrap_or(0)
+            }
+        };
         match key.code {
             KeyCode::Up => {
-                app.cmd_selected = sel.saturating_sub(1);
+                app.cmd_selected = nav_cmd(&rows, sel, -1);
                 return Ok(());
             }
             KeyCode::Down => {
-                if sel + 1 < menu.len() {
-                    app.cmd_selected = sel + 1;
-                }
+                app.cmd_selected = nav_cmd(&rows, sel, 1);
                 return Ok(());
             }
             KeyCode::Tab => {
-                if let Some(c) = menu.get(sel) {
+                if let MenuRow::Cmd(c) = rows[sel] {
                     app.input = c.name.to_string();
                 }
                 return Ok(());
             }
             KeyCode::Enter => {
-                let name = menu[sel].name;
-                app.input.clear();
-                app.cmd_selected = 0;
-                run_command(app, client, name).await;
+                if let MenuRow::Cmd(cmd) = rows[sel] {
+                    app.input.clear();
+                    app.cmd_selected = 0;
+                    run_command(app, client, cmd).await;
+                }
                 return Ok(());
             }
             KeyCode::Esc => {
@@ -955,47 +1127,12 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                     return Ok(());
                 }
             }
-            match text.as_str() {
-                "/quit" => {
-                    app.request_quit();
-                    return Ok(());
-                }
-                "/new" => {
-                    app.input.clear();
-                    new_session(app, client).await;
-                    return Ok(());
-                }
-                "/list" => {
-                    app.input.clear();
-                    open_sessions(app, client).await;
-                    return Ok(());
-                }
-                "/model" => {
-                    app.input.clear();
-                    open_config(app, client, "model", "模型").await;
-                    return Ok(());
-                }
-                "/effort" => {
-                    app.input.clear();
-                    open_config(app, client, "reasoning_effort", "推理档位").await;
-                    return Ok(());
-                }
-                "/cost" => {
-                    app.input.clear();
-                    open_info(app, "今日用量与费用", cost_report());
-                    return Ok(());
-                }
-                "/status" => {
-                    app.input.clear();
-                    open_info(app, "状态", status_lines(app));
-                    return Ok(());
-                }
-                "/web" => {
-                    app.input.clear();
-                    start_web(client);
-                    return Ok(());
-                }
-                _ => {}
+            // Verbatim slash command (canonical name or alias); anything
+            // unmatched is sent to the agent as a normal message (kimi-style).
+            if let Some(cmd) = resolve_cmd(&text) {
+                app.input.clear();
+                run_command(app, client, cmd).await;
+                return Ok(());
             }
             if app.state == RunState::Busy {
                 // dsh allows one in-flight prompt per session; queue instead.
@@ -1069,34 +1206,44 @@ async fn open_sessions(app: &mut App, client: &AcpClient) {
 }
 
 /// Execute a slash command chosen from the menu (or typed verbatim).
-async fn run_command(app: &mut App, client: &AcpClient, name: &str) {
-    match name {
+async fn run_command(app: &mut App, client: &AcpClient, cmd: &Cmd) {
+    if cmd.idle_only && app.state == RunState::Busy {
+        app.sysnote(&format!("{} 忙时不可用（Esc 取消当前任务后再试）", cmd.name));
+        return;
+    }
+    match cmd.name {
         "/quit" => app.request_quit(),
         "/new" => new_session(app, client).await,
         "/list" => open_sessions(app, client).await,
         "/model" => open_config(app, client, "model", "模型").await,
         "/effort" => open_config(app, client, "reasoning_effort", "推理档位").await,
         "/cost" => open_info(app, "今日用量与费用", cost_report()),
+        "/usage" => open_info(app, "会话用量", usage_report(app)),
         "/status" => open_info(app, "状态", status_lines(app)),
         "/web" => start_web(client),
         "/clear" => {
-            app.entries.clear();
-            app.tool_idx.clear();
-            app.tool_meta.clear();
-            app.dirty = true;
+            app.reset_transcript();
             app.sysnote("已清屏（会话上下文不受影响）");
         }
         "/help" => {
             let mut lines = vec![
-                "斜杠命令".to_string(),
+                "斜杠命令（别名同样可匹配，如 /sessions=/list、/exit=/quit）".to_string(),
                 format!("dsh-tui v{} — ACP v1 客户端（内核 dsh 只读复用）", env!("CARGO_PKG_VERSION")),
                 String::new(),
             ];
-            for c in COMMANDS {
-                lines.push(format!("  {:<8} — {}", c.name, c.desc));
+            for group in CmdGroup::ORDER {
+                let items: Vec<&Cmd> = COMMANDS.iter().filter(|c| c.group == group).collect();
+                if items.is_empty() {
+                    continue;
+                }
+                lines.push(format!("── {} ──", group.label()));
+                for c in items {
+                    lines.push(format!("  {:<8} — {}", c.name, c.desc));
+                }
+                lines.push(String::new());
             }
-            lines.push(String::new());
             lines.push("在输入框输入 !cmd 执行本地命令（!!cmd 只显示结果，不发给模型）".to_string());
+            lines.push("忙时仅 /model /effort /cost /usage /status 等可用；Esc 取消任务后恢复".to_string());
             lines.push("按键：↑↓ 滚动 · Esc 关闭".to_string());
             open_info(app, "帮助", lines);
         }
@@ -1209,13 +1356,8 @@ async fn new_session(app: &mut App, client: &AcpClient) {
                 let _ = client.close_session(&o).await;
             }
             app.session_id = Some(sid.clone());
-            app.entries.clear();
-            app.tool_idx.clear();
-            app.tool_meta.clear();
-            app.usage = None;
-            app.scroll_from_bottom = 0;
+            app.reset_transcript();
             app.busy_since = None;
-            app.dirty = true;
             app.sysnote(&format!("新会话已创建 {}", short_id(&sid)));
         }
         Err(e) => app.sysnote(&format!("创建会话失败: {e:#}")),
@@ -1239,13 +1381,8 @@ async fn resume_session(app: &mut App, client: &AcpClient, item: ListedSession) 
                 let _ = client.close_session(&old).await;
             }
             app.session_id = Some(sid.clone());
-            app.entries.clear();
-            app.tool_idx.clear();
-            app.tool_meta.clear();
-            app.scroll_from_bottom = 0;
-            app.usage = None;
+            app.reset_transcript();
             app.busy_since = None;
-            app.dirty = true;
             app.sysnote(&format!(
                 "已恢复会话 {}（ACP 不回放历史内容，但对话上下文已在内核恢复，可继续对话）",
                 short_id(&sid)
@@ -1624,6 +1761,77 @@ fn cost_report() -> Vec<String> {
     out
 }
 
+/// /usage — per-session token statistics from the shared token-stats storage
+/// (`sessions[date][sessionId]`). The storage keys may carry a "session-"
+/// prefix, so match exact id, then 8-char suffix both ways.
+fn usage_report(app: &App) -> Vec<String> {
+    let Some(sid) = app.session_id.clone() else {
+        return vec!["（尚未创建会话）".into()];
+    };
+    let Some(home) = dsh_home() else {
+        return vec!["无法解析 DSH home（$DSH_HOME 或 ~/.dsh）".into()];
+    };
+    let path = home.join("storages").join("token-stats.json");
+    let Ok(txt) = std::fs::read_to_string(&path) else {
+        return vec![
+            "未找到 token-stats.json（dsh-token-stats 插件未启用？）".into(),
+            format!("期望位置: {}", path.display()),
+        ];
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+        return vec!["token-stats.json 解析失败".into()];
+    };
+
+    let short = short_id(&sid);
+    let mut out = Vec::new();
+    out.push(format!("当前会话 {}（{}）", short, sid));
+    let Some(sessions) = v.get("sessions").and_then(|s| s.as_object()) else {
+        out.push("（token-stats 中暂无会话级记录——由 dsh-token-stats 插件写入）".into());
+        out.push("提示: /cost 查看今日全局用量；会话 id 在存储中可能有 session- 前缀差异".into());
+        return out;
+    };
+
+    let mut req = 0u64;
+    let mut input = 0u64;
+    let mut output = 0u64;
+    let mut cr = 0u64;
+    let mut cw = 0u64;
+    let mut reasoning = 0u64;
+    let mut found = false;
+    for (_date, day) in sessions {
+        let Some(day) = day.as_object() else { continue };
+        for (key, stats) in day {
+            let key_matches = key == &sid
+                || key.ends_with(short.as_str())
+                || sid.ends_with(key.as_str());
+            if !key_matches {
+                continue;
+            }
+            let get = |k: &str| stats.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            req += get("requests");
+            input += get("inputTokens");
+            output += get("outputTokens");
+            cr += get("cacheReadTokens");
+            cw += get("cacheWriteTokens");
+            reasoning += get("reasoningTokens");
+            found = true;
+        }
+    }
+    if !found {
+        out.push("（token-stats 中暂无本会话记录）".into());
+        out.push("提示: 会话 id 在存储中可能有 session- 前缀差异；/cost 查看今日全局用量".into());
+        return out;
+    }
+    out.push(format!("请求: {req} 次"));
+    out.push(format!("输入: {} tokens", fmt_tokens(input)));
+    out.push(format!("输出: {} tokens", fmt_tokens(output)));
+    out.push(format!("缓存读: {} tokens", fmt_tokens(cr)));
+    out.push(format!("缓存写: {} tokens", fmt_tokens(cw)));
+    out.push(format!("推理: {} tokens", fmt_tokens(reasoning)));
+    out.push(format!("合计: {} tokens", fmt_tokens(input + output + cr + cw)));
+    out
+}
+
 fn load_prices() -> Vec<(String, Price)> {
     let mut v: Vec<(String, Price)> = vec![
         ("deepseek-v4-flash".into(), Price { input: 0.14, cache_read: 0.028, cache_write: 0.14, output: 0.28 }),
@@ -1900,18 +2108,20 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
                     };
                     app.entries[idx].text = text;
                     app.entries[idx].status = Some(meta.status.clone());
-                    app.dirty = true;
+                    app.invalidate(idx);
                 }
             }
             false
         }
         AcpEvent::Usage { used, size } => {
             app.usage = Some((used, size));
+            app.dirty = true; // top-bar context bar + status line
             false
         }
         AcpEvent::ConfigUpdated(cfg) => {
             if !cfg.is_empty() && catalog_is_richer(&cfg, &app.config) {
                 app.config = cfg;
+                app.dirty = true; // model pill / picker
             }
             false
         }
@@ -1921,6 +2131,7 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
             } else {
                 app.queued_permissions.push((request_id, tool_title, options));
             }
+            app.dirty = true; // the permission dialog must appear immediately
             false
         }
         AcpEvent::PromptSettled { stop_reason, error } => {
@@ -2091,5 +2302,36 @@ mod tests {
 
         let fail = run_shell_cmd("exit 3").await;
         assert_eq!(fail.exit_code, Some(3));
+    }
+
+    #[test]
+    fn commands_resolve_aliases_and_group() {
+        // Canonical names and aliases both resolve.
+        assert_eq!(resolve_cmd("/list").unwrap().name, "/list");
+        assert_eq!(resolve_cmd("/sessions").unwrap().name, "/list");
+        assert_eq!(resolve_cmd("/s").unwrap().name, "/list");
+        assert_eq!(resolve_cmd("/exit").unwrap().name, "/quit");
+        assert_eq!(resolve_cmd("/?").unwrap().name, "/help");
+        assert!(resolve_cmd("/not-a-command").is_none());
+        // Unmatched lines fall through to the agent (kimi-style).
+        assert!(resolve_cmd("/mymessage").is_none());
+
+        // Grouping: headers only between groups, canonical order.
+        let all: Vec<&Cmd> = COMMANDS.iter().collect();
+        let rows = grouped_menu(&all);
+        let mut group_order = Vec::new();
+        for r in &rows {
+            match r {
+                MenuRow::Header(h) => group_order.push(*h),
+                MenuRow::Cmd(_) => {}
+            }
+        }
+        assert_eq!(group_order, vec!["会话", "模型", "信息", "系统"]);
+
+        // Navigation skips headers.
+        let header = rows.iter().position(|r| matches!(r, MenuRow::Header(_))).unwrap();
+        assert_eq!(nav_cmd(&rows, header, 1), header + 1);
+        let last_cmd = rows.iter().rposition(|r| matches!(r, MenuRow::Cmd(_))).unwrap();
+        assert_eq!(nav_cmd(&rows, last_cmd, 1), last_cmd); // clamps
     }
 }
