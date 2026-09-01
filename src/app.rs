@@ -428,6 +428,12 @@ pub struct App {
     /// messages and settles in the same instant; showing "完成" while the
     /// text is still typing would read backwards).
     pending_settle: Option<String>,
+    /// Whether the current session was created by this run (not resumed).
+    /// Only fresh sessions are close-on-quit candidates.
+    fresh_session: bool,
+    /// Whether any prompt was dispatched in the current session. A fresh
+    /// session that never saw one is pure residue and is closed on quit.
+    prompted: bool,
     debug_log: VecDeque<String>,
     /// Locally generated session titles (first user prompt → short title),
     /// persisted in `~/.dsh-tui/session-titles.json`. The dsh acp profile
@@ -473,6 +479,8 @@ impl App {
             last_tool_id: None,
             reveal_queue: VecDeque::new(),
             pending_settle: None,
+            fresh_session: false,
+            prompted: false,
             debug_log: VecDeque::new(),
             titles: load_titles(),
             perm_rules: load_permission_rules(),
@@ -1236,6 +1244,17 @@ pub async fn run(
                     client.cancel(&sid);
                 }
             }
+            // A session this run created but never used is pure residue: an
+            // empty log that lingers in /list and — before the companion's
+            // empty-session filter — used to hijack the web's new-session
+            // blank pool (hiding the mode picker for the whole workspace).
+            // Resumed sessions never qualify: their content is invisible
+            // here but real.
+            if app.fresh_session && !app.prompted {
+                if let Some(sid) = app.session_id.clone() {
+                    let _ = client.close_session(&sid).await;
+                }
+            }
             break;
         }
         // Gate: redraw only when (a) something changed and enough time passed
@@ -1562,6 +1581,7 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
             app.state = RunState::Busy;
             app.busy_since = Some(Instant::now());
             app.scroll_from_bottom = 0; // sending snaps the view to the latest
+            app.prompted = true;
             client.prompt(sid, text);
         }
         KeyCode::Backspace => {
@@ -1764,6 +1784,8 @@ async fn new_session(app: &mut App, client: &AcpClient) {
                 let _ = client.close_session(&o).await;
             }
             app.session_id = Some(sid.clone());
+            app.fresh_session = true;
+            app.prompted = false;
             app.reset_transcript();
             app.busy_since = None;
             app.sysnote(&format!("新会话已创建 {}", short_id(&sid)));
@@ -1789,6 +1811,8 @@ async fn resume_session(app: &mut App, client: &AcpClient, item: ListedSession) 
                 let _ = client.close_session(&old).await;
             }
             app.session_id = Some(sid.clone());
+            app.fresh_session = false; // resumed content exists even if invisible here
+            app.prompted = false;
             app.reset_transcript();
             app.busy_since = None;
             app.sysnote(&format!(
@@ -2611,6 +2635,8 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
     match ev {
         AcpEvent::SessionCreated { session_id } => {
             app.session_id = Some(session_id.clone());
+            app.fresh_session = true;
+            app.prompted = false;
             app.busy_since = None;
             if app.state == RunState::Booting {
                 app.state = RunState::Idle;
@@ -2803,6 +2829,7 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
                     app.state = RunState::Busy;
                     app.busy_since = Some(Instant::now());
                     app.scroll_from_bottom = 0;
+                    app.prompted = true;
                     client.prompt(sid, next);
                 }
             }
@@ -2838,6 +2865,7 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
                     app.state = RunState::Busy;
                     app.busy_since = Some(Instant::now());
                     app.scroll_from_bottom = 0;
+                    app.prompted = true;
                     client.prompt(sid, prompt_text);
                 } else {
                     app.sysnote("会话尚未就绪，shell 输出未发送");

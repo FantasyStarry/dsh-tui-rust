@@ -121,6 +121,13 @@ pub async fn probe() -> Result<()> {
         println!("session/resume: {} → ok", acp::short_id(&resumed));
     }
 
+    // Close this run's own session: the probe never talks to it, so it is
+    // pure residue (an empty header-only log). Left open it would pile up in
+    // the shared registry — the exact blanks that used to hijack the web's
+    // new-session blank pool and hide the mode picker.
+    let _ = client.close_session(&sid).await;
+    println!("session/close: {}（probe 自身会话已回收）", acp::short_id(&sid));
+
     // Optional dwell: keep the process alive so delayed host-side work
     // (e.g. the companion plugin's reconcile timers) can run before exit.
     let args: Vec<String> = std::env::args().collect();
