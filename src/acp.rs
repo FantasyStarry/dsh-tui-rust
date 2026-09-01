@@ -199,6 +199,9 @@ impl AcpClient {
             .spawn()
             .context("无法启动 dsh（需要 dsh 在 PATH 上，或用 DSH_BIN 指向可执行文件）")?;
 
+        #[cfg(target_os = "windows")]
+        attach_job_object(&child);
+
         let stdin = child.stdin.take().context("子进程缺少 stdin")?;
         let stdout = child.stdout.take().context("子进程缺少 stdout")?;
         let stderr = child.stderr.take().context("子进程缺少 stderr")?;
@@ -672,8 +675,45 @@ fn dsh_command() -> Command {
     }
 }
 
-/// Force-kill the dsh process tree. On Windows the launcher is
-/// `cmd /C dsh`, so the real node process is a *grandchild* — killing the
+/// Assign the dsh process tree to a kill-on-close Job Object (Windows).
+///
+/// The graceful path (stdin EOF → grace → tree-kill) covers normal exits,
+/// but a hard kill of the TUI — window ✕, task manager, crash — skips all of
+/// it and would orphan the kernel. With the child inside a job owned by this
+/// process, the OS closes the job handle when the TUI dies *however* it dies
+/// and reaps the whole tree. The handle is intentionally never closed.
+#[cfg(target_os = "windows")]
+fn attach_job_object(child: &tokio::process::Child) {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            return;
+        }
+        if let Some(h) = child.raw_handle() {
+            AssignProcessToJobObject(job, h);
+        }
+        // `job` is deliberately leaked: the last handle closes when this
+        // process exits, which kills every process in the job.
+    }
+}
+
+/// Force-kill the dsh process tree. On Windows the launcher is/// `cmd /C dsh`, so the real node process is a *grandchild* — killing the
 /// cmd wrapper alone would orphan it, and its open stdio handles would keep
 /// the protocol tasks (and this process) alive forever. Two passes:
 ///

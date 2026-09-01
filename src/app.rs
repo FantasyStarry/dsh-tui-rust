@@ -46,6 +46,26 @@ struct ToolMeta {
     status: String,
 }
 
+/// Progressive local reveal of a committed chunk. The dsh ACP surface
+/// (automation-only contract) delivers assistant messages and thoughts as
+/// single committed blocks at turn end — raw provider deltas never touch the
+/// wire (verified with `scripts/acp-stream-probe.mjs`). To restore the
+/// streaming feel, committed text is typed out locally (~1s per block).
+struct Reveal {
+    kind: EntryKind,
+    text: String,
+    /// Reveal schedule: drains in ≤ ticks_left render ticks (~33ms each).
+    ticks_left: u32,
+    /// Entry index the reveal appends to; created on the first tick when None.
+    target: Option<usize>,
+    /// No more merging into this reveal (a tool card / user message came
+    /// between, so the next same-kind chunk starts a new entry).
+    sealed: bool,
+    /// First tick must create a NEW entry (set when enqueued after a seal —
+    /// plain append_chunk would merge into the previous same-kind entry).
+    force_new: bool,
+}
+
 pub enum Dialog {
     None,
     Permission {
@@ -401,6 +421,12 @@ pub struct App {
     tool_collapsed: HashMap<String, bool>,
     /// Most recent tool_call_id (Ctrl+O toggles this one).
     last_tool_id: Option<String>,
+    /// Pending typewriter reveals (FIFO; see [`Reveal`]).
+    reveal_queue: VecDeque<Reveal>,
+    /// Settle note deferred until the reveal drains (the kernel commits
+    /// messages and settles in the same instant; showing "完成" while the
+    /// text is still typing would read backwards).
+    pending_settle: Option<String>,
     debug_log: VecDeque<String>,
     /// Locally generated session titles (first user prompt → short title),
     /// persisted in `~/.dsh-tui/session-titles.json`. The dsh acp profile
@@ -444,6 +470,8 @@ impl App {
             tool_meta: HashMap::new(),
             tool_collapsed: HashMap::new(),
             last_tool_id: None,
+            reveal_queue: VecDeque::new(),
+            pending_settle: None,
             debug_log: VecDeque::new(),
             titles: load_titles(),
             perm_rules: load_permission_rules(),
@@ -478,6 +506,11 @@ impl App {
             detail: None,
             tool_id: None,
         });
+        // A non-chunk entry (tool card / user message / system note) breaks
+        // the current reveal: later same-kind chunks must start a new entry.
+        if let Some(back) = self.reveal_queue.back_mut() {
+            back.sealed = true;
+        }
         self.invalidate(self.entries.len() - 1);
     }
 
@@ -509,6 +542,138 @@ impl App {
         save_history(&self.history);
     }
 
+    // -- typewriter reveal (committed chunk → streaming look) ---------------
+
+    /// Queue a committed assistant/thought chunk for progressive reveal.
+    /// Opt out with `DSH_TUI_NO_TYPEWRITER=1` (append directly).
+    fn enqueue_reveal(&mut self, kind: EntryKind, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if std::env::var("DSH_TUI_NO_TYPEWRITER").is_ok() {
+            self.append_chunk(kind, text);
+            return;
+        }
+        match self.reveal_queue.back_mut() {
+            Some(back) if back.kind == kind && !back.sealed => back.text.push_str(text),
+            _ => {
+                let force_new = self
+                    .reveal_queue
+                    .back()
+                    .is_some_and(|back| back.sealed && back.kind == kind);
+                self.reveal_queue.push_back(Reveal {
+                    kind,
+                    text: text.to_string(),
+                    ticks_left: 30,
+                    target: None,
+                    sealed: false,
+                    force_new,
+                })
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Advance the head reveal by one scheduled step (called every event-loop
+    /// iteration; the 33ms render tick paces it at ~30fps). When the queue
+    /// drains, a deferred settle note (if any) is shown.
+    fn tick_reveal(&mut self) {
+        if self.reveal_queue.is_empty() {
+            if let Some(note) = self.pending_settle.take() {
+                self.sysnote(&note);
+                self.dirty = true;
+            }
+            return;
+        }
+        // Phase 1: compute + consume from the head (queue borrow ends here).
+        let action = {
+            let Some(head) = self.reveal_queue.front_mut() else { return };
+            let remaining = head.text.chars().count();
+            if remaining == 0 {
+                Some((head.kind, head.force_new, head.target, String::new(), true))
+            } else {
+                let step = std::cmp::min(
+                    remaining,
+                    std::cmp::max(1, remaining.div_ceil(head.ticks_left.max(1) as usize)),
+                );
+                let take = head
+                    .text
+                    .char_indices()
+                    .nth(step)
+                    .map(|(i, _)| i)
+                    .unwrap_or(head.text.len());
+                let slice = head.text[..take].to_string();
+                head.text.drain(..take);
+                head.ticks_left = (head.ticks_left.saturating_sub(1)).max(1);
+                let done = head.text.is_empty();
+                Some((head.kind, head.force_new, head.target, slice, done))
+            }
+        };
+        let Some((kind, force_new, target, slice, done)) = action else { return };
+        if done {
+            self.reveal_queue.pop_front();
+        }
+        if slice.is_empty() {
+            return;
+        }
+        // Phase 2: append to the target entry (create it on the first tick).
+        let idx = match target {
+            Some(i) => {
+                if let Some(e) = self.entries.get_mut(i) {
+                    e.text.push_str(&slice);
+                }
+                i
+            }
+            None if force_new => {
+                self.entries.push(Entry {
+                    kind,
+                    text: slice,
+                    status: None,
+                    detail: None,
+                    tool_id: None,
+                });
+                self.entries.len() - 1
+            }
+            None => {
+                self.append_chunk(kind, &slice);
+                self.entries.len() - 1
+            }
+        };
+        if !done {
+            if let Some(head) = self.reveal_queue.front_mut() {
+                head.target = Some(idx);
+            }
+        }
+        self.invalidate(idx);
+    }
+
+    /// Immediately show all pending reveal text (cancel / shutdown).
+    fn flush_reveal(&mut self) {
+        while let Some(head) = self.reveal_queue.pop_front() {
+            if !head.text.is_empty() {
+                let idx = match head.target {
+                    Some(i) => {
+                        if let Some(e) = self.entries.get_mut(i) {
+                            e.text.push_str(&head.text);
+                        }
+                        i
+                    }
+                    None => {
+                        self.append_chunk(head.kind, &head.text);
+                        self.entries.len() - 1
+                    }
+                };
+                self.invalidate(idx);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Whether a typewriter reveal is still playing.
+    pub fn reveal_active(&self) -> bool {
+        !self.reveal_queue.is_empty()
+    }
+
     /// Clear the transcript and its display caches (new session / resume /
     /// /clear). The kernel-side conversation is unaffected.
     pub(crate) fn reset_transcript(&mut self) {
@@ -520,6 +685,7 @@ impl App {
         self.tool_meta.clear();
         self.tool_collapsed.clear();
         self.last_tool_id = None;
+        self.reveal_queue.clear();
         self.usage = None;
         self.scroll_from_bottom = 0;
         self.dirty = true;
@@ -1037,6 +1203,8 @@ pub async fn run(
             },
             _ = render_tick.tick() => {}
         }
+        // Advance the typewriter reveal (paced by the 33ms render tick).
+        app.tick_reveal();
         if app.quit_requested() {
             // Cancel any in-flight prompt first: the prompt task holds a
             // client clone, so without cancellation the runtime would linger
@@ -1311,6 +1479,7 @@ async fn handle_key(app: &mut App, client: &AcpClient, ev: Event) -> Result<(), 
                     client.cancel(&sid);
                     app.sysnote("已请求取消…");
                 }
+                app.flush_reveal(); // show whatever the kernel already sent
             } else if !app.input.is_empty() {
                 app.input.clear();
             } else if app.queue_len() > 0 {
@@ -2493,11 +2662,11 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
             false
         }
         AcpEvent::MessageChunk(t) => {
-            app.append_chunk(EntryKind::Agent, &t);
+            app.enqueue_reveal(EntryKind::Agent, &t);
             false
         }
         AcpEvent::ThoughtChunk(t) => {
-            app.append_chunk(EntryKind::Thought, &t);
+            app.enqueue_reveal(EntryKind::Thought, &t);
             false
         }
         AcpEvent::ToolCall { tool_call_id, title, kind, status, raw } => {
@@ -2591,14 +2760,22 @@ fn handle_acp(app: &mut App, client: &AcpClient, ev: AcpEvent) -> bool {
         AcpEvent::PromptSettled { stop_reason, error } => {
             app.state = RunState::Idle;
             app.busy_since = None;
-            match &error {
-                Some(err) => app.sysnote(&format!("请求失败: {err}")),
-                None if stop_reason == "cancelled" => app.sysnote("已取消"),
-                None => app.sysnote(&format!("— 完成（{stop_reason}）—")),
-            }
+            // Defer the settle note until the typewriter reveal drains: the
+            // kernel commits messages and settles in the same instant, and
+            // "完成" above still-typing text reads backwards.
+            app.pending_settle = Some(match &error {
+                Some(err) => format!("请求失败: {err}"),
+                None if stop_reason == "cancelled" => "已取消".to_string(),
+                None => format!("— 完成（{stop_reason}）—"),
+            });
+            app.dirty = true;
             // Drain the queue: send the next queued message, if any.
             if error.is_none() && !app.queue.is_empty() {
                 if let Some(sid) = app.session_id.clone() {
+                    // The previous turn's note lands between the turns.
+                    if let Some(note) = app.pending_settle.take() {
+                        app.sysnote(&note);
+                    }
                     let next = app.queue.pop_front().expect("checked non-empty");
                     app.push_entry(EntryKind::User, &next);
                     app.state = RunState::Busy;
@@ -2915,5 +3092,66 @@ mod tests {
         // Invalid keys are ignored (parse failure), no panic.
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn typewriter_reveal_drains_to_full_text() {
+        std::env::remove_var("DSH_TUI_NO_TYPEWRITER");
+        let mut app = App::new();
+        app.state = RunState::Idle;
+        app.enqueue_reveal(EntryKind::Agent, "你好世界 hello");
+        assert!(app.reveal_active());
+        for _ in 0..60 {
+            app.tick_reveal();
+        }
+        assert!(!app.reveal_active());
+        let agent: String = app
+            .entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Agent)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(agent, "你好世界 hello");
+    }
+
+    #[test]
+    fn reveal_flush_shows_everything_instantly() {
+        std::env::remove_var("DSH_TUI_NO_TYPEWRITER");
+        let mut app = App::new();
+        app.enqueue_reveal(EntryKind::Thought, "思考内容");
+        app.enqueue_reveal(EntryKind::Agent, "回复内容");
+        app.flush_reveal();
+        assert!(!app.reveal_active());
+        let thought: String = app
+            .entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Thought)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(thought, "思考内容");
+        let agent: String = app
+            .entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::Agent)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(agent, "回复内容");
+    }
+
+    #[test]
+    fn reveal_seals_on_entry_push() {
+        std::env::remove_var("DSH_TUI_NO_TYPEWRITER");
+        let mut app = App::new();
+        app.enqueue_reveal(EntryKind::Agent, "第一段");
+        app.push_entry(EntryKind::Tool, "edit"); // seals the running reveal
+        app.enqueue_reveal(EntryKind::Agent, "第二段");
+        for _ in 0..80 {
+            app.tick_reveal();
+        }
+        let agent_entries: Vec<&Entry> =
+            app.entries.iter().filter(|e| e.kind == EntryKind::Agent).collect();
+        assert_eq!(agent_entries.len(), 2, "tool card must break the reveal");
+        assert_eq!(agent_entries[0].text, "第一段");
+        assert_eq!(agent_entries[1].text, "第二段");
     }
 }

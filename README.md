@@ -36,6 +36,7 @@ TUI 退出不会影响内核，会话已持久化，重启后 `Ctrl+L` 可恢复
 |--------|------|
 | 进程隔离 | dsh 以子进程运行（`dsh --profile acp`），TUI 崩溃不影响内核，内核崩溃可凭持久化会话 resume |
 | 优雅退出 | 退出时先对 dsh stdin 发 EOF 请求优雅关机（持久化冲刷）；实测部分 out-of-tree 插件会阻止 dsh 退出，故 3 秒宽限后**整树强杀**（Windows：`taskkill /T` + 孤儿枚举，因 `cmd /C` 包装下 node 是孙进程；Unix：直接 kill）——保证 TUI 进程永不悬挂 |
+| 作业对象 | dsh 进程树挂入 Windows **Job Object**（kill-on-close）：即使 TUI 被硬杀（窗口 ✕ / 任务管理器 / 崩溃），OS 也会自动收割内核，绝不孤儿 |
 | 协议隔离 | 只依赖官方承诺的标准 ACP v1 surface（无私有方法、无 `_meta`），上游只要保持 ACP 兼容就不会破坏 TUI |
 | 环境隔离 | dsh 自带 profile 机制：acp profile 的插件树、补丁、持久化都在 `$DSH_HOME/profiles/acp/` 独立目录，与 web profile 互不干扰 |
 | 版本契约 | 要求 `dsh >= 0.1.2-alpha.2` 在 PATH 上（或用 `DSH_BIN` 环境变量指向可执行文件） |
@@ -133,6 +134,23 @@ DSH_BIN=/path/to/dsh cargo run    # 指定 dsh 路径
 未匹配的请求照常弹窗。`/permission` 查看已加载规则。
 
 启动时后台检查 `dsh --version`（≥ 0.1.2-alpha.2 契约），过低或缺失会在状态区警告。
+
+### 流式展示说明（重要）
+
+**实测结论**（`scripts/acp-stream-probe.mjs`，对真实内核逐事件计时）：dsh 的 ACP
+面是 automation-only 契约——assistant 消息与思考以**单个 committed 块**在回合
+结束时一次性发出，**原始 provider delta 不上 wire**（官方 README 原话：
+"raw provider deltas stay off the wire"；config catalog 亦无流式开关；
+npm 最新 0.1.2-alpha.3 无支持流式的版本）。这是内核的刻意设计，不是 bug，
+内核不可修改。
+
+**TUI 的解法：本地逐字揭示（typewriter reveal）**——committed 块到达后按
+~1s/块 的节奏逐字显示（自适应步长，长文本不拖沓），恢复流式观感：
+
+- 思考与回复分别排队揭示；工具卡片照常实时渲染
+- 结算提示（"— 完成 —"）延迟到揭示完成后显示，避免"完成"悬在打字机上方的错位
+- 揭示期间状态栏显示 `● 输出中` + 动画
+- `Esc` 取消立即 flush 已收到内容；`DSH_TUI_NO_TYPEWRITER=1` 关闭揭示（直达）
 
 ### 主题系统（`~/.dsh-tui/theme.json`，pi themes 风格）
 

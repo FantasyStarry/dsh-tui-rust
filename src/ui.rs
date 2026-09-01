@@ -198,18 +198,25 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 
     let width = area.width as usize;
     let mut left: Vec<Span> = vec![Span::raw(" ")];
+    let revealing = app.reveal_active();
     let (dot, label) = match app.state {
         RunState::Booting => (app.theme.dim, "启动中"),
+        RunState::Idle if revealing => (app.theme.warn, "输出中"),
         RunState::Idle => (app.theme.ok, "就绪"),
         RunState::Busy => (app.theme.warn, "运行中"),
     };
+    let animating = app.state == RunState::Busy || app.state == RunState::Booting || revealing;
     left.push(Span::styled("● ", plain(dot)));
-    if app.state == RunState::Busy {
+    if animating {
         let elapsed = app.busy_since.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
         let spinner = SPINNER[((elapsed * 8.0) as usize) % SPINNER.len()];
         left.push(Span::styled(format!("{spinner} "), plain(app.theme.violet)));
-        left.push(Span::styled(format!("{label} {:.0}s", elapsed), bold(app.theme.warn)));
-        left.push(Span::styled(" · Esc 取消", plain(app.theme.muted)));
+        if app.state == RunState::Busy {
+            left.push(Span::styled(format!("{label} {:.0}s", elapsed), bold(app.theme.warn)));
+            left.push(Span::styled(" · Esc 取消", plain(app.theme.muted)));
+        } else {
+            left.push(Span::styled(label.to_string(), bold(dot)));
+        }
     } else {
         left.push(Span::styled(label, plain(app.theme.fg)));
     }
