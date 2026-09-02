@@ -139,14 +139,78 @@ export interface SessionEventMap {
   'step/end': { readonly turn: number; readonly step: number }
   'user/message': UserMessage
   'assistant/chunk': { readonly turn: number; readonly step: number; readonly chunk: StreamChunk }
-  'assistant/message': { readonly turn: number; readonly step: number; readonly message: AssistantMessage; readonly interrupted?: true }
+  'assistant/message': { readonly turn: number; readonly step: number; readonly message: AssistantMessage; readonly usage?: TokenUsage; readonly interrupted?: true }
   'tool/call': { readonly turn: number; readonly step: number; readonly callId: string; readonly name: string; readonly arguments: string }
   'tool/result': { readonly turn: number; readonly step: number; readonly message: ToolResultMessage; readonly error?: { readonly name: string; readonly code: string } }
   'todo/write': { readonly todos: readonly TodoItem[] }
+  /** Full request header snapshot; the latest one reconstructs the route (dsh-session `EpochHeader`). */
+  'request/header': { readonly header: { readonly config: LlmCallConfig }; readonly reason: string }
   'session/end-seed': Record<string, never>
 }
 
 export type SessionEventType = keyof SessionEventMap
+
+/** Provider-neutral call configuration (dsh-llm `LlmCallConfig`). */
+export interface LlmCallConfig {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+  readonly temperature?: number
+  readonly maxTokens?: number
+  readonly stop?: readonly string[]
+}
+
+/** Token accounting reported by the adapter (dsh-llm `TokenUsage`). */
+export interface TokenUsage {
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens?: number
+  readonly cacheWriteTokens?: number
+  readonly reasoningTokens?: number
+}
+
+/** Display metadata for one registered provider route (dsh-llm `LlmProviderInfo`). */
+export interface LlmProviderInfo {
+  /** Provider route key used by `GenerateOptions.provider`. */
+  readonly id: string
+  /** Human-readable provider name for selectors. */
+  readonly name: string
+}
+
+/** One model entry of a provider route (dsh-llm `LlmModelInfo`). */
+export interface LlmModelInfo {
+  readonly provider: string
+  /** Model id passed to `GenerateOptions.model`. */
+  readonly id: string
+  /** Human-readable model name for selectors. */
+  readonly name: string
+  readonly description?: string
+}
+
+/** Adapter-owned reasoning effort metadata (dsh-llm `LlmReasoningEffortInfo`). */
+export interface LlmReasoningEffortInfo {
+  readonly id: string
+  readonly name: string
+  readonly description?: string
+}
+
+/** Exact-route model metadata resolved by its adapter (dsh-llm `LlmResolvedModelInfo`). */
+export interface LlmResolvedModelInfo extends LlmModelInfo {
+  readonly reasoning?: {
+    readonly efforts: readonly LlmReasoningEffortInfo[]
+    readonly defaultEffort?: string
+  }
+}
+
+/**
+ * The LLM runtime (`ctx.llm`, dsh-llm `LlmRuntime` — the selector subset):
+ * route/model enumeration plus exact-route resolution for reasoning efforts.
+ */
+export interface KernelLlmService {
+  listProviders(): readonly LlmProviderInfo[]
+  listModels(provider: string): Promise<readonly LlmModelInfo[]>
+  resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>
+}
 
 /**
  * One persisted session event (dsh-session `SessionEvent`). The payload is
@@ -204,6 +268,16 @@ export interface AgentOptions {
 }
 
 /**
+ * The subset of the agent-scoped Cordis `Context` Orca drives from the agent
+ * (dsh-agent `Agent.ctx`). Waterfall listeners (`agent/request`, …) receive
+ * `(payload, next)` and return their value through the listener's return —
+ * cordis `ctx.on` always returns the listener's disposer.
+ */
+export interface AgentScopedContext {
+  on(name: string, listener: (...args: unknown[]) => unknown): () => void
+}
+
+/**
  * A live agent (dsh-agent `Agent`). Prompts go through `followup` / `steer`
  * carrying full `UserMessage` values; in-flight work through `cancel(cause)`.
  */
@@ -215,6 +289,8 @@ export interface Agent {
   readonly session: Session
   /** `idle` | `running`, mirrored on every `agent/status` transition. */
   readonly status: 'idle' | 'running'
+  /** Agent-scoped context; its contributions unwind on disposal. */
+  readonly ctx: AgentScopedContext
   /** Queue an ordinary follow-up turn and wake the driver. */
   followup(message: UserMessage): void
   /** Submit steering for the nearest step. */
@@ -272,7 +348,8 @@ export interface KernelLoader {
  * Owning service of the composition's `provider`/`model` defaults; callers
  * read `currentSelection()` and pass the pair through `agentOptions` — the
  * kernel applies NO default on its own (an agent without a provider/model
- * fails every turn with "has no provider/model").
+ * fails every turn with "has no provider/model"). `saveSelection` persists a
+ * new default when a settings provider is mounted.
  */
 export interface KernelAgentDefaultModel {
   currentSelection(): {
@@ -280,6 +357,7 @@ export interface KernelAgentDefaultModel {
     model: string
     reasoningEffort?: string
   }
+  saveSelection(next: { provider: string; model: string; reasoningEffort?: string }): Promise<void>
 }
 
 /**
@@ -300,8 +378,12 @@ export interface KernelAgentsService {
  * silently when absent — an optional seam may never break the boot.
  */
 export interface KernelContext {
-  /** Subscribe to a kernel event (e.g. `session/event`, `agent/status`). */
-  on(name: string, listener: (...args: unknown[]) => void): void
+  /**
+   * Subscribe to a kernel event. `ctx.on` returns the listener's disposer
+   * (cordis 4.0.2); emit listeners return nothing, waterfall listeners
+   * receive `(payload, next)` and return the chained value.
+   */
+  on(name: string, listener: (...args: unknown[]) => unknown): () => void
   /** Soft-probe a service; pass `false` to return undefined instead of throwing. */
   get<T = unknown>(name: string): T | undefined
   get<T = unknown>(name: string, soft: false): T | undefined

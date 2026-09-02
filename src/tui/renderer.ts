@@ -44,6 +44,12 @@ export class Renderer {
     const up = this.last.length - 1 - firstDiff + this.trailingRows(this.last)
     if (up > 0) out.push(`\x1b[${up}A`)
     out.push('\r')
+    // Pure-append growth (prefix identical, lines added below the old
+    // frame): the cursor is parked ON the old last line — step down one
+    // row before painting, or the first new line overwrites it.
+    if (firstDiff >= this.last.length && this.last.length > 0) {
+      out.push('\x1b[1B')
+    }
 
     for (let i = firstDiff; i < frame.length; i++) {
       out.push(CLEAR_LINE, frame[i] ?? '', '\r\n')

@@ -25,7 +25,7 @@
 - 内核接缝类型是**镜像**（`src/kernel/types.ts`）：与真实 `@deepseek-ai/*` 面不一致时改镜像并注明核对过的内核版本；镜像上必须有 doc 注明对应接缝。
 - 未知事件类型/字段一律宽容忽略（内核是 developer preview，破坏性变更是预期）。
 - 文案中文优先；宽度计算永远按 terminal cell，不按 `string.length`。
-- 提交信息：中文 + 英文摘要风格，沿用仓库历史。
+- 提交信息：**Conventional Commits**（`feat:` / `fix:` / `refactor:` / `docs:` / `chore:`），主题行中文写清做了什么——新增了什么、修复了什么、删除了什么；可附英文摘要。（2026-08 起，历史提交不改写。）
 
 ## 验证（提交前必跑）
 

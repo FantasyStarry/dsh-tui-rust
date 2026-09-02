@@ -59,12 +59,18 @@ export class Keyboard {
 }
 
 /** Submit / cancel / text-entry classification used by the editor. */
-export function classify(key: KeyPress): 'submit' | 'cancel' | 'exit' | 'backspace' | 'text' | 'ignore' {
+export function classify(key: KeyPress): 'submit' | 'cancel' | 'exit' | 'backspace' | 'navigate' | 'text' | 'ignore' {
   if (key.ctrl && key.name === 'c') return 'exit'
   if (key.ctrl && key.name === 'd') return 'exit'
   if (key.name === 'escape') return 'cancel'
   if (key.name === 'return' && !key.ctrl && !key.alt) return 'submit'
   if (key.name === 'backspace') return 'backspace'
+  // Navigation keys carry escape sequences as their `sequence`; inserting
+  // them into the editor would smear raw CSI garbage into the prompt line.
+  // Proper cursor movement is a later milestone — for now they no-op.
+  if (['up', 'down', 'left', 'right', 'home', 'end', 'delete', 'pageup', 'pagedown', 'insert'].includes(key.name)) {
+    return 'navigate'
+  }
   if (!key.ctrl && !key.alt && key.sequence.length > 0 && key.sequence.codePointAt(0)! >= 0x20) {
     return 'text'
   }

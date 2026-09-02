@@ -26,11 +26,29 @@ export interface TranscriptRow {
   status?: 'pending' | 'running' | 'ok' | 'failed'
   /** Tool rows: tool display name. */
   tool?: string
+  /** Thought rows: wall-clock start while streaming (drives the live timer). */
+  startMs?: number
+  /** Thought rows: sealed duration in seconds (collapses the block). */
+  seconds?: number
   /** Monotonic frame counter bump marker for the renderer. */
   seq: number
 }
 
 export type AgentRunState = 'idle' | 'thinking' | 'working'
+
+/** The request route the log last recorded (`request/header` — the truth). */
+export interface SessionRoute {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+export interface SessionUsage {
+  input: number
+  output: number
+  reasoning: number
+  messages: number
+}
 
 let rowId = 0
 
@@ -103,6 +121,11 @@ function preview(text: string, max = ARGS_PREVIEW_MAX): string {
   return clean.length > max ? clean.slice(0, max) + '…' : clean
 }
 
+function numOf(record: Record<string, unknown>, key: string): number {
+  const value = record[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
 /**
  * Defensive event ingest. Unknown event types are ignored (the kernel is a
  * developer preview; new types appear without notice). Chunk semantics:
@@ -114,6 +137,10 @@ export class Channel {
   runState: AgentRunState = 'idle'
   /** Bumped on every projection change; render loops compare against it. */
   version = 0
+  /** Latest route recorded by `request/header` — session truth, not UI state. */
+  route: SessionRoute | null = null
+  /** Cumulative token usage accumulated from `assistant/message` events. */
+  usage: SessionUsage = { input: 0, output: 0, reasoning: 0, messages: 0 }
 
   private openAssistantId: number | null = null
   private openThoughtId: number | null = null
@@ -124,10 +151,39 @@ export class Channel {
         this.runState = 'thinking'
         break
       }
+      case 'request/header': {
+        const data = dataOf(event)
+        const header = recordOf(data['header'])
+        const config = header ? recordOf(header['config']) : undefined
+        if (config) {
+          const provider = str(config, 'provider')
+          const model = str(config, 'model')
+          if (provider && model) {
+            const reasoningEffort = str(config, 'reasoningEffort')
+            this.route = reasoningEffort ? { provider, model, reasoningEffort } : { provider, model }
+            this.version++
+          }
+        }
+        break
+      }
+      case 'assistant/message': {
+        const data = dataOf(event)
+        const usage = recordOf(data['usage'])
+        if (usage) {
+          this.usage = {
+            input: this.usage.input + numOf(usage, 'inputTokens'),
+            output: this.usage.output + numOf(usage, 'outputTokens'),
+            reasoning: this.usage.reasoning + numOf(usage, 'reasoningTokens'),
+            messages: this.usage.messages + 1,
+          }
+          this.version++
+        }
+        break
+      }
       case 'turn/end': {
         this.runState = 'idle'
+        this.sealThought()
         this.openAssistantId = null
-        this.openThoughtId = null
         const data = dataOf(event)
         const reason = recordOf(data['reason'])
         if (reason && str(reason, 'kind') === 'error') {
@@ -170,8 +226,8 @@ export class Channel {
       case 'tool/call': {
         const data = dataOf(event)
         const tool = str(data, 'name', 'tool') || 'tool'
+        this.sealThought()
         this.openAssistantId = null
-        this.openThoughtId = null
         this.rows.push({
           id: ++rowId,
           kind: 'tool',
@@ -218,14 +274,24 @@ export class Channel {
 
   /** A user prompt submitted from the editor (used by tests and the fake kernel). */
   pushUser(text: string): void {
+    this.sealThought()
     this.openAssistantId = null
-    this.openThoughtId = null
     this.rows.push({ id: ++rowId, kind: 'user', text, seq: ++this.version })
   }
 
   /** Local notice (connection loss, resume hint, …) — never model-visible. */
   pushSystem(text: string): void {
     this.rows.push({ id: ++rowId, kind: 'system', text, seq: ++this.version })
+  }
+
+  /** Stamp the sealed duration onto the open thought row and close it. */
+  private sealThought(): void {
+    if (this.openThoughtId === null) return
+    const row = this.rows.find((candidate) => candidate.id === this.openThoughtId)
+    if (row && row.seconds === undefined && row.startMs !== undefined) {
+      row.seconds = Math.round((Date.now() - row.startMs) / 100) / 10
+    }
+    this.openThoughtId = null
   }
 
   private appendChunk(kind: Extract<RowKind, 'assistant' | 'thought'>, openKind: 'assistant' | 'thought', text: string): void {
@@ -235,7 +301,10 @@ export class Channel {
     if (open && open.kind === kind) {
       open.text += text
     } else {
-      const row: TranscriptRow = { id: ++rowId, kind, text, seq: ++this.version }
+      const row: TranscriptRow =
+        openKind === 'thought'
+          ? { id: ++rowId, kind, text, startMs: Date.now(), seq: ++this.version }
+          : { id: ++rowId, kind, text, seq: ++this.version }
       this.rows.push(row)
       if (openKind === 'assistant') this.openAssistantId = row.id
       else this.openThoughtId = row.id
