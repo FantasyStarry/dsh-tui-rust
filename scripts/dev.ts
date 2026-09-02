@@ -41,7 +41,16 @@ const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setT
  * SGR color pairs are STRIPPED here (assertions target visible text, never
  * raw escape boundaries), and the CSI-2026 sync pair pass through as no-ops.
  */
-function paintScreen(writes: string[]): string[] {
+/**
+ * Minimal terminal emulator for the renderer contract: replays the write
+ * stream (cursor up/down, clear-line, clear-to-end, newline) onto a screen
+ * buffer so tests can assert the VISIBLE frame, not just that bytes moved.
+ * SGR color pairs are STRIPPED here (assertions target visible text, never
+ * raw escape boundaries), and the CSI-2026 sync pair pass through as no-ops.
+ * With `height` set, newlines past the bottom SCROLL (top row drops) — the
+ * real-terminal behavior the chrome-drift regressions hinge on.
+ */
+function paintScreen(writes: string[], height = Number.POSITIVE_INFINITY): string[] {
   const screen: string[] = ['']
   let row = 0
   const stream = writes.join('')
@@ -52,6 +61,16 @@ function paintScreen(writes: string[]): string[] {
     const plain = text.replace(/\x1b\[[0-9;?]*[@-~]/g, '')
     while (screen.length <= row) screen.push('')
     screen[row] += plain
+  }
+  const lineFeed = (): void => {
+    if (row + 1 >= height) {
+      screen.shift()
+      while (screen.length < height) screen.push('')
+      row = height - 1
+      return
+    }
+    row++
+    while (screen.length <= row) screen.push('')
   }
   while ((match = re.exec(stream)) !== null) {
     writeText(stream.slice(last, match.index))
@@ -71,8 +90,7 @@ function paintScreen(writes: string[]): string[] {
       while (screen.length <= row) screen.push('')
       screen[row] = ''
     } else if (match[0] === '\r\n') {
-      row++
-      while (screen.length <= row) screen.push('')
+      lineFeed()
     }
     // lone '\r' and the sync pair: no-ops under the full-line write model
   }
@@ -341,6 +359,24 @@ async function main(): Promise<void> {
     while (screen.length > 0 && screen[screen.length - 1] === '') screen.pop()
     const expected = 's1\ns2\ns3\na5'
     if (screen.join('\n') !== expected) problems.push(`phase0.5：渲染契约失真：${JSON.stringify(screen)}`)
+  }
+
+  // ── Phase 0.6: full-height repaint must NOT scroll — the last frame row
+  // carries no trailing newline, so a top-row change on a screen-filling
+  // frame keeps every row visible (the chrome-drift regression).
+  {
+    const rw: string[] = []
+    const renderer = new Renderer(makeStdout(rw), () => 40)
+    const cursor = { fromEnd: 0, col: 3 }
+    renderer.render(['a1', 'a2', 'a3', 'a4'], [], cursor) // fills a 4-row screen
+    renderer.render(['b1', 'a2', 'a3', 'a4'], [], cursor) // top-row change → full repaint
+    renderer.render(['b1', 'a2', 'a3', 'c4'], [], cursor) // tail change
+    renderer.render(['b1', 'a2', 'a3', 'c4'], ['s1', 's2'], cursor) // seal flush above
+    const screen = paintScreen(rw, 4)
+    renderer.dispose()
+    // The seal rows overflow a full screen into scrollback; the frame itself
+    // must come through intact — no lost top row, no drift, no stale tail.
+    if (screen.join('\n') !== 'b1\na2\na3\nc4') problems.push(`phase0.6：整屏重绘丢行/漂移：${JSON.stringify(screen)}`)
   }
 
   // ── Phase 1: degraded boot (#183) — no `agents` service, never a throw ───

@@ -60,9 +60,6 @@ export interface ChatFrame {
   readonly cursor: { readonly fromEnd: number; readonly col: number }
 }
 
-/** Hard cap for open-row lines in the live region (safety on tiny viewports). */
-const MAX_OPEN_LINES = 120
-
 const HINT = 'Enter 发送  ·  /model 模型  ·  Esc 取消  ·  Ctrl+C 退出'
 
 /** kimi symbols.ts: role bullets, status marks; `✨` carries VS16 so both our
@@ -78,6 +75,7 @@ const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '�
 
 export function buildFrame(ctx: FrameContext): ChatFrame {
   const width = Math.max(20, ctx.width)
+  const height = Math.max(8, ctx.height ?? 24)
   const stream: string[] = []
   const live: string[] = []
   // Content area: transcript + panels sit inside a 1-cell chrome gutter
@@ -92,28 +90,33 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     stream.push(...renderRow(row, ctx, inner).map(gutter))
   }
 
-  // Live region: open rows of the current turn + the bottom chrome.
+  // Live region: open rows of the current turn + the bottom chrome. The
+  // chrome FOLLOWS the content (kimi inline layout) — no spacer pads the
+  // frame to the screen height, so a fresh session shows the welcome card
+  // and the editor stacked at the top instead of a wall of blank rows.
   const openRows = ctx.channel.rows.slice(sealedTo)
   let openLines: string[] = []
   for (const row of openRows) {
     openLines.push(...renderRow(row, ctx, inner).map(gutter))
   }
-  if (openLines.length > MAX_OPEN_LINES) {
-    const dropped = openLines.length - MAX_OPEN_LINES
-    openLines = [theme.muted(`… 本回合前 ${dropped} 行暂省（回合结束后进历史）`), ...openLines.slice(-MAX_OPEN_LINES)]
+
+  const pickerLines = ctx.picker ? renderPicker(ctx.picker, inner).map(gutter) : []
+  const bottom = [...inputBox(ctx.editorText, width), ...footerLines(ctx, width)]
+  // The open-row window is capped so the frame never outgrows the terminal —
+  // the diff painter can only repaint rows that are on screen. Overflow
+  // collapses into a note and resumes into scrollback at the next seal.
+  const pickerReserve = pickerLines.length > 0 ? pickerLines.length + 1 : 0
+  const maxOpen = Math.max(2, height - bottom.length - pickerReserve)
+  if (openLines.length > maxOpen) {
+    const dropped = openLines.length - maxOpen
+    openLines = [theme.muted(`… 本回合前 ${dropped} 行暂省（回合结束后进历史）`), ...openLines.slice(-(maxOpen - 1))]
   }
   live.push(...openLines)
 
-  const pickerLines = ctx.picker ? renderPicker(ctx.picker, inner).map(gutter) : []
   if (pickerLines.length > 0) {
     live.push(...pickerLines)
     live.push('')
   }
-
-  const targetHeight = Math.max(8, ctx.height ?? 24)
-  const bottom = [...inputBox(ctx.editorText, width), ...footerLines(ctx, width)]
-  const spacer = Math.max(0, targetHeight - live.length - bottom.length)
-  if (spacer > 0) live.push(...Array.from({ length: spacer }, () => ''))
   live.push(...bottom)
   // Cursor home: the editor content row is 3 above the frame bottom (box
   // bottom + footer L1 + L2); `│ > ` puts the text at column 5.

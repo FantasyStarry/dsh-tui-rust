@@ -49,6 +49,9 @@ export class Renderer {
    * diff-tracked. A terminal-width change forces the same full repaint
    * (per-row diffs would land on stale columns).
    *
+   * The LAST frame row is written WITHOUT a trailing newline: a newline
+   * after a full-height frame would scroll the screen and silently drop the
+   * frame's top row (the chrome would drift upward one row per repaint).
    * `cursor` places the terminal cursor inside the frame (the input row) —
    * the painter would otherwise leave it parked on the bottom row.
    */
@@ -66,16 +69,13 @@ export class Renderer {
       for (const line of stream) {
         out.push(CLEAR_LINE, truncateToCells(line, width), '\r\n')
       }
-      for (const line of frame) {
-        out.push(CLEAR_LINE, line, '\r\n')
-      }
+      this.writeFrame(out, frame)
       // Clear whatever is left of the old region below the new frame — the
       // seal flush often SHRINKS the live region (previous turn's rows left),
       // and uncleared rows kept ghost copies of the chrome on screen.
       const written = stream.length + frame.length
       const stale = this.last.length - written
-      if (stale > 0) out.push(CLEAR_LINE, '\x1b[0J')
-      if (frame.length > 0) out.push('\x1b[1A')
+      this.clearStale(out, stale, frame.length)
       this.placeCursor(out, frame.length, cursor)
       this.stdout.write(out.join(''))
       this.last = [...frame]
@@ -103,14 +103,11 @@ export class Renderer {
     else if (move < 0) out.push(`\x1b[${-move}B`)
     out.push('\r')
 
-    for (let i = firstDiff; i < frame.length; i++) {
-      out.push(CLEAR_LINE, frame[i] ?? '', '\r\n')
-    }
+    this.writeFrame(out, frame, firstDiff)
     // Clear stale lines below the new frame (shrink case) and park the
     // cursor on the final input line.
     const stale = this.last.length - frame.length
-    if (stale > 0) out.push(CLEAR_LINE, '\x1b[0J')
-    if (frame.length > 0) out.push('\x1b[1A')
+    this.clearStale(out, stale, frame.length)
     this.placeCursor(out, frame.length, cursor)
     out.push(SYNC_END)
 
@@ -119,12 +116,34 @@ export class Renderer {
     this.lastWidth = width
   }
 
+  /** Frame rows from `from` (default 0); the last row gets NO trailing newline. */
+  private writeFrame(out: string[], frame: readonly string[], from = 0): void {
+    for (let i = from; i < frame.length; i++) {
+      out.push(CLEAR_LINE, frame[i] ?? '')
+      if (i < frame.length - 1) out.push('\r\n')
+    }
+  }
+
+  /**
+   * Clear `stale` leftover rows below the frame. The cursor sits at the end
+   * of the last frame row, so step down first — but only when a frame was
+   * actually written (an empty frame leaves the cursor on the first stale
+   * row already, and a `\r\n` there would skip one).
+   */
+  private clearStale(out: string[], stale: number, frameLength: number): void {
+    if (stale <= 0) return
+    if (frameLength > 0) out.push('\r\n')
+    out.push(CLEAR_LINE, '\x1b[0J')
+  }
+
   /** Move the cursor to its in-frame home (the input row) after painting. */
   private placeCursor(out: string[], frameLength: number, cursor?: CursorPlacement): void {
     if (!cursor || frameLength === 0) {
       this.cursorFromEnd = 0
       return
     }
+    // The cursor rests at the end of the LAST frame row (no trailing
+    // newline), so parking is exactly `fromEnd` rows up from there.
     const up = Math.max(0, Math.min(cursor.fromEnd, frameLength - 1))
     this.cursorFromEnd = up
     if (up > 0) out.push(`\x1b[${up}A`)
