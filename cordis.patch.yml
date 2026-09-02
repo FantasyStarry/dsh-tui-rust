@@ -19,14 +19,19 @@
 - insert:
     # Entry-level inject only; the plugin module's own code-level inject stays
     # empty so a stale patch cannot deadlock a composition lacking these
-    # services (#183 pattern from the dsh-TUI ecosystem spec). Without the
-    # rows Orca degrades gracefully instead of failing the boot.
+    # services (#183 pattern from the dsh-TUI ecosystem spec). Only list
+    # services Orca actually requires: `workspaceRegistry` is NOT loaded by
+    # every profile composition — injecting it left the plugin pending
+    # forever and failed the boot (dsh 0.1.1-rc.2, verified in-profile).
+    # Optional seams beyond `agents` are soft-probed and degrade silently.
     - id: orca
       name: 'dsh-orca'
-      inject: [workspaceRegistry, agents]
+      inject: [agents]
       config:
-        # LLM routing preset passed through to the agent factory.
-        provider: deepseek-official
+        # LLM route override; empty = the composition default
+        # (agentDefaultModel). provider+model must be set together.
+        provider: !!js process.env.ORCA_PROVIDER ?? ''
+        model: !!js process.env.ORCA_MODEL ?? ''
         # Alternate-screen fullscreen is the target experience; inline
         # (main screen, terminal-managed scrollback) is the skeleton default
         # until scroll/mouse/selection mature. Flip via ORCA_FULLSCREEN=1

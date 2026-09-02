@@ -61,12 +61,12 @@ dsh plugin --profile orca add <本包路径或 npm 包名>
 dsh --profile orca          # 或安装后直接 orca
 ```
 
-`ORCA_RESUME_SESSION=<id>` 恢复会话；`ORCA_FULLSCREEN=1` 切备用屏（骨架期默认 inline 主屏）。
+`ORCA_RESUME_SESSION=<id>` 恢复会话；`ORCA_PROVIDER`/`ORCA_MODEL` 成对覆盖模型路由（默认空 = 组合默认 `agentDefaultModel`，内核自身不会兜底缺省模型）；`ORCA_FULLSCREEN=1` 切备用屏（骨架期默认 inline 主屏）。
 
 ## 路线图
 
 - [x] **M0 骨架**：插件契约、cordis.patch.yml、差分渲染器、键盘、Channel 投影、假内核 dev harness
-- [ ] **M1 真内核闭环**：profile 挂载实测、agents 工厂真实 API 对齐（当前为类型镜像）、流式 delta 上屏
+- [x] **M1 真内核闭环**（实测验收 ✔）：agents 镜像对齐真实 API（dsh 0.1.1-rc.2：`AgentHandle{agent,dispose}`、`followup(UserMessage)`、`assistant/chunk` 流式信封）；profile 挂载实测（`link:` 挂载 + Standard Schema `Config` + `inject:[agents]` + loader 激活等待 + `agentDefaultModel` 默认模型接入 + 工厂注册竞态重试）；流式 delta 真终端上屏
 - [ ] **M2 视觉**：主题 token 系统、Markdown 渲染、工具卡三态、diff 视图
 - [ ] **M3 会话**：`/resume` 浏览器、会话标题、`/compact`、rewind（双击 Esc 时间回溯）
 - [ ] **M4 壳层**：权限审批面板、hooks、状态栏插槽、fullscreen 备用屏 + 鼠标选区

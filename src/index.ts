@@ -2,9 +2,18 @@
  * Orca — a self-owned in-process TUI front door for DeepSeek Harness.
  *
  * Cordis plugin contract (dsh-ecosystem-spec): the package root exports
- * exactly `name`, `Config`, `apply` — no default export. All config keys
- * carry defaults so a missing/misconfigured plugin degrades to "nothing
+ * exactly `name`, `Config`, `apply` — no default export. Every config key
+ * carries a default so a missing/misconfigured plugin degrades to "nothing
  * happened", never a failed boot.
+ *
+ * `Config` implements the Standard Schema v1 interface (`~standard.validate`)
+ * — that is what cordis's `resolveConfig` calls before starting the plugin
+ * (verified against @deepseek-ai/cordis 4.0.2, shipped with dsh
+ * v0.1.1-rc.2). A plain defaults table fails the boot with
+ * `Cannot read properties of undefined (reading 'validate')`. We implement
+ * the interface by hand instead of importing schemastery: zero extra
+ * runtime deps, and validation coerces wrong-typed keys back to defaults —
+ * the gentlest possible failure mode.
  */
 
 import { bootstrapApp } from './app.js'
@@ -13,25 +22,57 @@ import type { KernelContext } from './kernel/types.js'
 export const name = 'orca'
 
 export interface OrcaConfig {
-  /** LLM routing preset handed to the agent factory. */
+  /** LLM provider route override; empty = composition default (agentDefaultModel). */
   provider: string
+  /** Model id override; empty = composition default. Must be set with provider. */
+  model: string
   /** Alternate-screen fullscreen (target experience) vs inline main screen. */
   fullscreen: boolean
 }
 
-/**
- * Schema-lite default table. Once the package is mounted in a real profile
- * this becomes a Schemastery object (`@deepseek-ai/schemastery`, the same
- * schema system the kernel uses) — the shape of the exported `Config`
- * constant will not change.
- */
-export const Config: OrcaConfig = {
-  provider: 'deepseek-official',
+const DEFAULTS: OrcaConfig = {
+  provider: '',
+  model: '',
   fullscreen: false,
 }
 
+/** Minimal Standard Schema v1 types (https://standardschema.dev). */
+interface StandardIssue {
+  readonly message: string
+  readonly path?: readonly (string | number | symbol)[]
+}
+
+interface StandardResult {
+  readonly value?: unknown
+  readonly issues?: readonly StandardIssue[]
+}
+
+interface StandardSchema {
+  readonly '~standard': {
+    readonly version: 1
+    readonly vendor: string
+    readonly validate: (value: unknown) => StandardResult
+  }
+}
+
+function validateConfig(value: unknown): StandardResult {
+  const raw = typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
+  const provider = typeof raw['provider'] === 'string' ? raw['provider'] : DEFAULTS.provider
+  const model = typeof raw['model'] === 'string' ? raw['model'] : DEFAULTS.model
+  const fullscreen = typeof raw['fullscreen'] === 'boolean' ? raw['fullscreen'] : DEFAULTS.fullscreen
+  return { value: { provider, model, fullscreen } satisfies OrcaConfig }
+}
+
+export const Config: StandardSchema = {
+  '~standard': {
+    version: 1,
+    vendor: 'dsh-orca',
+    validate: validateConfig,
+  },
+}
+
 export function apply(ctx: KernelContext, config: Partial<OrcaConfig> = {}): void {
-  const resolved: OrcaConfig = { ...Config, ...config }
+  const resolved: OrcaConfig = { ...DEFAULTS, ...config }
 
   // The whole app tree hangs off one effect: plugin unload (hot reload,
   // profile teardown) unmounts the TUI, restores the terminal, disposes the
