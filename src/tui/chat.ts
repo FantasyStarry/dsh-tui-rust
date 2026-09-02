@@ -47,6 +47,8 @@ export interface ChatFrame {
   readonly stream: readonly string[]
   /** Open rows + input box + footer — diff-painted in place. */
   readonly live: readonly string[]
+  /** Where the terminal cursor belongs (inside the input box). */
+  readonly cursor: { readonly fromEnd: number; readonly col: number }
 }
 
 /** Hard cap for open-row lines in the live region (safety on tiny viewports). */
@@ -76,14 +78,19 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
 
   if (openLines.length > 0) live.push('', ...openLines)
   live.push('')
-  if (ctx.picker) {
-    live.push(...renderPicker(ctx.picker, width))
+  const pickerLines = ctx.picker ? renderPicker(ctx.picker, width) : []
+  if (pickerLines.length > 0) {
+    live.push(...pickerLines)
     live.push('')
   }
   live.push(...inputBox(ctx.editorText, width))
   live.push(theme.muted('Enter 发送 · /model 切换模型 · Esc 清空/取消 · Ctrl+C 退出'))
   live.push(footerLine(ctx.channel.runState, ctx.route, ctx.usage, width))
-  return { stream, live }
+  // Cursor home: inside the box, right after the typed text. Rows below the
+  // input row: box-bottom + hint + footer (plus the picker block above).
+  const pickerExtra = pickerLines.length > 0 ? pickerLines.length + 1 : 0
+  const cursor = { fromEnd: 3 + pickerExtra, col: 5 + stringWidth(ctx.editorText) }
+  return { stream, live, cursor }
 }
 
 /** One-time welcome card — the only banner orca ever prints. */

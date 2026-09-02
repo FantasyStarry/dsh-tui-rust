@@ -416,13 +416,18 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       picker,
     })
     stream.push(...frame.stream)
-    renderer.render(frame.live, stream)
+    renderer.render(frame.live, stream, frame.cursor)
     flushedSealed = Math.min(channel.sealedRowCount, channel.rows.length)
   }
 
   // ~30fps render tick; the diff painter collapses no-op frames to zero
   // writes, so a fixed tick is cheap even while idle.
   const tick = setInterval(render, 33)
+  // Own the screen: clear the viewport so orca starts from a clean slate
+  // (shell residue stays in scrollback, one scroll away). In fullscreen
+  // mode take the alternate buffer instead — the pre-orca screen is
+  // restored verbatim on exit.
+  stdout.write(config.fullscreen ? '\x1b[?1049h\x1b[2J\x1b[H' : '\x1b[2J\x1b[H')
   keyboard.start()
   void start()
 
@@ -432,6 +437,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     clearInterval(tick)
     keyboard.stop()
     renderer.dispose()
+    if (config.fullscreen) stdout.write('\x1b[?1049l')
     for (const disposeListener of listenerDisposers) disposeListener()
     void handle?.dispose()
   }

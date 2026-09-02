@@ -45,7 +45,7 @@ function paintScreen(writes: string[]): string[] {
   const screen: string[] = ['']
   let row = 0
   const stream = writes.join('')
-  const re = /\x1b\[\??[0-9]*([ABlJK])|\x1b\[\?2026[hl]|\r\n|\r/g
+  const re = /\x1b\[\??[0-9]*([ABlJK])|\x1b\[\??[0-9]*[HG]|\x1b\[\?2026[hl]|\r\n|\r/g
   let last = 0
   let match: RegExpExecArray | null
   const writeText = (text: string): void => {

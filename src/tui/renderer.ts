@@ -15,9 +15,17 @@ const SYNC_START = '\x1b[?2026h'
 const SYNC_END = '\x1b[?2026l'
 const CLEAR_LINE = '\x1b[2K'
 
+export interface CursorPlacement {
+  /** Rows above the bottom of the live frame (0 = last row). */
+  readonly fromEnd: number
+  /** 1-based column for the cursor (CHA). */
+  readonly col: number
+}
+
 export class Renderer {
   private last: string[] = []
   private lastRows = 0
+  private lastWidth = 0
 
   constructor(
     private readonly stdout: NodeJS.WriteStream,
@@ -32,14 +40,19 @@ export class Renderer {
    * then never tracked again — the overflow past the screen bottom scrolls
    * into the terminal's own scrollback. The live frame is fully repainted in
    * the same synchronized block, and afterwards only the live rows are
-   * diff-tracked.
+   * diff-tracked. A terminal-width change forces the same full repaint
+   * (per-row diffs would land on stale columns).
+   *
+   * `cursor` places the terminal cursor inside the frame (the input row) —
+   * the painter would otherwise leave it parked on the bottom row.
    */
-  render(live: readonly string[], stream: readonly string[] = []): void {
+  render(live: readonly string[], stream: readonly string[] = [], cursor?: CursorPlacement): void {
     const width = Math.max(1, this.getWidth())
     const frame = live.map((line) => truncateToCells(line, width))
-    if (stream.length === 0 && sameFrame(frame, this.last) && frame.length === this.last.length) return
+    const forceFull = stream.length > 0 || width !== this.lastWidth
+    if (!forceFull && sameFrame(frame, this.last) && frame.length === this.last.length) return
 
-    if (stream.length > 0) {
+    if (forceFull) {
       const out: string[] = [SYNC_START]
       const n = this.last.length
       if (n > 1) out.push(`\x1b[${n - 1}A`)
@@ -57,8 +70,10 @@ export class Renderer {
       const stale = n - written
       if (stale > 0) out.push(CLEAR_LINE, '\x1b[0J')
       if (frame.length > 0) out.push('\x1b[1A')
+      this.placeCursor(out, frame.length, cursor)
       this.stdout.write(out.join(''))
       this.last = [...frame]
+      this.lastWidth = width
       return
     }
 
@@ -91,12 +106,20 @@ export class Renderer {
     const stale = this.last.length - frame.length
     if (stale > 0) out.push(CLEAR_LINE, '\x1b[0J')
     if (frame.length > 0) out.push('\x1b[1A')
+    this.placeCursor(out, frame.length, cursor)
     out.push(SYNC_END)
 
     this.stdout.write(out.join(''))
     this.last = [...frame]
-    this.lastRows = frame.length
-    void this.lastRows
+    this.lastWidth = width
+  }
+
+  /** Move the cursor to its in-frame home (the input row) after painting. */
+  private placeCursor(out: string[], frameLength: number, cursor?: CursorPlacement): void {
+    if (!cursor || frameLength === 0) return
+    const up = Math.max(0, Math.min(cursor.fromEnd, frameLength - 1))
+    if (up > 0) out.push(`\x1b[${up}A`)
+    out.push(`\x1b[${Math.max(1, cursor.col)}G`)
   }
 
   /** Restore terminal state on teardown. */
