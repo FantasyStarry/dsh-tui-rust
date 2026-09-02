@@ -100,7 +100,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
 export function welcomeCard(cwd: string, width: number): string[] {
   void width
   return [
-    theme.strong('  orca') + theme.muted('  DeepSeek Harness 终端前端'),
+    theme.primary('✻ ') + theme.strong('orca') + theme.muted('  DeepSeek Harness 终端前端'),
     theme.muted('  ' + short(cwd)),
     '',
   ]
@@ -121,7 +121,7 @@ function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
   const wrapped = wrapWidth(row.text || '…', width - 2)
   switch (row.kind) {
     case 'user':
-      return [theme.strong('❯ ' + (wrapped[0] ?? '')), ...wrapped.slice(1).map(theme.muted)]
+      return [theme.primary('❯ ') + theme.strong(wrapped[0] ?? ''), ...wrapped.slice(1).map(theme.muted)]
     case 'assistant':
       // Markdown for the model's voice; the md layer owns indentation.
       return renderMarkdown(row.text || '…', Math.max(12, width - 2)).map((line, index) =>
@@ -176,7 +176,7 @@ function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
 function inputBox(text: string, width: number): string[] {
   const w = Math.max(20, width)
   const prompt = theme.primary('❯')
-  const body = text !== '' ? text : theme.muted('说点什么…')
+  const body = text !== '' ? text : theme.placeholder('说点什么…')
   return [truncateCells(` ${prompt} ${body}`, w)]
 }
 

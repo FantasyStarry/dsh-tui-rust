@@ -45,17 +45,19 @@ export function pickedItem(state: PickerState): PickerItem | undefined {
 
 /** Render the picker as an overlay block (already themed). */
 export function renderPicker(state: PickerState, width: number): string[] {
-  const lines: string[] = [theme.border(`╭─ ${theme.accent(state.title)}`)]
+  const lines: string[] = [theme.border('╭─ ') + theme.accent(state.title)]
   const from = Math.max(0, state.index - 8)
   const visible = state.items.slice(from, from + 17)
   for (let i = 0; i < visible.length; i++) {
     const item = visible[i]
     if (!item) continue
     const actual = from + i
-    const cursor = actual === state.index ? '❯ ' : '  '
+    const isSelected = actual === state.index
+    const cursor = isSelected ? theme.primary('❯ ') : '  '
+    const label = isSelected ? theme.strong(item.label) : item.label
     const hint = item.hint ? theme.muted(` — ${item.hint}`) : ''
-    const body = `${cursor}${item.label}${hint}`
-    lines.push(truncateWidth(actual === state.index ? theme.selected(body) : body, Math.max(8, width - 2)))
+    const body = `${cursor}${label}${hint}`
+    lines.push(truncateWidth(body, Math.max(8, width - 2)))
   }
   lines.push(theme.border('╰─') + theme.muted(' ↑/↓ 选择 · Enter 确认 · Esc 取消'))
   return lines

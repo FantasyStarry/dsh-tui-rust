@@ -427,7 +427,7 @@ async function main(): Promise<void> {
   if (!painted2.includes('⏺ edit src/app.ts')) problems.push('phase2：工具 diff 卡头未渲染')
   if (!painted2.includes('+ const a = 2') || !painted2.includes('- const a = 1')) problems.push('phase2：diff 增删行未着色渲染')
   if (!painted2.includes('+ const b = 3')) problems.push('phase2：diff 新增行缺失')
-  if (!painted2.includes('  orca')) problems.push('phase2：欢迎区缺失')
+  if (!painted2.includes('✻ orca')) problems.push('phase2：欢迎区缺失')
   if (!painted2.includes('↳ 模型 default-provider/default-model')) problems.push('phase2：路由线未打印')
   if (!painted2.includes('default-provider/default-model')) problems.push('phase2：页脚未显示 request/header 路由')
   if (!painted2.includes('↑120') || !painted2.includes('↓45')) problems.push('phase2：token 用量未上屏')

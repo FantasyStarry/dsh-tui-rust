@@ -29,7 +29,7 @@ export function inlineSpans(text: string): readonly Span[] {
     last = re.lastIndex
     if (match[2] !== undefined) {
       flush()
-      spans.push({ text: match[2], paint: theme.accent })
+      spans.push({ text: match[2], paint: theme.code })
     } else if (match[4] !== undefined) {
       flush()
       spans.push({ text: match[4], paint: theme.strong })
@@ -83,8 +83,11 @@ export function renderMarkdown(text: string, width: number): string[] {
     if (heading) {
       const level = (heading[1] ?? '#').length
       const body = inlineSpans(heading[2] ?? '')
-      const mark = level <= 2 ? '■ ' : '▪ '
-      for (const line of wrapSpans([{ text: mark, paint: theme.accent }, ...body], width)) {
+      const top = level <= 2
+      const mark = top ? '■ ' : '▪ '
+      const markPaint = top ? theme.primary : theme.accent
+      const styled = top ? [{ text: mark, paint: markPaint }, ...body.map((span) => ({ ...span, paint: span.paint ?? theme.strong }))] : [{ text: mark, paint: markPaint }, ...body]
+      for (const line of wrapSpans(styled, width)) {
         lines.push(line)
       }
       continue
