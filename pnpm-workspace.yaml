@@ -1,0 +1,4 @@
+# esbuild 的 postinstall 只做平台二进制校验；二进制经 optionalDependencies
+# (@esbuild/win32-x64) 分发，脚本被忽略不影响 tsx 使用。
+allowBuilds:
+  esbuild: false
