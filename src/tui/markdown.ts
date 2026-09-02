@@ -7,6 +7,7 @@
  */
 
 import { highlightCodeLine, normalizeLang } from './highlight.js'
+import { boxed, type BoxStyle } from './box.js'
 import { renderSpans, wrapSpans, type Span } from './span.js'
 import { theme } from './theme.js'
 
@@ -58,6 +59,13 @@ export function renderMarkdown(text: string, width: number): string[] {
   const source = text.split('\n')
   let inFence = false
   let fenceLang = ''
+  let fenceLines: string[] = []
+
+  const flushFence = (): void => {
+    const label = fenceLang === '' ? 'code' : fenceLang
+    const style: BoxStyle = { bg: theme.codeBg, border: theme.code, title: label, titlePaint: theme.code }
+    lines.push(...boxed(fenceLines, width, style))
+  }
 
   for (const raw of source) {
     const fenceMatch = /^\s*```(.*)$/.exec(raw)
@@ -65,17 +73,16 @@ export function renderMarkdown(text: string, width: number): string[] {
       if (!inFence) {
         inFence = true
         fenceLang = normalizeLang(fenceMatch[1] ?? '')
-        const label = fenceLang === '' ? 'code' : fenceLang
-        lines.push(theme.code(`╭─ ${label} ` + '─'.repeat(10)))
+        fenceLines = []
       } else {
         inFence = false
-        lines.push(theme.code('╰' + '─'.repeat(14)))
+        flushFence()
       }
       continue
     }
     if (inFence) {
       const spans = highlightCodeLine(raw, fenceLang)
-      lines.push(theme.code('│ ') + renderSpans(spans, width - 4))
+      fenceLines.push(renderSpans(spans, Math.max(4, width - 4)))
       continue
     }
 
@@ -139,6 +146,6 @@ export function renderMarkdown(text: string, width: number): string[] {
       lines.push(line)
     }
   }
-  if (inFence) lines.push(theme.code('╰' + '─'.repeat(14)))
+  if (inFence) flushFence()
   return lines
 }

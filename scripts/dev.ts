@@ -38,8 +38,8 @@ const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setT
  * Minimal terminal emulator for the renderer contract: replays the write
  * stream (cursor up/down, clear-line, clear-to-end, newline) onto a screen
  * buffer so tests can assert the VISIBLE frame, not just that bytes moved.
- * SGR/color pairs and the CSI-2026 sync pair pass through as no-ops; use
- * plain-text frames when asserting screen content.
+ * SGR color pairs are STRIPPED here (assertions target visible text, never
+ * raw escape boundaries), and the CSI-2026 sync pair pass through as no-ops.
  */
 function paintScreen(writes: string[]): string[] {
   const screen: string[] = ['']
@@ -49,8 +49,9 @@ function paintScreen(writes: string[]): string[] {
   let last = 0
   let match: RegExpExecArray | null
   const writeText = (text: string): void => {
+    const plain = text.replace(/\x1b\[[0-9;?]*[@-~]/g, '')
     while (screen.length <= row) screen.push('')
-    screen[row] += text
+    screen[row] += plain
   }
   while ((match = re.exec(stream)) !== null) {
     writeText(stream.slice(last, match.index))
@@ -87,6 +88,11 @@ function makeStdout(writes: string[]): NodeJS.WriteStream {
       return true
     },
   } as unknown as NodeJS.WriteStream
+}
+
+/** Remove CSI sequences (SGR + cursor moves) so assertions read visible text. */
+function stripSgr(text: string): string {
+  return text.replace(/\x1b\[[0-9;?]*[@-~]/g, '')
 }
 
 /** Fake TTY stdin: keypress events are emitted directly by the harness. */
@@ -348,8 +354,9 @@ async function main(): Promise<void> {
   await sleep(150)
   dispose1()
   const painted1 = writes1.join('')
+  const visible1 = stripSgr(painted1)
   if (writes1.length === 0) problems.push('phase1：没有帧写入')
-  if (!painted1.includes('agents` 未挂载')) problems.push('phase1：降级启动提示缺失')
+  if (!visible1.includes('agents` 未挂载')) problems.push('phase1：降级启动提示缺失')
 
   // ── Phase 2: mounted fake kernel, real contract, real keyboard drive ────
   const writes2: string[] = []
@@ -367,7 +374,7 @@ async function main(): Promise<void> {
   for (const ch of '帮我看看') stdin2.text(ch)
   stdin2.key('return')
   await sleep(850) // the scripted turn streams through (incl. usage @560ms)
-  if (!writes2.join('').includes('思考中')) problems.push('phase2：思考中状态未上屏')
+  if (!stripSgr(writes2.join('')).includes('思考中')) problems.push('phase2：思考中状态未上屏')
 
   // Type + backspace WITHOUT submitting: the chrome must stay a single copy.
   // Regression guard for cursor-accounted repaints — when the painter forgot
@@ -412,28 +419,29 @@ async function main(): Promise<void> {
   await sleep(20) // handle.dispose() settles
 
   const painted2 = writes2.join('')
+  const visible2 = stripSgr(painted2)
   const record = kernel2.record
   if (writes2.length === 0) problems.push('phase2：没有帧写入')
-  if (painted2.includes('agent 启动失败')) problems.push('phase2：工厂未就绪竞态未被重试吸收')
-  if (!painted2.includes('session 已连接')) problems.push('phase2：session 连接提示缺失')
-  if (!painted2.includes('帮我看看')) problems.push('phase2：user/message 未投影（session 非真源）')
-  if (!painted2.includes('你好，Orca。')) problems.push('phase2：assistant 流式转录缺失')
-  if (!painted2.includes('流式增量上屏测试。')) problems.push('phase2：增量 chunk 未并入同一行')
-  if (!painted2.includes('• 列表一') || !painted2.includes('• 列表二')) problems.push('phase2：markdown 列表未渲染')
-  if (!painted2.includes('╭─ ts ')) problems.push('phase2：围栏代码块未渲染')
-  if (!painted2.includes('const n = 1')) problems.push('phase2：代码行未渲染')
-  if (!painted2.includes('思考一下。')) problems.push('phase2：reasoning-delta 未进思考行')
-  if (!/已思考 \d+(\.\d+)?s/.test(painted2)) problems.push('phase2：思考块未折叠为时长摘要')
-  if (!painted2.includes('⏺ edit src/app.ts')) problems.push('phase2：工具 diff 卡头未渲染')
-  if (!painted2.includes('+ const a = 2') || !painted2.includes('- const a = 1')) problems.push('phase2：diff 增删行未着色渲染')
-  if (!painted2.includes('+ const b = 3')) problems.push('phase2：diff 新增行缺失')
-  if (!painted2.includes('✻ orca')) problems.push('phase2：欢迎区缺失')
-  if (!painted2.includes('↳ 模型 default-provider/default-model')) problems.push('phase2：路由线未打印')
-  if (!painted2.includes('default-provider/default-model')) problems.push('phase2：页脚未显示 request/header 路由')
-  if (!painted2.includes('↑120') || !painted2.includes('↓45')) problems.push('phase2：token 用量未上屏')
-  if (!painted2.includes('就绪')) problems.push('phase2：turn/end 后状态未回就绪')
+  if (visible2.includes('agent 启动失败')) problems.push('phase2：工厂未就绪竞态未被重试吸收')
+  if (!visible2.includes('session 已连接')) problems.push('phase2：session 连接提示缺失')
+  if (!visible2.includes('帮我看看')) problems.push('phase2：user/message 未投影（session 非真源）')
+  if (!visible2.includes('你好，Orca。')) problems.push('phase2：assistant 流式转录缺失')
+  if (!visible2.includes('流式增量上屏测试。')) problems.push('phase2：增量 chunk 未并入同一行')
+  if (!visible2.includes('• 列表一') || !visible2.includes('• 列表二')) problems.push('phase2：markdown 列表未渲染')
+  if (!visible2.includes('╭─ ts ')) problems.push('phase2：围栏代码块未渲染')
+  if (!visible2.includes('const n = 1')) problems.push('phase2：代码行未渲染')
+  if (!visible2.includes('思考一下。')) problems.push('phase2：reasoning-delta 未进思考行')
+  if (!/已思考 \d+(\.\d+)?s/.test(visible2)) problems.push('phase2：思考块未折叠为时长摘要')
+  if (!visible2.includes('⏺ edit src/app.ts')) problems.push('phase2：工具 diff 卡头未渲染')
+  if (!visible2.includes('+ const a = 2') || !visible2.includes('- const a = 1')) problems.push('phase2：diff 增删行未着色渲染')
+  if (!visible2.includes('+ const b = 3')) problems.push('phase2：diff 新增行缺失')
+  if (!visible2.includes('✦ orca')) problems.push('phase2：欢迎区缺失')
+  if (!visible2.includes('↳ 模型 default-provider/default-model')) problems.push('phase2：路由线未打印')
+  if (!visible2.includes('default-provider/default-model')) problems.push('phase2：页脚未显示 request/header 路由')
+  if (!visible2.includes('↑120') || !visible2.includes('↓45')) problems.push('phase2：token 用量未上屏')
+  if (!visible2.includes('就绪')) problems.push('phase2：turn/end 后状态未回就绪')
   for (const expect of ['选择 Provider', '选择模型（fake-a）', '选择思考强度（fake-a-m1）', '模型已切换：fake-a/fake-a-m1(low)']) {
-    if (!painted2.includes(expect)) problems.push(`phase2：/model 流程缺少「${expect}」`)
+    if (!visible2.includes(expect)) problems.push(`phase2：/model 流程缺少「${expect}」`)
   }
   if (record.selectionSaved?.provider !== 'fake-a' || record.selectionSaved.model !== 'fake-a-m1' || record.selectionSaved.reasoningEffort !== 'low') {
     problems.push('phase2：saveSelection 未持久化选择')
@@ -474,7 +482,7 @@ async function main(): Promise<void> {
   if (promptRow === undefined) {
     problems.push(`phase2：输入行不完整：${JSON.stringify(rows2.slice(-8))}`)
   }
-  if (!rows2.includes(hint)) problems.push(`phase2：提示行缺失或不唯一：${JSON.stringify(tail)}`)
+  if (!rows2.some((row) => row.includes(hint))) problems.push(`phase2：提示行缺失或不唯一：${JSON.stringify(tail)}`)
   // The q1 submit opened the second turn — the footer is mid-turn here.
   const footerRow = rows2.find((row) => row.includes('◐ 思考中…'))
   if (footerRow === undefined) problems.push(`phase2：页脚缺失或状态不符：${JSON.stringify(tail)}`)

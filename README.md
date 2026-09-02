@@ -69,6 +69,7 @@ dsh --profile orca          # 或安装后直接 orca
 - [x] **M1 真内核闭环**（实测验收 ✔）：agents 镜像对齐真实 API（dsh 0.1.1-rc.2：`AgentHandle{agent,dispose}`、`followup(UserMessage)`、`assistant/chunk` 流式信封）；profile 挂载实测（`link:` 挂载 + Standard Schema `Config` + `inject:[agents]` + loader 激活等待 + `agentDefaultModel` 默认模型接入 + 工厂注册竞态重试）；流式 delta 真终端上屏
 - [x] **M2a 可用性**（实测验收 ✔：PTY 端到端 + 假内核契约冒烟）：主题 token 骨架（`NO_COLOR` 可降级）；状态栏显示当前 route/model/思考强度与 token 用量（取自 `request/header` 与 `assistant/message.usage`）；思考块折叠 + 思考中计时；`/model` 三段选择器（provider → model → 思考强度），经 `agent/request` waterfall 运行中热切换、`agentDefaultModel.saveSelection` 尽力持久化
 - [x] **M2b 视觉**（代码就绪，待真终端验收）：scrollback 封存（流/活动区分帧，已定稿行写入终端原生滚动缓冲）；Markdown 渲染（标题/列表/引用/行内样式/围栏代码块）；轻量代码高亮（js/ts/json/py/bash/yaml）；工具卡三态 + write/edit 结果的 diff 卡（增删行着色，来自 `tool/result.meta.diffs`）
+- [x] **M2c 视觉改版**（分层卡片语言）：用户消息暖色全宽气泡、助手连续 teal 左栏、代码块全宽深底卡片、工具卡背景面板 + 状态色头部（`⏺` + 增删计数）、思考旋转动画；顶部 chrome 状态条（brand · session · cwd）、标题化盒式输入框（提示嵌底边）、状态栏式页脚（状态 · 路由 · token 用量）；主题 token 扩至 21 个（19 fg/bg 语义色 + 2 边框），精确 SGR 复位支持嵌套背景填充，`NO_COLOR`/256 色降级保留
 - [ ] **M3 会话**：`/resume` 浏览器、会话标题、`/compact`、rewind（双击 Esc 时间回溯）
 - [ ] **M4 壳层**：权限审批面板、hooks、状态栏插槽、fullscreen 备用屏 + 鼠标选区
 

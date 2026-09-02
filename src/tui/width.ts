@@ -79,7 +79,7 @@ export function truncateWidth(text: string, max: number, tail = ''): string {
     used += w
     if (code > 0xffff) i++
   }
-  return out + (clipped && hadEscape ? '\x1b[0m' : '') + tail
+  return out + (clipped && hadEscape ? '\x1b[39m\x1b[22m\x1b[23m' : '') + tail
 }
 
 /** Return the final index of a CSI escape sequence, or -1 for plain ESC. */

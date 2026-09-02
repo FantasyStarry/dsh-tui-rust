@@ -23,29 +23,31 @@ export function spansWidth(spans: readonly Span[]): number {
 
 /** Render spans to one line (no wrapping — clip with an ellipsis tail). */
 export function renderSpans(spans: readonly Span[], width: number, ellipsis = '…'): string {
+  // Fast path: everything fits — paint each span as one unit.
+  if (spansWidth(spans) <= width) {
+    let out = ''
+    for (const span of spans) {
+      out += span.paint ? span.paint(span.text) : span.text
+    }
+    return out
+  }
+  // Clip path: emit chars (per-char paints stay balanced) up to the budget,
+  // then a precise fg/bold/italic reset so no style leaks past the ellipsis —
+  // and crucially no background reset, so a surrounding card fill survives.
+  const tailW = charWidth(ellipsis.codePointAt(0) ?? 0)
+  const budget = Math.max(0, width - tailW)
   let out = ''
   let used = 0
-  let clipped = false
-  for (const span of spans) {
+  outer: for (const span of spans) {
+    const paint = span.paint
     for (const ch of span.text) {
       const w = charWidth(ch.codePointAt(0) ?? 0)
-      if (used + w > width) {
-        clipped = true
-        break
-      }
-      out += ch
+      if (used + w > budget) break outer
+      out += paint ? paint(ch) : ch
       used += w
     }
-    if (clipped) break
   }
-  if (!clipped) return out
-  const tailWidth = charWidth(ellipsis.codePointAt(0) ?? 0)
-  while (used + tailWidth > width) {
-    const dropped = [...out].pop() ?? ''
-    out = out.slice(0, out.length - dropped.length)
-    used -= charWidth(dropped.codePointAt(0) ?? 0)
-  }
-  return out + ellipsis
+  return out + '\x1b[39m\x1b[22m\x1b[23m' + ellipsis
 }
 
 /** Word-wrap styled spans to `width` cells with a fixed leading `indent`. */
