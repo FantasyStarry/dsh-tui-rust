@@ -120,7 +120,7 @@ export function renderMarkdown(text: string, width: number): string[] {
       const depth = Math.floor((bullet[1]?.length ?? 0) / 2)
       const indent = '  '.repeat(depth)
       const body = inlineSpans(bullet[2] ?? '')
-      for (const line of wrapSpans([{ text: '• ', paint: theme.accent }, ...body], width, indent)) {
+      for (const line of wrapSpans([{ text: '• ', paint: theme.text }, ...body], width, indent)) {
         lines.push(line)
       }
       continue

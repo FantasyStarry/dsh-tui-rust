@@ -5,25 +5,30 @@
  * render tick, never mutating inputs. All color goes through the theme
  * tokens; the frame never embeds raw SGR itself.
  *
- * Visual language (layered card school — pi / Claude Code / kimi-code):
- * a persistent chrome strip on top (brand · cwd · session) and a boxed
- * input + status-bar footer pinned at the bottom; user prompts render as
- * warm full-width bubbles, assistant voice carries a continuous teal left
- * bar with full-width code cards, tool runs as backgrounded cards with
- * status-colored headers, thinking as a spinning live row.
+ * Visual language — the kimi-code school (MoonshotAI/kimi-code:
+ * `src/tui/components/messages`, `components/editor`, `components/chrome`,
+ * `constant/symbols.ts`, `constant/rendering.ts`):
+ * - user prompts: `✨` amber bold role bullet, no bubble;
+ * - assistant voice: `● ` body-color bullet + markdown (code as cards);
+ * - thinking: braille spinner + dim italic preview, sealed to `● 已思考 Ns`;
+ * - tool runs: backgrounded cards, `⠋`/`✓ `/`✗ ` status marks in the frame;
+ * - chrome: a boxed `> ` prompt editor (primary border), a two-line plain
+ *   status footer (no fill), a boxed welcome card with info rows;
+ * - a 1-cell chrome gutter lines transcript/panels up with the editor
+ *   interior (kimi CHROME_GUTTER); the editor spans the full width.
  *
  * Frame split (the scrollback-sealing contract, ADR-0001):
  * - `stream` — newly sealed transcript rows (final, immutable) plus the
  *   welcome card / route lines when due. Written once at the top of the
  *   tracked region; overflow scrolls into the terminal's native scrollback.
- * - `live` — persistent chrome + open rows of the current turn + input box
- *   + footer. Diffed in place every tick.
+ * - `live` — open rows of the current turn + editor box + footer. Diffed
+ *   in place every tick.
  */
 
 import type { AgentRunState, Channel, SessionRoute, SessionUsage, TranscriptRow } from '../adapter/channel.js'
 import { renderMarkdown } from './markdown.js'
 import { renderPicker, type PickerState } from './picker.js'
-import { boxed, type BoxStyle } from './box.js'
+import { boxed, boxLine, boxTop, boxBottom, type BoxStyle } from './box.js'
 import { theme } from './theme.js'
 import { stringWidth, truncateWidth, wrapWidth } from './width.js'
 
@@ -49,69 +54,88 @@ export interface FrameContext {
 export interface ChatFrame {
   /** Newly sealed lines + one-time cards — written once, never repainted. */
   readonly stream: readonly string[]
-  /** Persistent chrome + open rows + input box + footer — diff-painted. */
+  /** Open rows + editor box + footer — diff-painted in place. */
   readonly live: readonly string[]
-  /** Where the terminal cursor belongs (inside the input box). */
+  /** Where the terminal cursor belongs (inside the editor box). */
   readonly cursor: { readonly fromEnd: number; readonly col: number }
 }
 
 /** Hard cap for open-row lines in the live region (safety on tiny viewports). */
 const MAX_OPEN_LINES = 120
 
-/** Bottom-border hint, reused verbatim by the welcome card rules. */
 const HINT = 'Enter 发送  ·  /model 模型  ·  Esc 取消  ·  Ctrl+C 退出'
 
-/** Thinking spinner frames (single-cell quarter-circle pie). */
-const SPIN = ['◐', '◓', '◑', '◒']
+/** kimi symbols.ts: role bullets, status marks; `✨` carries VS16 so both our
+ *  cell math (1+1) and real emoji rendering (2 cells) agree on 3. */
+const USER_BULLET = '✨\uFE0F '
+const STATUS_BULLET = '● '
+const SUCCESS_MARK = '✓ '
+const FAILURE_MARK = '✗ '
+const MESSAGE_INDENT = '  '
+
+/** kimi rendering.ts BRAILLE_SPINNER_FRAMES (80ms per frame). */
+const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 export function buildFrame(ctx: FrameContext): ChatFrame {
   const width = Math.max(20, ctx.width)
   const stream: string[] = []
   const live: string[] = []
+  // Content area: transcript + panels sit inside a 1-cell chrome gutter
+  // (kimi CHROME_GUTTER) so their left edge aligns with the editor interior;
+  // the editor box and welcome card span the full width.
+  const inner = Math.max(18, width - 2)
+  const gutter = (line: string): string => (line === '' ? '' : ' ' + line + ' ')
 
   // Newly sealed transcript rows → written once into scrollback.
   const sealedTo = Math.min(ctx.channel.sealedRowCount, ctx.channel.rows.length)
   for (const row of ctx.channel.rows.slice(ctx.sealedFrom, sealedTo)) {
-    stream.push(...renderRow(row, ctx), '')
+    stream.push(...renderRow(row, ctx, inner).map(gutter))
   }
 
-  // Live region: persistent chrome + open rows of the current turn.
-  live.push(topBar(ctx, width))
+  // Live region: open rows of the current turn + the bottom chrome.
   const openRows = ctx.channel.rows.slice(sealedTo)
   let openLines: string[] = []
   for (const row of openRows) {
-    openLines.push(...renderRow(row, ctx), '')
+    openLines.push(...renderRow(row, ctx, inner).map(gutter))
   }
   if (openLines.length > MAX_OPEN_LINES) {
     const dropped = openLines.length - MAX_OPEN_LINES
     openLines = [theme.muted(`… 本回合前 ${dropped} 行暂省（回合结束后进历史）`), ...openLines.slice(-MAX_OPEN_LINES)]
   }
-  if (openLines.length > 0) live.push('', ...openLines)
+  live.push(...openLines)
 
-  const pickerLines = ctx.picker ? renderPicker(ctx.picker, width) : []
+  const pickerLines = ctx.picker ? renderPicker(ctx.picker, inner).map(gutter) : []
   if (pickerLines.length > 0) {
     live.push(...pickerLines)
     live.push('')
   }
 
-  const inputLines = inputBox(ctx.editorText, width)
-  const footer = footerLine(ctx.channel.runState, ctx.route, ctx.usage, width)
   const targetHeight = Math.max(8, ctx.height ?? 24)
-  const spacer = Math.max(0, targetHeight - live.length - inputLines.length - 1)
+  const bottom = [...inputBox(ctx.editorText, width), ...footerLines(ctx, width)]
+  const spacer = Math.max(0, targetHeight - live.length - bottom.length)
   if (spacer > 0) live.push(...Array.from({ length: spacer }, () => ''))
-  live.push(...inputLines)
-  live.push(footer)
-  // Cursor home: the input content row is 2 above the frame bottom
-  // (hint border + footer below it); the `❯ ` prompt sits at col 3.
-  const cursor = { fromEnd: 2, col: 5 + stringWidth(ctx.editorText) }
+  live.push(...bottom)
+  // Cursor home: the editor content row is 3 above the frame bottom (box
+  // bottom + footer L1 + L2); `│ > ` puts the text at column 5.
+  const cursor = { fromEnd: bottom.length - 2, col: 5 + stringWidth(ctx.editorText) }
   return { stream, live, cursor }
 }
 
-/** One-time welcome block — a splash card; the transcript stays primary. */
-export function welcomeCard(cwd: string, width: number): string[] {
-  const style: BoxStyle = { bg: theme.chrome, border: theme.chromeBorder, title: '✦ orca', titlePaint: theme.primary }
-  const content = [theme.muted('DeepSeek Harness 终端前端'), theme.subtle(short(cwd))]
-  return [...boxed(content, width, style), '']
+/** One-time welcome block — kimi-style box with info rows; brand wordmark. */
+export function welcomeCard(cwd: string, sessionId: string | null, model: string | null, width: number): string[] {
+  const style: BoxStyle = { bg: (t) => t, border: theme.primary }
+  const logo = ['▝▀▀▀▜', '▐▄▄▄▌'] as const
+  const logoW = 5
+  const gap = '  '
+  const row0 = theme.primary(logo[0].padEnd(logoW)) + gap + theme.title('✦ orca')
+  const row1 = theme.primary(logo[1].padEnd(logoW)) + gap + theme.subtle('DeepSeek Harness 终端前端')
+  const label = (text: string): string => theme.strong(theme.subtle(text))
+  const info = [
+    label('Directory:') + '  ' + short(cwd),
+    label('Session:') + '    ' + (sessionId ? shortSession(sessionId) : '—'),
+    label('Model:') + '      ' + (model ?? theme.warn('未设置')),
+  ]
+  return ['', ...boxed(['', row0, row1, '', ...info, ''], width, style), '']
 }
 
 /** Slim in-stream line announcing the active route (on connect / change). */
@@ -124,69 +148,59 @@ export function routeKey(route: SessionRoute): string {
   return `${route.provider}/${route.model}/${route.reasoningEffort ?? ''}`
 }
 
-function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
-  const width = Math.max(20, ctx.width)
+function renderRow(row: TranscriptRow, ctx: FrameContext, width: number): string[] {
   switch (row.kind) {
     case 'user':
-      return userBubble(row.text || '…', width)
+      return userLines(row.text || '…', width)
     case 'assistant':
-      return assistantBlock(row.text || '…', width)
+      return assistantLines(row.text || '…', width)
     case 'thought':
       return thoughtLines(row, ctx, width)
     case 'tool':
       return toolCard(row, width)
     case 'system':
-      return systemLines(row.text || '…', width)
+      return ['', ...wrapWidth(row.text || '…', Math.max(8, width - 2)).map((line) => theme.muted(MESSAGE_INDENT + line))]
   }
 }
 
-/** User prompt: warm full-width bubble, coral `❯`, first line bold. */
-function userBubble(text: string, width: number): string[] {
-  const inner = Math.max(8, width - 6)
+/** User prompt: `✨ ` amber bold role bullet; continuation aligns under it. */
+function userLines(text: string, width: number): string[] {
+  const bulletW = stringWidth(USER_BULLET)
+  const inner = Math.max(8, width - bulletW)
   const wrapped = wrapWidth(text || '…', inner)
-  const style: BoxStyle = { bg: theme.bubble, border: theme.bubbleBorder }
-  const content = wrapped.map((line, index) =>
-    index === 0 ? theme.primary('❯ ') + theme.strong(line) : theme.muted(line),
-  )
-  return boxed(content, width, style)
+  return ['', ...wrapped.map((line, index) =>
+    index === 0 ? theme.roleUser(USER_BULLET) + theme.roleUser(line) : ' '.repeat(bulletW) + theme.roleUser(line),
+  )]
 }
 
-/** Assistant voice: continuous teal left bar + markdown (code as cards). */
-function assistantBlock(text: string, width: number): string[] {
+/** Assistant voice: `● ` body bullet + markdown; continuation indents. */
+function assistantLines(text: string, width: number): string[] {
   const inner = Math.max(10, width - 2)
   const md = renderMarkdown(text || '…', inner)
-  const bar = theme.accent('│ ')
-  return md.map((line) => (line === '' ? '' : bar + line))
+  return ['', ...md.map((line, index) => (index === 0 ? theme.text(STATUS_BULLET) + line : MESSAGE_INDENT + line))]
 }
 
 function thoughtLines(row: TranscriptRow, ctx: FrameContext, width: number): string[] {
   // Sealed: one collapsed summary line (full text stays in the session log).
   if (row.seconds !== undefined) {
-    return [theme.live('  ✻ ') + theme.muted(`已思考 ${row.seconds}s`)]
+    return ['', theme.subtle(STATUS_BULLET) + theme.placeholder(`已思考 ${row.seconds}s`)]
   }
-  // Streaming: spinning timer + the last two wrapped lines as a preview.
+  // Streaming: spinner + timer, then the last two wrapped lines as a preview.
   const elapsed = row.startMs !== undefined ? Math.round((ctx.now - row.startMs) / 100) / 10 : 0
-  const tick = row.startMs !== undefined ? Math.floor((ctx.now - row.startMs) / 120) % SPIN.length : 0
-  const head = theme.live(`  ${SPIN[tick] ?? '◐'} 思考中 ${elapsed}s`)
-  const wrapped = wrapWidth(row.text || '', Math.max(8, width - 6))
-  const tail = wrapped.slice(-2).map((line) => theme.subtle('  ⋯ ' + line))
-  return [head, ...tail]
+  const tick = row.startMs !== undefined ? Math.floor((ctx.now - row.startMs) / 80) % SPIN.length : 0
+  const head = theme.subtle(`${SPIN[tick] ?? SPIN[0]} 思考中 ${elapsed}s`)
+  const wrapped = wrapWidth(row.text || '', Math.max(8, width - 4))
+  const tail = wrapped.slice(-2).map((line) => theme.placeholder(MESSAGE_INDENT + '⋯ ' + line))
+  return ['', head, ...tail]
 }
 
-/** Tool run: backgrounded card; status-colored marker + counts in the frame. */
+/** Tool run: backgrounded card; status mark + counts in the frame. */
 function toolCard(row: TranscriptRow, width: number): string[] {
   const name = row.tool ?? 'tool'
-  const mark =
-    row.status === 'running'
-      ? theme.primary('⏺')
-      : row.status === 'ok'
-        ? theme.ok('⏺')
-        : row.status === 'failed'
-          ? theme.fail('⏺')
-          : theme.muted('⏺')
   const style: BoxStyle = { bg: theme.panel, border: theme.panelBorder }
   if (row.diff) {
-    const title = mark + ' ' + theme.strong(`${name} ${row.diff.path}`)
+    const mark = row.status === 'failed' ? theme.fail(FAILURE_MARK) : theme.ok(SUCCESS_MARK)
+    const title = mark + theme.strong(`${name} ${row.diff.path}`)
     const right =
       `${row.diff.added > 0 ? theme.ok(`+${row.diff.added}`) : ''}` +
       `${row.diff.removed > 0 ? ' ' + theme.fail(`−${row.diff.removed}`) : ''}`
@@ -197,61 +211,64 @@ function toolCard(row: TranscriptRow, width: number): string[] {
       else if (line.kind === 'del') content.push(theme.fail('- ' + text))
       else content.push(theme.subtle('· ' + text))
     }
-    return boxed(content, width, { ...style, title }, { right })
+    return ['', ...boxed(content, width, { ...style, title }, { right })]
   }
-  const suffix = row.status === 'running' ? theme.muted(' …') : ''
-  const title = mark + ' ' + theme.strong(name) + suffix
+  const mark =
+    row.status === 'running' ? theme.primary('⠋') : row.status === 'failed' ? theme.fail(FAILURE_MARK) : theme.ok(SUCCESS_MARK)
+  const suffix = row.status === 'running' ? theme.subtle(' …') : ''
+  const title = mark + theme.strong(name) + suffix
   const wrapped = wrapWidth(row.text || '', Math.max(8, width - 8))
   const content = wrapped.slice(0, 3).map((line) => theme.subtle(line))
-  return boxed(content, width, { ...style, title })
+  return ['', ...boxed(content, width, { ...style, title })]
 }
 
-function systemLines(text: string, width: number): string[] {
-  const wrapped = wrapWidth(text, Math.max(8, width - 4))
-  return wrapped.map((line) => theme.accent('· ') + theme.muted(line))
+function wrappedLines(text: string, width: number): string[] {
+  return wrapWidth(text, width)
 }
 
-/** Persistent top strip: brand · session · cwd on a chrome fill. */
-function topBar(ctx: FrameContext, width: number): string {
-  const brand = theme.strong('✦ orca')
-  const session = ctx.sessionId ? theme.subtle(shortSession(ctx.sessionId)) : ''
-  const cwd = theme.muted(short(ctx.cwd))
-  return chromeLine([brand, session, cwd].filter((part) => part !== '').join(theme.subtle('  ·  ')), width)
-}
-
-/** Boxed input, Claude-Code-style: titled frame, `❯` prompt, hint in the rim. */
+/** Boxed editor, kimi-style: primary rounded frame, `> ` prompt at column 2. */
 function inputBox(text: string, width: number): string[] {
   const w = Math.max(20, width)
-  const style: BoxStyle = { bg: theme.chrome, border: theme.chromeBorder, title: '输入', titlePaint: theme.subtle }
-  const prompt = theme.primary('❯')
+  const style: BoxStyle = { bg: (t) => t, border: theme.primary }
   const body = text !== '' ? text : theme.placeholder('说点什么…')
-  return boxed([`${prompt} ${body}`], w, style, { hint: theme.muted(HINT) })
+  return [boxTop(w, style), boxLine('> ' + body, w, style), boxBottom(w, style)]
 }
 
-/** Bottom status bar: run state · route · token usage on a chrome fill. */
-function footerLine(state: AgentRunState, route: SessionRoute | null, usage: SessionUsage, width: number): string {
-  const dot =
-    state === 'idle' ? theme.ok('●') : state === 'thinking' ? theme.live('◐') : theme.primary('⏺')
-  const label = state === 'idle' ? '就绪' : state === 'thinking' ? '思考中…' : '执行工具…'
-  const parts: string[] = [theme.strong(`${dot} ${label}`)]
-  if (route) {
-    const effort = route.reasoningEffort ? `(${route.reasoningEffort})` : ''
-    parts.push(theme.muted(`${route.provider}/${route.model}${effort}`))
+/** Two-line plain status footer (kimi footer.ts): state/route/cwd + hints/context. */
+function footerLines(ctx: FrameContext, width: number): string[] {
+  const state = ctx.channel.runState
+  const route = ctx.route
+  const usage = ctx.usage
+  const badge =
+    state === 'thinking' ? theme.subtle('⠋ 思考中…') : state === 'working' ? theme.subtle('⏺ 执行工具…') : ''
+  const routeText = route
+    ? theme.text(`${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}`)
+    : ''
+  const dir = theme.muted(short(ctx.cwd))
+  const line1 = [badge, routeText, dir].filter((part) => part !== '').join(theme.subtle('  '))
+
+  const context =
+    usage.messages > 0
+      ? `context: ↑${fmtTokens(usage.input)} ↓${fmtTokens(usage.output)}${usage.reasoning > 0 ? ` ✻${fmtTokens(usage.reasoning)}` : ''}`
+      : ''
+  const hintText = theme.muted(HINT)
+  let line2: string
+  if (context !== '') {
+    const contextText = theme.text(context)
+    const ctxW = stringWidth(contextText)
+    const avail = Math.max(0, width - 2 - ctxW)
+    const shownHint = stringWidth(hintText) > avail ? truncateWidth(hintText, avail) : hintText
+    const pad = Math.max(0, width - 2 - stringWidth(shownHint) - ctxW)
+    line2 = shownHint + ' '.repeat(pad) + contextText
+  } else {
+    line2 = hintText
   }
-  if (usage.messages > 0) {
-    const reasoning = usage.reasoning > 0 ? theme.live(` ✻${fmtTokens(usage.reasoning)}`) : ''
-    parts.push(theme.muted(`↑${fmtTokens(usage.input)} ↓${fmtTokens(usage.output)}`) + reasoning)
-  }
-  return chromeLine(parts.join(theme.subtle('  │  ')), width)
+  return [gutterLine(line1, width), gutterLine(line2, width)]
 }
 
-/** Full-width chrome strip: padded content on a solid background fill. */
-function chromeLine(content: string, width: number): string {
-  const inner = Math.max(2, width - 4)
-  let c = content
-  if (stringWidth(c) > inner) c = truncateWidth(c, inner)
-  const pad = Math.max(0, inner - stringWidth(c))
-  return theme.chrome('  ' + c + ' '.repeat(pad) + '  ')
+/** 1-cell gutter strip (kimi CHROME_GUTTER): ` content ` within `width`. */
+function gutterLine(content: string, width: number): string {
+  return ' ' + truncateWidth(content, width - 2) + ' '
 }
 
 function fmtTokens(count: number): string {

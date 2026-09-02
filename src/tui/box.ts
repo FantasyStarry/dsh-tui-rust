@@ -64,15 +64,13 @@ export function boxBottom(width: number, style: BoxStyle, hint?: string): string
 
 /**
  * Body line: `│ content …pad… │` with the whole line background-filled.
- * `fill` overrides the box bg (used for full-row selection highlights).
  */
-export function boxLine(content: string, width: number, style: BoxStyle, fill?: Paint): string {
+export function boxLine(content: string, width: number, style: BoxStyle): string {
   const innerW = inner(width)
   let c = content
   if (stringWidth(c) > innerW - 2) c = truncateWidth(c, innerW - 2)
   const pad = Math.max(0, innerW - 2 - stringWidth(c))
-  const bg = fill ?? style.bg
-  return bg(style.border(V) + ' ' + c + ' '.repeat(pad) + ' ' + style.border(V))
+  return style.bg(style.border(V) + ' ' + c + ' '.repeat(pad) + ' ' + style.border(V))
 }
 
 /** A complete box: top border → body lines → bottom border (optional hint). */

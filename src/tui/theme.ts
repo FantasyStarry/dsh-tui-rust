@@ -1,19 +1,22 @@
 /**
  * Theme tokens — the semantic color layer between the channel/view and raw
- * SGR (pi's token-set idea, expanded for the layered card/bubble language).
- * Views never write escape codes directly; they pick a token by MEANING.
+ * SGR (adapted from kimi-code's dark `ColorPalette`, MoonshotAI/kimi-code
+ * `src/tui/theme/colors.ts`): blue primary (#4FA8FF), amber user role
+ * (#FFCB6B), gray text scale, teal accent. Views never write escape codes
+ * directly; they pick a token by MEANING.
  *
  * Three fidelity tiers, chosen once at import:
  * - truecolor (COLORTERM=truecolor/24bit, Windows Terminal, VS Code): the
- *   full palette — coral brand, teal info, layered background fills.
+ *   exact palette.
  * - 256-color: the closest xterm-256 approximations.
  * - NO_COLOR: plain text.
  *
  * Paint discipline: every paint is PAIRED with a PRECISE close — fg
  * `\x1b[39m`, bold/dim `\x1b[22m`, italic `\x1b[23m`, bg `\x1b[49m`. Never a
- * bare `\x1b[0m`: a blanket reset kills an outer background when paints nest
- * (a bg-filled card wrapping painted content), which would punch holes in the
- * card fill. Width math is always terminal cells, never string.length.
+ * bare `\x1b[0m`: a blanket reset kills an outer style when paints nest
+ * (cards wrap painted content, e.g. a bg-filled code card). Because closes
+ * are precise, paints compose — `strong(subtle(x))` is bold-dim text.
+ * Width math is always terminal cells, never string.length.
  */
 
 export type Paint = (text: string) => string
@@ -50,89 +53,84 @@ function bg256(n: number): Paint {
   return pair(`\x1b[48;5;${n}m`, '\x1b[49m')
 }
 
-/** Background + foreground combined (used by selected rows / fills). */
-function comb(open: string, close: string): Paint {
-  return pair(open, close)
-}
-
 export interface PaletteSpec {
+  /** Brand / interactive blue: selector pointers, focused editor border,
+   *  code inline, welcome box, link-ish accents. */
   primary: Paint
+  /** Secondary teal highlight. */
   accent: Paint
+  /** primary + bold — dialog titles, selected rows, welcome wordmark. */
+  title: Paint
+  /** Default body text (assistant bullet, footer values, context). */
+  text: Paint
+  /** Secondary dim text (metadata, hints). */
   muted: Paint
-  /** Dimmer than muted — tertiary / metadata. */
+  /** Faintest text (descriptions, scroll info). */
   subtle: Paint
+  /** Emphasised near-white bold. */
   strong: Paint
   ok: Paint
   fail: Paint
   warn: Paint
-  /** Streaming / thinking activity. */
+  /** Violet accent (code numbers, streaming highlights). */
   live: Paint
-  /** Full-row highlight (picker selection). */
-  selected: Paint
   border: Paint
+  /** Inline code + code-card frames. */
   code: Paint
   quote: Paint
   placeholder: Paint
-  /** User-message bubble: background fill + frame color. */
-  bubble: Paint
-  bubbleBorder: Paint
-  /** Neutral card (tool results): background fill + frame. */
+  /** User-message role color: amber bold bullet + text. */
+  roleUser: Paint
+  /** Tool-card background fill + frame. */
   panel: Paint
   panelBorder: Paint
-  /** Persistent chrome strips (top bar / input box / footer): bg + frame. */
-  chrome: Paint
-  chromeBorder: Paint
   /** Code-card background fill (frame stays `code`). */
   codeBg: Paint
 }
 
-/** Layered warm palette: coral brand, teal info, paneled chrome. */
+/** kimi-code dark palette: blue brand, amber user role, gray scale. */
 const truecolorPalette: PaletteSpec = {
-  primary: rgb(232, 131, 108), // #E8836C coral
-  accent: rgb(91, 200, 213), // #5BC8D5 teal
-  muted: rgb(139, 148, 158), // #8B949E
-  subtle: rgb(110, 118, 129), // #6E7681
-  strong: pair('\x1b[1m\x1b[38;2;230;237;243m', '\x1b[39m\x1b[22m'), // near-white bold
-  ok: rgb(143, 206, 154), // #8FCE9A
-  fail: rgb(224, 108, 117), // #E06C75
-  warn: rgb(229, 192, 123), // #E5C07B
-  live: rgb(198, 120, 221), // #C678DD
-  selected: comb('\x1b[1m\x1b[38;2;230;237;243m\x1b[48;2;61;68;80m', '\x1b[49m\x1b[39m\x1b[22m'),
-  border: rgb(86, 93, 102), // #565D66
-  code: rgb(121, 184, 255), // #79B8FF
-  quote: rgb(160, 168, 179), // #A0A8B3
-  placeholder: pair('\x1b[2;3m\x1b[38;2;139;148;158m', '\x1b[39m\x1b[23m\x1b[22m'), // dim italic
-  bubble: bg(59, 47, 43), // #3B2F2B warm dark
-  bubbleBorder: rgb(168, 104, 82), // #A86852
-  panel: bg(35, 39, 46), // #23272E
-  panelBorder: rgb(70, 80, 92), // #46505C
-  chrome: bg(32, 36, 43), // #20242B
-  chromeBorder: rgb(58, 65, 76), // #3A414C
-  codeBg: bg(23, 27, 33), // #171B21
+  primary: rgb(79, 168, 255), // #4FA8FF
+  accent: rgb(91, 192, 190), // #5BC0BE
+  title: pair('\x1b[1m\x1b[38;2;79;168;255m', '\x1b[39m\x1b[22m'),
+  text: rgb(224, 224, 224), // #E0E0E0
+  muted: rgb(136, 136, 136), // #888888
+  subtle: rgb(107, 107, 107), // #6B6B6B
+  strong: pair('\x1b[1m\x1b[38;2;245;245;245m', '\x1b[39m\x1b[22m'), // #F5F5F5
+  ok: rgb(78, 200, 126), // #4EC87E
+  fail: rgb(232, 84, 84), // #E85454
+  warn: rgb(232, 168, 56), // #E8A838
+  live: rgb(189, 147, 249), // #BD93F9
+  border: rgb(90, 90, 90), // #5A5A5A
+  code: rgb(79, 168, 255), // #4FA8FF
+  quote: rgb(136, 136, 136), // #888888
+  placeholder: pair('\x1b[2;3m\x1b[38;2;107;107;107m', '\x1b[39m\x1b[23m\x1b[22m'), // dim italic
+  roleUser: pair('\x1b[1m\x1b[38;2;255;203;107m', '\x1b[39m\x1b[22m'), // #FFCB6B bold
+  panel: bg(38, 42, 48), // #262A30
+  panelBorder: rgb(90, 90, 90), // #5A5A5A
+  codeBg: bg(23, 26, 30), // #171A1E
 }
 
 /** xterm-256 approximations of the same semantics. */
 const palette256: PaletteSpec = {
-  primary: c256(209),
-  accent: c256(80),
-  muted: c256(245),
-  subtle: c256(240),
+  primary: c256(75),
+  accent: c256(79),
+  title: pair('\x1b[1;38;5;75m', '\x1b[39m\x1b[22m'),
+  text: c256(253),
+  muted: c256(243),
+  subtle: c256(241),
   strong: pair('\x1b[1;38;5;255m', '\x1b[39m\x1b[22m'),
   ok: c256(114),
   fail: c256(203),
   warn: c256(215),
-  live: c256(141),
-  selected: comb('\x1b[1;38;5;255;48;5;238m', '\x1b[49m\x1b[39m\x1b[22m'),
-  border: c256(242),
-  code: c256(117),
-  quote: c256(146),
-  placeholder: pair('\x1b[2;3;38;5;245m', '\x1b[39m\x1b[23m\x1b[22m'),
-  bubble: bg256(237),
-  bubbleBorder: c256(173),
+  live: c256(177),
+  border: c256(240),
+  code: c256(75),
+  quote: c256(243),
+  placeholder: pair('\x1b[2;3;38;5;241m', '\x1b[39m\x1b[23m\x1b[22m'),
+  roleUser: pair('\x1b[1;38;5;221m', '\x1b[39m\x1b[22m'),
   panel: bg256(236),
-  panelBorder: c256(244),
-  chrome: bg256(235),
-  chromeBorder: c256(242),
+  panelBorder: c256(240),
   codeBg: bg256(234),
 }
 
@@ -140,6 +138,8 @@ const palette256: PaletteSpec = {
 const plainPalette: PaletteSpec = {
   primary: (t) => t,
   accent: (t) => t,
+  title: (t) => t,
+  text: (t) => t,
   muted: (t) => t,
   subtle: (t) => t,
   strong: (t) => t,
@@ -147,17 +147,13 @@ const plainPalette: PaletteSpec = {
   fail: (t) => t,
   warn: (t) => t,
   live: (t) => t,
-  selected: (t) => t,
   border: (t) => t,
   code: (t) => t,
   quote: (t) => t,
   placeholder: (t) => t,
-  bubble: (t) => t,
-  bubbleBorder: (t) => t,
+  roleUser: (t) => t,
   panel: (t) => t,
   panelBorder: (t) => t,
-  chrome: (t) => t,
-  chromeBorder: (t) => t,
   codeBg: (t) => t,
 }
 

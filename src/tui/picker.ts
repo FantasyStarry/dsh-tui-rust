@@ -6,12 +6,16 @@
  * owns async loading between stages; this module only holds navigable state
  * and paints lines, so it stays unit-testable inside the smoke harness.
  *
- * Rendered as a chrome panel with a titled frame; the selected row gets a
- * full-width background highlight (the `selected` token as the line fill).
+ * Layout follows the kimi-code dialog spec (`.agents/skills/write-tui/
+ * DESIGN.md`): flat `─` borders (primary) top and bottom only, title
+ * (primary + bold), hint (textMuted) hugging the title, listed rows with the
+ * `❯ ` pointer on the selected row, a ` ← current` success marker appended
+ * to the row that holds the live route value, and a `▼ N more` scroll
+ * indicator for long lists.
  */
 
 import { theme } from './theme.js'
-import { boxLine, boxTop, boxBottom, type BoxStyle } from './box.js'
+import { truncateWidth } from './width.js'
 
 export interface PickerItem {
   /** Value carried out on selection (id / effort id). */
@@ -28,10 +32,13 @@ export interface PickerState {
   readonly title: string
   readonly items: readonly PickerItem[]
   index: number
+  /** The live route value at this stage — its row gets ` ← current`. */
+  readonly current?: string
 }
 
-export function openPicker(title: string, items: readonly PickerItem[]): PickerState {
-  return { title, items, index: 0 }
+export function openPicker(title: string, items: readonly PickerItem[], current?: string): PickerState {
+  const base = { title, items, index: 0 }
+  return current === undefined ? base : { ...base, current }
 }
 
 /** Move the cursor by ±delta, clamped to the item range. */
@@ -46,22 +53,35 @@ export function pickedItem(state: PickerState): PickerItem | undefined {
   return state.items[state.index]
 }
 
-/** Render the picker as a boxed overlay block (already themed). */
+/** kimi SELECT_POINTER / CURRENT_MARK, per DESIGN.md: indents align. */
+const POINTER_W = 2
+const HINT = '↑/↓ 选择 · Enter 确认 · Esc 取消'
+
+/** Render the picker as a flat-bordered overlay block (already themed). */
 export function renderPicker(state: PickerState, width: number): string[] {
-  const style: BoxStyle = { bg: theme.chrome, border: theme.chromeBorder, title: state.title, titlePaint: theme.strong }
+  const lines: string[] = []
+  lines.push(theme.primary('─'.repeat(width)))
+  lines.push(' ' + theme.title(state.title))
+  lines.push(theme.subtle(' ' + HINT))
+  lines.push('')
+
   const from = Math.max(0, state.index - 8)
   const visible = state.items.slice(from, from + 17)
-  const content: string[] = []
   for (let i = 0; i < visible.length; i++) {
     const item = visible[i]
     if (!item) continue
     const actual = from + i
-    const isSelected = actual === state.index
-    const cursor = isSelected ? theme.primary('❯ ') : '  '
-    const label = isSelected ? theme.strong(item.label) : item.label
-    const hint = item.hint ? theme.subtle(` — ${item.hint}`) : ''
-    content.push(boxLine(`${cursor}${label}${hint}`, width, style, isSelected ? theme.selected : undefined))
+    const selected = actual === state.index
+    const pointer = selected ? theme.title('❯ ') : ' '.repeat(POINTER_W)
+    const label = selected ? theme.title(item.label) : item.label
+    const current = state.current !== undefined && item.value === state.current ? theme.ok('  ← current') : ''
+    const hint = item.hint ? theme.subtle('  ' + item.hint) : ''
+    lines.push(truncateWidth(`  ${pointer}${label}${hint}${current}`, Math.max(8, width - 4)))
   }
-  const hint = theme.subtle('↑/↓ 选择 · Enter 确认 · Esc 取消')
-  return [boxTop(width, style), ...content, boxBottom(width, style, hint)]
+  const remaining = state.items.length - (from + visible.length)
+  if (remaining > 0) {
+    lines.push(theme.subtle(` ▼ ${remaining} more`))
+  }
+  lines.push(theme.primary('─'.repeat(width)))
+  return lines
 }

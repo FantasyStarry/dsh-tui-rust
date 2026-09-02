@@ -387,9 +387,10 @@ async function main(): Promise<void> {
   {
     const snap = paintScreen(writes2)
     const countOf = (needle: string): number => snap.filter((row) => row.includes(needle)).length
-    if (countOf('❯ 说点什么…') !== 1) problems.push('phase2：编辑后输入行重复/缺失')
+    if (countOf('> 说点什么…') !== 1) problems.push('phase2：编辑后输入行重复/缺失')
     if (countOf('Enter 发送') !== 1) problems.push('phase2：编辑后提示行重复/缺失')
-    if (countOf('● 就绪') !== 1) problems.push('phase2：编辑后页脚重复/缺失')
+    if (snap.some((row) => row.includes('思考中…'))) problems.push('phase2：idle 页脚不应显示思考中徽标')
+    if (!snap.some((row) => row.includes('context: ↑120'))) problems.push('phase2：turn/end 后用量未上屏')
     if (snap.some((row) => row.includes('试说'))) problems.push('phase2：退格后占位符残留输入字符')
   }
 
@@ -432,14 +433,14 @@ async function main(): Promise<void> {
   if (!visible2.includes('const n = 1')) problems.push('phase2：代码行未渲染')
   if (!visible2.includes('思考一下。')) problems.push('phase2：reasoning-delta 未进思考行')
   if (!/已思考 \d+(\.\d+)?s/.test(visible2)) problems.push('phase2：思考块未折叠为时长摘要')
-  if (!visible2.includes('⏺ edit src/app.ts')) problems.push('phase2：工具 diff 卡头未渲染')
+  if (!visible2.includes('✓ edit src/app.ts')) problems.push('phase2：工具 diff 卡头未渲染')
   if (!visible2.includes('+ const a = 2') || !visible2.includes('- const a = 1')) problems.push('phase2：diff 增删行未着色渲染')
   if (!visible2.includes('+ const b = 3')) problems.push('phase2：diff 新增行缺失')
   if (!visible2.includes('✦ orca')) problems.push('phase2：欢迎区缺失')
+  if (!visible2.includes('Directory:')) problems.push('phase2：欢迎区信息行缺失')
   if (!visible2.includes('↳ 模型 default-provider/default-model')) problems.push('phase2：路由线未打印')
   if (!visible2.includes('default-provider/default-model')) problems.push('phase2：页脚未显示 request/header 路由')
   if (!visible2.includes('↑120') || !visible2.includes('↓45')) problems.push('phase2：token 用量未上屏')
-  if (!visible2.includes('就绪')) problems.push('phase2：turn/end 后状态未回就绪')
   for (const expect of ['选择 Provider', '选择模型（fake-a）', '选择思考强度（fake-a-m1）', '模型已切换：fake-a/fake-a-m1(low)']) {
     if (!visible2.includes(expect)) problems.push(`phase2：/model 流程缺少「${expect}」`)
   }
@@ -472,19 +473,19 @@ async function main(): Promise<void> {
   if (record.cancelCause?.kind !== 'user') problems.push('phase2：cancel 未携带 user 原因')
   if (!record.disposed) problems.push('phase2：dispose 未触达 handle.dispose')
 
-  // Final VISIBLE screen tail must be the intact inline chrome: prompt → hint
-  // → footer, each exactly once.
+  // Final VISIBLE screen tail must be the intact bottom chrome: editor box
+  // (top → prompt → bottom) + footer L1 → L2, each exactly once.
   while (rows2.length > 0 && rows2[rows2.length - 1] === '') rows2.pop()
-  const tail = rows2.slice(-3)
+  const tail = rows2.slice(-5)
   const hint = 'Enter 发送  ·  /model 模型  ·  Esc 取消  ·  Ctrl+C 退出'
-  if (tail.length !== 3) problems.push(`phase2：最终画面尾部不足 3 行：${JSON.stringify(rows2.slice(-6))}`)
-  const promptRow = rows2.find((row) => row.includes('❯ 说点什么…'))
+  if (tail.length !== 5) problems.push(`phase2：最终画面尾部不足 5 行：${JSON.stringify(rows2.slice(-7))}`)
+  const promptRow = rows2.find((row) => row.includes('> 说点什么…'))
   if (promptRow === undefined) {
     problems.push(`phase2：输入行不完整：${JSON.stringify(rows2.slice(-8))}`)
   }
   if (!rows2.some((row) => row.includes(hint))) problems.push(`phase2：提示行缺失或不唯一：${JSON.stringify(tail)}`)
-  // The q1 submit opened the second turn — the footer is mid-turn here.
-  const footerRow = rows2.find((row) => row.includes('◐ 思考中…'))
+  // The q1 submit opened the second turn — the footer badge is mid-turn here.
+  const footerRow = rows2.find((row) => row.includes('思考中…'))
   if (footerRow === undefined) problems.push(`phase2：页脚缺失或状态不符：${JSON.stringify(tail)}`)
   // The /model switch happened before q1 — the footer must show the LIVE selection.
   if (footerRow === undefined || !footerRow.includes('fake-a/fake-a-m1(low)')) problems.push(`phase2：页脚未反映切换后路由：${JSON.stringify(footerRow)}`)

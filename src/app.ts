@@ -161,7 +161,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       const provider = item.value
       const stage: PickerStage = { kind: 'models', provider }
       pickerStage = stage
-      picker = openPicker(`选择模型（${provider}）`, loadingItems())
+      picker = openPicker(`选择模型（${provider}）`, loadingItems(), selection?.model)
       void (async (): Promise<void> => {
         try {
           const models = await llm.listModels(provider)
@@ -174,6 +174,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
           picker = openPicker(
             `选择模型（${provider}）`,
             models.map((m) => itemOf(m.name || m.id, m.id, m.description)),
+            selection?.model,
           )
         } catch (error) {
           pickFailed(error)
@@ -187,7 +188,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       const model = item.value
       const stage: PickerStage = { kind: 'effort', provider, model }
       pickerStage = stage
-      picker = openPicker(`选择思考强度（${model}）`, loadingItems())
+      picker = openPicker(`选择思考强度（${model}）`, loadingItems(), selection?.reasoningEffort)
       void (async (): Promise<void> => {
         const items: PickerItem[] = [itemOf('默认（模型默认行为）', '')]
         try {
@@ -199,7 +200,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
           // Exact-route resolution is optional; default-only stays usable.
         }
         if (stage !== pickerStage) return
-        picker = openPicker(`选择思考强度（${model}）`, items)
+        picker = openPicker(`选择思考强度（${model}）`, items, selection?.reasoningEffort)
       })()
       return
     }
@@ -240,7 +241,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
     const stage: PickerStage = { kind: 'providers' }
     pickerStage = stage
-    picker = openPicker('选择 Provider', loadingItems())
+    picker = openPicker('选择 Provider', loadingItems(), selection?.provider)
     void (async (): Promise<void> => {
       try {
         const providers = await Promise.resolve(llm.listProviders())
@@ -253,6 +254,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         picker = openPicker(
           '选择 Provider',
           providers.map((p) => itemOf(p.name || p.id, p.id, p.name && p.name !== p.id ? p.id : undefined)),
+          selection?.provider,
         )
       } catch (error) {
         pickFailed(error)
@@ -391,7 +393,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     // line — the scrollback stream never accumulates repeated banners.
     if (!welcomed) {
       welcomed = true
-      stream.push(...welcomeCard(process.cwd(), stdout.columns ?? 80))
+      const routeModel = route ? `${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}` : null
+      stream.push(...welcomeCard(process.cwd(), agent?.session.id ?? null, routeModel, stdout.columns ?? 80))
       if (route) {
         stream.push(routeLine(route))
         lastRouteKey = routeKey(route)

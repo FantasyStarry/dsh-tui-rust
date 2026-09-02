@@ -279,6 +279,28 @@ TUI 侧规范细节（对 dsh-tui 有直接参考价值）：可打印字符比�
 
 ---
 
+## 附：视觉层面落地（Orca 2026-09，`src/tui/`）
+
+> Orca（TS Cordis 插件，非 Rust ACP 客户端）的 TUI 视觉已直接对齐 kimi-code 的实现
+> 细节。以下为落地时从仓库实际抓取的规范文件与逐项映射，后续改视觉先读这些：
+
+| kimi-code 文件 | 落地点（Orca） |
+| --- | --- |
+| `src/tui/theme/colors.ts`（`darkColors`） | `src/tui/theme.ts` 调色板：primary `#4FA8FF` / accent `#5BC0BE` / text `#E0E0E0` / textDim→muted `#888888` / textMuted→subtle `#6B6B6B` / success→ok / error→fail / warning→warn / roleUser `#FFCB6B` / shellMode→live `#BD93F9`；diff=success/error |
+| `constant/symbols.ts` | `USER_BULLET='✨'（带 VS16 保宽）+ 空格`、`STATUS_BULLET='● '`、`SUCCESS_MARK='✓ '`、`FAILURE_MARK='✗ '`、`SELECT_POINTER='❯'` |
+| `constant/rendering.ts` | `MESSAGE_INDENT='  '`、`CHROME_GUTTER=1`（转录区 1 格排水沟对齐输入框内部）、`BRAILLE_SPINNER_FRAMES`（80ms/帧） |
+| `components/messages/user-message.ts` | 用户消息 = 角色色琥珀加粗 + `✨` 前缀，**无气泡**；续行按前缀宽缩进 |
+| `components/messages/assistant-message.ts` | 助手消息 = 前置空行 + `● ` 正文色圆点 + markdown；续行 2 格缩进 |
+| `components/messages/thinking.ts` | 流式 = spinner + `thinking…` + 末 2 行预览（dim）；折叠提示 `… (N more lines)`；正文斜体 dim |
+| `components/messages/status-message.ts` | 系统消息 = 2 格缩进 + dim |
+| `components/editor/custom-editor.ts` | 输入框 = primary 圆角盒 + `> ` 提示符第 2 列（paddingX=4）；bash 模式 `!` |
+| `components/chrome/footer.ts` | 页脚 = 编辑器下方两行纯文本（无背景填充）：L1 徽标/模型/目录（状态徽标仅忙时），L2 提示左 + `context:` 用量右对齐 |
+| `components/chrome/welcome.ts` | 欢迎 = primary 圆角盒（整宽）+ 像素 logo + `✦ orca` 字标 + Directory/Session/Model 信息行 |
+| `.agents/skills/write-tui/DESIGN.md` | 选择器 = 平直 `─` 顶底边框（仅两条全宽）、标题 primary+bold 紧贴 hint（textMuted）、`❯ ` 指针、` ← current`（success）、`▼ N more` 滚动指示；输入框圆角 primary；hint 不做键位高亮 |
+| apps/kimi-code/AGENTS.md（色彩规范） | token 唯一来源、禁 named color、对比度 AA（light ≥4.5:1 / chrome ≥3:1）——Orca 的 `NO_COLOR`/256 降级保留 |
+
+---
+
 ## 附：主要引用链接
 
 - 仓库与 README：[MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code) / [README.md](https://github.com/MoonshotAI/kimi-code/blob/main/README.md)
