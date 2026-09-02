@@ -9,7 +9,7 @@
  * pi / dsh-TUI) is the next renderer milestone — see docs/adr/0001.
  */
 
-import { stringWidth } from './width.js'
+import { truncateWidth } from './width.js'
 
 const SYNC_START = '\x1b[?2026h'
 const SYNC_END = '\x1b[?2026l'
@@ -24,8 +24,14 @@ export interface CursorPlacement {
 
 export class Renderer {
   private last: string[] = []
-  private lastRows = 0
   private lastWidth = 0
+  /**
+   * Where placeCursor left the terminal cursor, counted from the bottom of
+   * `last` (0 = last row). The repaint math is relative to THIS park
+   * position — placing the cursor mid-frame (the input row) shifts every
+   * subsequent repaint, and ignoring it smears the chrome down the screen.
+   */
+  private cursorFromEnd = 0
 
   constructor(
     private readonly stdout: NodeJS.WriteStream,
@@ -54,8 +60,8 @@ export class Renderer {
 
     if (forceFull) {
       const out: string[] = [SYNC_START]
-      const n = this.last.length
-      if (n > 1) out.push(`\x1b[${n - 1}A`)
+      const parkRow = this.last.length - 1 - this.cursorFromEnd
+      if (parkRow > 0) out.push(`\x1b[${parkRow}A`)
       out.push('\r')
       for (const line of stream) {
         out.push(CLEAR_LINE, truncateToCells(line, width), '\r\n')
@@ -67,7 +73,7 @@ export class Renderer {
       // seal flush often SHRINKS the live region (previous turn's rows left),
       // and uncleared rows kept ghost copies of the chrome on screen.
       const written = stream.length + frame.length
-      const stale = n - written
+      const stale = this.last.length - written
       if (stale > 0) out.push(CLEAR_LINE, '\x1b[0J')
       if (frame.length > 0) out.push('\x1b[1A')
       this.placeCursor(out, frame.length, cursor)
@@ -87,16 +93,15 @@ export class Renderer {
     }
 
     const out: string[] = [SYNC_START]
-    // Park the cursor at the first changed line of the previous frame.
-    const up = this.last.length - 1 - firstDiff + this.trailingRows(this.last)
-    if (up > 0) out.push(`\x1b[${up}A`)
+    // Move the cursor from its actual park position to the first changed
+    // row. Pure-append growth (firstDiff below the old region) falls out as
+    // a negative move — step DOWN, or the first new line overwrites the old
+    // last row.
+    const parkRow = this.last.length - 1 - this.cursorFromEnd
+    const move = parkRow - firstDiff
+    if (move > 0) out.push(`\x1b[${move}A`)
+    else if (move < 0) out.push(`\x1b[${-move}B`)
     out.push('\r')
-    // Pure-append growth (prefix identical, lines added below the old
-    // frame): the cursor is parked ON the old last line — step down one
-    // row before painting, or the first new line overwrites it.
-    if (firstDiff >= this.last.length && this.last.length > 0) {
-      out.push('\x1b[1B')
-    }
 
     for (let i = firstDiff; i < frame.length; i++) {
       out.push(CLEAR_LINE, frame[i] ?? '', '\r\n')
@@ -116,8 +121,12 @@ export class Renderer {
 
   /** Move the cursor to its in-frame home (the input row) after painting. */
   private placeCursor(out: string[], frameLength: number, cursor?: CursorPlacement): void {
-    if (!cursor || frameLength === 0) return
+    if (!cursor || frameLength === 0) {
+      this.cursorFromEnd = 0
+      return
+    }
     const up = Math.max(0, Math.min(cursor.fromEnd, frameLength - 1))
+    this.cursorFromEnd = up
     if (up > 0) out.push(`\x1b[${up}A`)
     out.push(`\x1b[${Math.max(1, cursor.col)}G`)
   }
@@ -126,37 +135,13 @@ export class Renderer {
   dispose(): void {
     this.stdout.write('\r' + CLEAR_LINE + '\x1b[0J')
     this.last = []
-  }
-
-  private trailingRows(_frame: readonly string[]): number {
-    return 0
+    this.cursorFromEnd = 0
   }
 }
 
 /** Hard-guard every row to the terminal width so the diff never miscounts. */
 function truncateToCells(line: string, width: number): string {
-  if (stringWidth(line) <= width) return line
-  let out = ''
-  let used = 0
-  for (const ch of line) {
-    const code = ch.codePointAt(0) ?? 0
-    const w = code >= 0x1100 && isWideRange(code) ? 2 : 1
-    if (used + w > width) break
-    out += ch
-    used += w
-  }
-  return out
-}
-
-function isWideRange(code: number): boolean {
-  return (
-    (code >= 0x1100 && code <= 0x115f) ||
-    (code >= 0x2e80 && code <= 0xa4cf) ||
-    (code >= 0xac00 && code <= 0xd7a3) ||
-    (code >= 0xf900 && code <= 0xfaff) ||
-    (code >= 0xff00 && code <= 0xff60) ||
-    (code >= 0x20000 && code <= 0x3fffd)
-  )
+  return truncateWidth(line, width)
 }
 
 function sameFrame(a: readonly string[], b: readonly string[]): boolean {

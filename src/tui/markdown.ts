@@ -66,16 +66,16 @@ export function renderMarkdown(text: string, width: number): string[] {
         inFence = true
         fenceLang = normalizeLang(fenceMatch[1] ?? '')
         const label = fenceLang === '' ? 'code' : fenceLang
-        lines.push(theme.muted(`╭─ ${label} ` + '─'.repeat(10)))
+        lines.push(theme.code(`╭─ ${label} ` + '─'.repeat(10)))
       } else {
         inFence = false
-        lines.push(theme.muted('╰' + '─'.repeat(14)))
+        lines.push(theme.code('╰' + '─'.repeat(14)))
       }
       continue
     }
     if (inFence) {
       const spans = highlightCodeLine(raw, fenceLang)
-      lines.push(theme.muted('│ ') + renderSpans(spans, width - 4))
+      lines.push(theme.code('│ ') + renderSpans(spans, width - 4))
       continue
     }
 
@@ -92,14 +92,14 @@ export function renderMarkdown(text: string, width: number): string[] {
 
     const rule = /^\s*(---+|\*\*\*+)\s*$/.exec(raw)
     if (rule) {
-      lines.push(theme.muted('─'.repeat(16)))
+      lines.push(theme.muted('┄'.repeat(16)))
       continue
     }
 
     const quote = /^\s*>\s?(.*)$/.exec(raw)
     if (quote) {
       const body = inlineSpans(quote[1] ?? '')
-      for (const line of wrapSpans([{ text: '▏ ', paint: theme.muted }, ...body], width)) {
+      for (const line of wrapSpans([{ text: '▏ ', paint: theme.quote }, ...body], width)) {
         lines.push(line)
       }
       continue
@@ -136,6 +136,6 @@ export function renderMarkdown(text: string, width: number): string[] {
       lines.push(line)
     }
   }
-  if (inFence) lines.push(theme.muted('╰' + '─'.repeat(14)))
+  if (inFence) lines.push(theme.code('╰' + '─'.repeat(14)))
   return lines
 }

@@ -408,6 +408,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       sealedFrom: flushedSealed,
       editorText: editor,
       width: stdout.columns ?? 80,
+      height: stdout.rows ?? 24,
       cwd: process.cwd(),
       sessionId: agent?.session.id ?? null,
       route,

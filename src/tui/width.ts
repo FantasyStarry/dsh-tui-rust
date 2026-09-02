@@ -34,7 +34,19 @@ export function charWidth(code: number): number {
 
 export function stringWidth(text: string): number {
   let width = 0
-  for (const ch of text) width += charWidth(ch.codePointAt(0) ?? 0)
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (ch === '\x1b') {
+      const end = csiEnd(text, i + 1)
+      if (end !== -1) {
+        i = end
+        continue
+      }
+    }
+    const code = text.codePointAt(i) ?? 0
+    width += charWidth(code)
+    if (code > 0xffff) i++
+  }
   return width
 }
 
@@ -44,13 +56,40 @@ export function truncateWidth(text: string, max: number, tail = ''): string {
   const budget = Math.max(0, max - stringWidth(tail))
   let out = ''
   let used = 0
-  for (const ch of text) {
-    const w = charWidth(ch.codePointAt(0) ?? 0)
-    if (used + w > budget) break
-    out += ch
+  let clipped = false
+  let hadEscape = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i] ?? ''
+    if (ch === '\x1b') {
+      const end = csiEnd(text, i + 1)
+      if (end !== -1) {
+        hadEscape = true
+        out += text.slice(i, end + 1)
+        i = end
+        continue
+      }
+    }
+    const code = text.codePointAt(i) ?? 0
+    const w = charWidth(code)
+    if (used + w > budget) {
+      clipped = true
+      break
+    }
+    out += String.fromCodePoint(code)
     used += w
+    if (code > 0xffff) i++
   }
-  return out + tail
+  return out + (clipped && hadEscape ? '\x1b[0m' : '') + tail
+}
+
+/** Return the final index of a CSI escape sequence, or -1 for plain ESC. */
+function csiEnd(text: string, start: number): number {
+  if (text[start] !== '[') return -1
+  for (let i = start + 1; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code >= 0x40 && code <= 0x7e) return i
+  }
+  return -1
 }
 
 /** Word-ish wrap to terminal cells; hard-splits runs longer than `width`. */

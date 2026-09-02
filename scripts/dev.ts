@@ -369,6 +369,23 @@ async function main(): Promise<void> {
   await sleep(850) // the scripted turn streams through (incl. usage @560ms)
   if (!writes2.join('').includes('思考中')) problems.push('phase2：思考中状态未上屏')
 
+  // Type + backspace WITHOUT submitting: the chrome must stay a single copy.
+  // Regression guard for cursor-accounted repaints — when the painter forgot
+  // where placeCursor left the cursor, every keystroke smeared a new
+  // hint+footer block down the screen.
+  stdin2.text('试')
+  await sleep(100)
+  stdin2.key('backspace')
+  await sleep(100)
+  {
+    const snap = paintScreen(writes2)
+    const countOf = (needle: string): number => snap.filter((row) => row.includes(needle)).length
+    if (countOf('❯ 说点什么…') !== 1) problems.push('phase2：编辑后输入行重复/缺失')
+    if (countOf('Enter 发送') !== 1) problems.push('phase2：编辑后提示行重复/缺失')
+    if (countOf('● 就绪') !== 1) problems.push('phase2：编辑后页脚重复/缺失')
+    if (snap.some((row) => row.includes('试说'))) problems.push('phase2：退格后占位符残留输入字符')
+  }
+
   // /model picker: open → provider → model → effort(down to 低) → applied
   for (const ch of '/model') stdin2.text(ch)
   stdin2.key('return')
@@ -410,7 +427,7 @@ async function main(): Promise<void> {
   if (!painted2.includes('⏺ edit src/app.ts')) problems.push('phase2：工具 diff 卡头未渲染')
   if (!painted2.includes('+ const a = 2') || !painted2.includes('- const a = 1')) problems.push('phase2：diff 增删行未着色渲染')
   if (!painted2.includes('+ const b = 3')) problems.push('phase2：diff 新增行缺失')
-  if (!painted2.includes('✻ orca')) problems.push('phase2：欢迎卡片缺失')
+  if (!painted2.includes('  orca')) problems.push('phase2：欢迎区缺失')
   if (!painted2.includes('↳ 模型 default-provider/default-model')) problems.push('phase2：路由线未打印')
   if (!painted2.includes('default-provider/default-model')) problems.push('phase2：页脚未显示 request/header 路由')
   if (!painted2.includes('↑120') || !painted2.includes('↓45')) problems.push('phase2：token 用量未上屏')
@@ -447,21 +464,22 @@ async function main(): Promise<void> {
   if (record.cancelCause?.kind !== 'user') problems.push('phase2：cancel 未携带 user 原因')
   if (!record.disposed) problems.push('phase2：dispose 未触达 handle.dispose')
 
-  // Final VISIBLE screen tail must be the intact chrome: box → hint →
-  // footer, each exactly once (the seal-shrink stale-clear regression kept
-  // ghost copies of the hint right below the live region).
+  // Final VISIBLE screen tail must be the intact inline chrome: prompt → hint
+  // → footer, each exactly once.
   while (rows2.length > 0 && rows2[rows2.length - 1] === '') rows2.pop()
-  const tail = rows2.slice(-5)
-  const hint = 'Enter 发送 · /model 切换模型 · Esc 清空/取消 · Ctrl+C 退出'
-  if (tail.length !== 5) problems.push(`phase2：最终画面尾部不足 5 行：${JSON.stringify(rows2.slice(-8))}`)
-  if (!(tail[1]?.startsWith('│ ❯ 说点什么…') && tail[1]?.endsWith('│'))) {
-    problems.push(`phase2：输入框行不完整：${JSON.stringify(tail[1])}`)
+  const tail = rows2.slice(-3)
+  const hint = 'Enter 发送  ·  /model 模型  ·  Esc 取消  ·  Ctrl+C 退出'
+  if (tail.length !== 3) problems.push(`phase2：最终画面尾部不足 3 行：${JSON.stringify(rows2.slice(-6))}`)
+  const promptRow = rows2.find((row) => row.includes('❯ 说点什么…'))
+  if (promptRow === undefined) {
+    problems.push(`phase2：输入行不完整：${JSON.stringify(rows2.slice(-8))}`)
   }
-  if (tail[3] !== hint) problems.push(`phase2：提示行缺失或不唯一：${JSON.stringify(tail)}`)
+  if (!rows2.includes(hint)) problems.push(`phase2：提示行缺失或不唯一：${JSON.stringify(tail)}`)
   // The q1 submit opened the second turn — the footer is mid-turn here.
-  if (tail[4] === undefined || !tail[4].includes('◐ 思考中…')) problems.push(`phase2：页脚缺失或状态不符：${JSON.stringify(tail[4])}`)
+  const footerRow = rows2.find((row) => row.includes('◐ 思考中…'))
+  if (footerRow === undefined) problems.push(`phase2：页脚缺失或状态不符：${JSON.stringify(tail)}`)
   // The /model switch happened before q1 — the footer must show the LIVE selection.
-  if (tail[4] === undefined || !tail[4].includes('fake-a/fake-a-m1(low)')) problems.push(`phase2：页脚未反映切换后路由：${JSON.stringify(tail[4])}`)
+  if (footerRow === undefined || !footerRow.includes('fake-a/fake-a-m1(low)')) problems.push(`phase2：页脚未反映切换后路由：${JSON.stringify(footerRow)}`)
 
   if (problems.length > 0) {
     console.error(`smoke 失败：${problems.join('；')}`)

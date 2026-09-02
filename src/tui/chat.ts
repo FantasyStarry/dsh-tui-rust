@@ -22,8 +22,7 @@ import type { AgentRunState, Channel, SessionRoute, SessionUsage, TranscriptRow 
 import { renderMarkdown } from './markdown.js'
 import { renderPicker, type PickerState } from './picker.js'
 import { theme } from './theme.js'
-import { stringWidth } from './width.js'
-import { wrapWidth } from './width.js'
+import { stringWidth, truncateWidth, wrapWidth } from './width.js'
 
 export interface FrameContext {
   readonly channel: Channel
@@ -31,6 +30,8 @@ export interface FrameContext {
   readonly sealedFrom: number
   readonly editorText: string
   readonly width: number
+  /** Terminal rows; used to keep the prompt anchored at the bottom. */
+  readonly height?: number
   readonly cwd: string
   readonly sessionId: string | null
   /** Live selection override (picker result) — wins over the logged route. */
@@ -83,33 +84,24 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     live.push(...pickerLines)
     live.push('')
   }
+  const targetHeight = Math.max(8, ctx.height ?? 24)
+  const spacer = Math.max(0, targetHeight - live.length - 3)
+  if (spacer > 0) live.push(...Array.from({ length: spacer }, () => ''))
   live.push(...inputBox(ctx.editorText, width))
-  live.push(theme.muted('Enter 发送 · /model 切换模型 · Esc 清空/取消 · Ctrl+C 退出'))
+  live.push(theme.muted('Enter 发送  ·  /model 模型  ·  Esc 取消  ·  Ctrl+C 退出'))
   live.push(footerLine(ctx.channel.runState, ctx.route, ctx.usage, width))
-  // Cursor home: inside the box, right after the typed text. Rows below the
-  // input row: box-bottom + hint + footer (plus the picker block above).
+  // Cursor home: after the prompt text. Rows below it: hint + footer.
   const pickerExtra = pickerLines.length > 0 ? pickerLines.length + 1 : 0
-  const cursor = { fromEnd: 3 + pickerExtra, col: 5 + stringWidth(ctx.editorText) }
+  const cursor = { fromEnd: 2 + pickerExtra, col: 4 + stringWidth(ctx.editorText) }
   return { stream, live, cursor }
 }
 
-/** One-time welcome card — the only banner orca ever prints. */
+/** One-time welcome block — intentionally light so the transcript stays primary. */
 export function welcomeCard(cwd: string, width: number): string[] {
-  const boxWidth = Math.min(Math.max(34, width - 4), 64)
-  const inner = boxWidth - 2
-  const border = theme.primary('╭' + '─'.repeat(inner) + '╮')
-  const bottom = theme.primary('╰' + '─'.repeat(inner) + '╯')
-  const row = (content: string): string => {
-    const visible = stringWidth(content.replaceAll(/\x1b\[[0-9;?]*[A-Za-z]/g, ''))
-    const pad = Math.max(0, inner - 2 - visible)
-    return '│  ' + content + ' '.repeat(pad) + theme.primary(' │')
-  }
+  void width
   return [
-    border,
-    row(theme.primary('✻ orca') + ' — DeepSeek Harness 终端前端'),
-    row(theme.muted(short(cwd))),
-    row(theme.muted('/model 切换模型 · Esc 取消 · Ctrl+C 退出')),
-    bottom,
+    theme.strong('  orca') + theme.muted('  DeepSeek Harness 终端前端'),
+    theme.muted('  ' + short(cwd)),
     '',
   ]
 }
@@ -132,7 +124,9 @@ function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
       return [theme.strong('❯ ' + (wrapped[0] ?? '')), ...wrapped.slice(1).map(theme.muted)]
     case 'assistant':
       // Markdown for the model's voice; the md layer owns indentation.
-      return renderMarkdown(row.text || '…', width)
+      return renderMarkdown(row.text || '…', Math.max(12, width - 2)).map((line, index) =>
+        index === 0 ? theme.accent('│ ') + line : '  ' + line,
+      )
     case 'thought': {
       // Sealed: one collapsed summary line (full text stays in the session log).
       if (row.seconds !== undefined) {
@@ -158,36 +152,32 @@ function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
       if (diff) {
         const head = truncateCells(`  ${mark} ${row.tool ?? 'tool'} ${diff.path}`, Math.max(12, width - 10))
         const removed = diff.removed > 0 ? ` ${theme.fail(`−${diff.removed}`)}` : ''
-        out.push(head + ` ${theme.ok(`+${diff.added}`)}${removed}`)
+        out.push(theme.accent('  ┌ ') + head.slice(2) + ` ${theme.ok(`+${diff.added}`)}${removed}`)
         for (const line of diff.lines) {
           const text = truncateCells(line.text, Math.max(8, width - 8))
           if (line.kind === 'add') out.push(theme.ok(`  │ + ${text}`))
           else if (line.kind === 'del') out.push(theme.fail(`  │ - ${text}`))
-          else out.push(theme.muted(`  │   ${text}`))
+          else out.push(theme.muted(`  │ · ${text}`))
         }
+        out.push(theme.muted('  └'))
         return out
       }
+      // Keep the tool label contiguous so it remains easy to scan and copy.
       out.push(truncateCells(`  ${mark} ${row.tool ?? 'tool'}${row.status === 'running' ? theme.muted(' …') : ''}`, width))
       out.push(...wrapped.slice(0, 3).map((line) => theme.muted('    └ ' + line)))
       return out
     }
     case 'system':
-      return wrapped.map((line) => theme.warn('  ⚑ ' + line))
+      return wrapped.map((line) => theme.accent('  · ') + theme.muted(line))
   }
 }
 
-/** Rounded input box, Claude-Code style, pinned at the bottom. */
+/** Inline prompt, Claude-Code style, pinned at the bottom. */
 function inputBox(text: string, width: number): string[] {
   const w = Math.max(20, width)
-  const inner = Math.max(1, w - 4)
-  const content = theme.strong('❯ ') + (text !== '' ? text : theme.muted('说点什么…'))
-  const visible = stringWidth(content.replaceAll(/\x1b\[[0-9;?]*[A-Za-z]/g, ''))
-  const pad = Math.max(0, inner - visible)
-  return [
-    theme.primary('╭' + '─'.repeat(w - 2) + '╮'),
-    '│ ' + content + ' '.repeat(pad) + ' │',
-    theme.primary('╰' + '─'.repeat(w - 2) + '╯'),
-  ]
+  const prompt = theme.primary('❯')
+  const body = text !== '' ? text : theme.muted('说点什么…')
+  return [truncateCells(` ${prompt} ${body}`, w)]
 }
 
 /** Bottom footer: run state + active route + cumulative usage. */
@@ -218,18 +208,5 @@ function short(cwd: string): string {
 }
 
 function truncateCells(line: string, width: number): string {
-  let used = 0
-  let out = ''
-  for (const ch of line) {
-    // SGR escapes carry zero width; pass them through untouched.
-    if (ch === '\x1b') {
-      out += ch
-      continue
-    }
-    const w = ch.codePointAt(0)! > 0x1100 && /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\uff00-\uff60]/u.test(ch) ? 2 : 1
-    if (used + w > width) break
-    out += ch
-    used += w
-  }
-  return out
+  return truncateWidth(line, width)
 }

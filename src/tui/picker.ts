@@ -8,6 +8,7 @@
  */
 
 import { theme } from './theme.js'
+import { truncateWidth } from './width.js'
 
 export interface PickerItem {
   /** Value carried out on selection (id / effort id). */
@@ -44,7 +45,7 @@ export function pickedItem(state: PickerState): PickerItem | undefined {
 
 /** Render the picker as an overlay block (already themed). */
 export function renderPicker(state: PickerState, width: number): string[] {
-  const lines: string[] = [theme.accent(`┌ ${state.title}`)]
+  const lines: string[] = [theme.border(`╭─ ${theme.accent(state.title)}`)]
   const from = Math.max(0, state.index - 8)
   const visible = state.items.slice(from, from + 17)
   for (let i = 0; i < visible.length; i++) {
@@ -54,24 +55,8 @@ export function renderPicker(state: PickerState, width: number): string[] {
     const cursor = actual === state.index ? '❯ ' : '  '
     const hint = item.hint ? theme.muted(` — ${item.hint}`) : ''
     const body = `${cursor}${item.label}${hint}`
-    lines.push(truncate(actual === state.index ? theme.selected(body) : body, width - 2))
+    lines.push(truncateWidth(actual === state.index ? theme.selected(body) : body, Math.max(8, width - 2)))
   }
-  lines.push(theme.muted('└ ↑/↓ 选择 · Enter 确认 · Esc 取消'))
+  lines.push(theme.border('╰─') + theme.muted(' ↑/↓ 选择 · Enter 确认 · Esc 取消'))
   return lines
-}
-
-function truncate(line: string, width: number): string {
-  let used = 0
-  let out = ''
-  for (const ch of line) {
-    if (ch === '\x1b') {
-      out += ch
-      continue
-    }
-    const w = ch.codePointAt(0)! > 0x1100 && /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\uff00-\uff60]/u.test(ch) ? 2 : 1
-    if (used + w > width) break
-    out += ch
-    used += w
-  }
-  return out
 }

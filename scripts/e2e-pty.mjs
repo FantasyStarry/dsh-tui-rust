@@ -96,11 +96,11 @@ function pickItemContaining(needle) {
   const normalize = (text) => text.toLowerCase().replaceAll(' ', '-')
   const target = normalize(needle)
   const plain = stripAnsi(buffer)
-  const region = plain.slice(plain.lastIndexOf('┌ 选择'))
+  const region = plain.slice(plain.lastIndexOf('╭─ 选择'))
   const lines = region.split('\r\n').map((line) => line.trim())
-  const titleIndex = lines.findIndex((line) => line.startsWith('┌'))
+  const titleIndex = lines.findIndex((line) => line.startsWith('╭─'))
   if (titleIndex < 0) throw new Error(`picker 未在屏上：找不到标题行（needle=${needle}）`)
-  const itemIndex = lines.findIndex((line, i) => i > titleIndex && !line.startsWith('└') && normalize(line).includes(target))
+  const itemIndex = lines.findIndex((line, i) => i > titleIndex && !line.startsWith('╰') && normalize(line).includes(target))
   if (itemIndex < 0) throw new Error(`picker 中找不到包含「${needle}」的项（可见项：${lines.slice(titleIndex + 1, titleIndex + 8).join(' | ')}）`)
   for (let i = 0; i < itemIndex - titleIndex - 1; i++) proc.write('\x1b[B')
   proc.write('\r')
@@ -111,7 +111,7 @@ const globalTimer = setTimeout(() => {
 }, GLOBAL_TIMEOUT_MS)
 
 try {
-  await waitMarker('TUI 启动（欢迎卡片）', /✻ orca/)
+  await waitMarker('TUI 启动（欢迎区）', /DeepSeek Harness 终端前端/)
   await waitMarker('session 已连接', /session 已连接：session-[0-9a-f-]+/)
 
   // Parse the live route from the slim route line — never hardcode the
