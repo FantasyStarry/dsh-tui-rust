@@ -67,7 +67,7 @@ dsh --profile orca          # 或安装后直接 orca
 
 - [x] **M0 骨架**：插件契约、cordis.patch.yml、差分渲染器、键盘、Channel 投影、假内核 dev harness
 - [x] **M1 真内核闭环**（实测验收 ✔）：agents 镜像对齐真实 API（dsh 0.1.1-rc.2：`AgentHandle{agent,dispose}`、`followup(UserMessage)`、`assistant/chunk` 流式信封）；profile 挂载实测（`link:` 挂载 + Standard Schema `Config` + `inject:[agents]` + loader 激活等待 + `agentDefaultModel` 默认模型接入 + 工厂注册竞态重试）；流式 delta 真终端上屏
-- [ ] **M2a 可用性**（代码就绪，待真终端验收）：主题 token 骨架（`NO_COLOR` 可降级）；状态栏显示当前 route/model/思考强度与 token 用量（取自 `request/header` 与 `assistant/message.usage`）；思考块折叠 + 思考中计时；`/model` 三段选择器（provider → model → 思考强度），经 `agent/request` waterfall 运行中热切换、`agentDefaultModel.saveSelection` 尽力持久化
+- [x] **M2a 可用性**（实测验收 ✔：PTY 端到端 + 假内核契约冒烟）：主题 token 骨架（`NO_COLOR` 可降级）；状态栏显示当前 route/model/思考强度与 token 用量（取自 `request/header` 与 `assistant/message.usage`）；思考块折叠 + 思考中计时；`/model` 三段选择器（provider → model → 思考强度），经 `agent/request` waterfall 运行中热切换、`agentDefaultModel.saveSelection` 尽力持久化
 - [ ] **M2b 视觉**：Markdown 渲染、代码高亮、工具卡三态、diff 视图、scrollback 封存
 - [ ] **M3 会话**：`/resume` 浏览器、会话标题、`/compact`、rewind（双击 Esc 时间回溯）
 - [ ] **M4 壳层**：权限审批面板、hooks、状态栏插槽、fullscreen 备用屏 + 鼠标选区
