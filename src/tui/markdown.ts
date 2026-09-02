@@ -65,16 +65,17 @@ export function renderMarkdown(text: string, width: number): string[] {
       if (!inFence) {
         inFence = true
         fenceLang = normalizeLang(fenceMatch[1] ?? '')
-        lines.push(theme.muted(`  ┌─${fenceLang === '' ? '──' : ` ${fenceLang} `}${'─'.repeat(8)}`))
+        const label = fenceLang === '' ? 'code' : fenceLang
+        lines.push(theme.muted(`╭─ ${label} ` + '─'.repeat(10)))
       } else {
         inFence = false
-        lines.push(theme.muted('  └' + '─'.repeat(12)))
+        lines.push(theme.muted('╰' + '─'.repeat(14)))
       }
       continue
     }
     if (inFence) {
       const spans = highlightCodeLine(raw, fenceLang)
-      lines.push('  ' + renderSpans(spans, width - 4))
+      lines.push(theme.muted('│ ') + renderSpans(spans, width - 4))
       continue
     }
 
@@ -83,7 +84,7 @@ export function renderMarkdown(text: string, width: number): string[] {
       const level = (heading[1] ?? '#').length
       const body = inlineSpans(heading[2] ?? '')
       const mark = level <= 2 ? '■ ' : '▪ '
-      for (const line of wrapSpans([{ text: mark, paint: theme.accent }, ...body], width - 2, '  ')) {
+      for (const line of wrapSpans([{ text: mark, paint: theme.accent }, ...body], width)) {
         lines.push(line)
       }
       continue
@@ -91,14 +92,14 @@ export function renderMarkdown(text: string, width: number): string[] {
 
     const rule = /^\s*(---+|\*\*\*+)\s*$/.exec(raw)
     if (rule) {
-      lines.push(theme.muted('  ' + '─'.repeat(16)))
+      lines.push(theme.muted('─'.repeat(16)))
       continue
     }
 
     const quote = /^\s*>\s?(.*)$/.exec(raw)
     if (quote) {
       const body = inlineSpans(quote[1] ?? '')
-      for (const line of wrapSpans([{ text: '▏ ', paint: theme.muted }, ...body], width - 2, '  ')) {
+      for (const line of wrapSpans([{ text: '▏ ', paint: theme.muted }, ...body], width)) {
         lines.push(line)
       }
       continue
@@ -107,7 +108,7 @@ export function renderMarkdown(text: string, width: number): string[] {
     const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(raw)
     if (bullet) {
       const depth = Math.floor((bullet[1]?.length ?? 0) / 2)
-      const indent = '  ' + '  '.repeat(depth)
+      const indent = '  '.repeat(depth)
       const body = inlineSpans(bullet[2] ?? '')
       for (const line of wrapSpans([{ text: '• ', paint: theme.accent }, ...body], width, indent)) {
         lines.push(line)
@@ -118,7 +119,7 @@ export function renderMarkdown(text: string, width: number): string[] {
     const ordered = /^(\s*)\d+[.)]\s+(.*)$/.exec(raw)
     if (ordered) {
       const depth = Math.floor((ordered[1]?.length ?? 0) / 2)
-      const indent = '  ' + '  '.repeat(depth) + '  '
+      const indent = '  '.repeat(depth) + '  '
       const body = inlineSpans(ordered[2] ?? '')
       for (const line of wrapSpans(body, width, indent)) {
         lines.push(line)
@@ -131,10 +132,10 @@ export function renderMarkdown(text: string, width: number): string[] {
       continue
     }
 
-    for (const line of wrapSpans(inlineSpans(raw), width, '  ')) {
+    for (const line of wrapSpans(inlineSpans(raw), width)) {
       lines.push(line)
     }
   }
-  if (inFence) lines.push(theme.muted('  └' + '─'.repeat(12)))
+  if (inFence) lines.push(theme.muted('╰' + '─'.repeat(14)))
   return lines
 }

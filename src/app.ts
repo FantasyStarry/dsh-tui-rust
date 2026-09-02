@@ -22,7 +22,7 @@ import type { SessionRoute } from './adapter/channel.js'
 import type { OrcaConfig } from './index.js'
 import type { Agent, AgentHandle, KernelAgentDefaultModel, KernelAgentsService, KernelContext, KernelLlmService, KernelLoader, SessionEvent, UserMessage } from './kernel/types.js'
 import { KERNEL_EVENTS } from './kernel/types.js'
-import { bannerLine, buildFrame } from './tui/chat.js'
+import { buildFrame, routeKey, routeLine, welcomeCard } from './tui/chat.js'
 import { classify, Keyboard } from './tui/input.js'
 import type { KeyPress } from './tui/input.js'
 import { openPicker, movePicker, pickedItem, type PickerItem, type PickerState } from './tui/picker.js'
@@ -382,16 +382,26 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   })
 
   let flushedSealed = 0
-  let lastBanner = ''
+  let welcomed = false
+  let lastRouteKey = ''
   const render = (): void => {
     const route = selection ?? channel.route
-    const banner = bannerLine(process.cwd(), route, channel.usage, agent?.session.id ?? null)
     const stream: string[] = []
-    if (banner !== lastBanner) {
-      // The banner lives in the stream: it lands in scrollback with each
-      // turn's sealed content instead of pinning the top of the screen.
-      stream.push(banner)
-      lastBanner = banner
+    // One-time welcome card; afterwards only route changes print a slim
+    // line — the scrollback stream never accumulates repeated banners.
+    if (!welcomed) {
+      welcomed = true
+      stream.push(...welcomeCard(process.cwd(), stdout.columns ?? 80))
+      if (route) {
+        stream.push(routeLine(route))
+        lastRouteKey = routeKey(route)
+      }
+    } else if (route) {
+      const key = routeKey(route)
+      if (key !== lastRouteKey) {
+        lastRouteKey = key
+        stream.push(routeLine(route))
+      }
     }
     const frame = buildFrame({
       channel,

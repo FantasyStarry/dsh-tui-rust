@@ -388,6 +388,9 @@ async function main(): Promise<void> {
   stdin2.key('up')
   stdin2.key('return')
   await sleep(120)
+  // Snapshot BEFORE dispose: dispose intentionally wipes the live region
+  // (including the footer) — the final chrome check targets the live UI.
+  const rows2 = paintScreen(writes2)
   dispose2()
   await sleep(20) // handle.dispose() settles
 
@@ -400,14 +403,16 @@ async function main(): Promise<void> {
   if (!painted2.includes('你好，Orca。')) problems.push('phase2：assistant 流式转录缺失')
   if (!painted2.includes('流式增量上屏测试。')) problems.push('phase2：增量 chunk 未并入同一行')
   if (!painted2.includes('• 列表一') || !painted2.includes('• 列表二')) problems.push('phase2：markdown 列表未渲染')
-  if (!painted2.includes('┌─ ts ')) problems.push('phase2：围栏代码块未渲染')
+  if (!painted2.includes('╭─ ts ')) problems.push('phase2：围栏代码块未渲染')
   if (!painted2.includes('const n = 1')) problems.push('phase2：代码行未渲染')
   if (!painted2.includes('思考一下。')) problems.push('phase2：reasoning-delta 未进思考行')
   if (!/已思考 \d+(\.\d+)?s/.test(painted2)) problems.push('phase2：思考块未折叠为时长摘要')
-  if (!painted2.includes('┌─ ✔ edit · src/app.ts')) problems.push('phase2：工具 diff 卡头未渲染')
+  if (!painted2.includes('⏺ edit src/app.ts')) problems.push('phase2：工具 diff 卡头未渲染')
   if (!painted2.includes('+ const a = 2') || !painted2.includes('- const a = 1')) problems.push('phase2：diff 增删行未着色渲染')
   if (!painted2.includes('+ const b = 3')) problems.push('phase2：diff 新增行缺失')
-  if (!painted2.includes('default-provider/default-model')) problems.push('phase2：状态栏未显示 request/header 路由')
+  if (!painted2.includes('✻ orca')) problems.push('phase2：欢迎卡片缺失')
+  if (!painted2.includes('↳ 模型 default-provider/default-model')) problems.push('phase2：路由线未打印')
+  if (!painted2.includes('default-provider/default-model')) problems.push('phase2：页脚未显示 request/header 路由')
   if (!painted2.includes('↑120') || !painted2.includes('↓45')) problems.push('phase2：token 用量未上屏')
   if (!painted2.includes('就绪')) problems.push('phase2：turn/end 后状态未回就绪')
   for (const expect of ['选择 Provider', '选择模型（fake-a）', '选择思考强度（fake-a-m1）', '模型已切换：fake-a/fake-a-m1(low)']) {
@@ -441,6 +446,22 @@ async function main(): Promise<void> {
   if (lastFollowup?.source['kind'] !== 'user') problems.push('phase2：followup 消息缺 user 来源')
   if (record.cancelCause?.kind !== 'user') problems.push('phase2：cancel 未携带 user 原因')
   if (!record.disposed) problems.push('phase2：dispose 未触达 handle.dispose')
+
+  // Final VISIBLE screen tail must be the intact chrome: box → hint →
+  // footer, each exactly once (the seal-shrink stale-clear regression kept
+  // ghost copies of the hint right below the live region).
+  while (rows2.length > 0 && rows2[rows2.length - 1] === '') rows2.pop()
+  const tail = rows2.slice(-5)
+  const hint = 'Enter 发送 · /model 切换模型 · Esc 清空/取消 · Ctrl+C 退出'
+  if (tail.length !== 5) problems.push(`phase2：最终画面尾部不足 5 行：${JSON.stringify(rows2.slice(-8))}`)
+  if (!(tail[1]?.startsWith('│ ❯ 说点什么…') && tail[1]?.endsWith('│'))) {
+    problems.push(`phase2：输入框行不完整：${JSON.stringify(tail[1])}`)
+  }
+  if (tail[3] !== hint) problems.push(`phase2：提示行缺失或不唯一：${JSON.stringify(tail)}`)
+  // The q1 submit opened the second turn — the footer is mid-turn here.
+  if (tail[4] === undefined || !tail[4].includes('◐ 思考中…')) problems.push(`phase2：页脚缺失或状态不符：${JSON.stringify(tail[4])}`)
+  // The /model switch happened before q1 — the footer must show the LIVE selection.
+  if (tail[4] === undefined || !tail[4].includes('fake-a/fake-a-m1(low)')) problems.push(`phase2：页脚未反映切换后路由：${JSON.stringify(tail[4])}`)
 
   if (problems.length > 0) {
     console.error(`smoke 失败：${problems.join('；')}`)

@@ -111,13 +111,14 @@ const globalTimer = setTimeout(() => {
 }, GLOBAL_TIMEOUT_MS)
 
 try {
-  await waitMarker('TUI 启动（orca 头栏）', /── orca ·/)
+  await waitMarker('TUI 启动（欢迎卡片）', /✻ orca/)
   await waitMarker('session 已连接', /session 已连接：session-[0-9a-f-]+/)
 
-  // Parse the live route from the header — never hardcode the composition.
+  // Parse the live route from the slim route line — never hardcode the
+  // composition default.
   await sleep(300)
-  const routeMatch = /· ([A-Za-z0-9._-]+)\/([^\x1b·\r\n ]+)(?:\([^)]*\))? · #[0-9a-f]{8}/.exec(stripAnsi(buffer))
-  if (!routeMatch) fail(`头栏未解析出路由：${stripAnsi(buffer).slice(-300)}`)
+  const routeMatch = /↳ 模型 ([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)/.exec(stripAnsi(buffer))
+  if (!routeMatch) fail(`未解析出路由行：${stripAnsi(buffer).slice(-300)}`)
   const provider = routeMatch[1]
   const model = routeMatch[2]
   markersSeen.push(`路由 ${provider}/${model}`)

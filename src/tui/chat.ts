@@ -5,19 +5,24 @@
  * render tick, never mutating inputs. All color goes through the theme
  * tokens; the frame never embeds raw SGR itself.
  *
+ * Visual language (Claude Code / kimi-code school): a one-time welcome card
+ * and slim route lines live in the scrollback stream — no persistent top
+ * banner; ⏺ tool markers; a rounded input box pinned at the bottom with a
+ * dim hint and a footer carrying state + route + usage.
+ *
  * Frame split (the scrollback-sealing contract, ADR-0001):
  * - `stream` — newly sealed transcript rows (final, immutable) plus the
- *   banner line whenever it changed. The renderer writes them once at the
- *   top of the tracked region; the overflow past the screen bottom scrolls
- *   into the terminal's native scrollback.
- * - `live` — open rows of the current turn + the chrome (status, editor,
- *   hints, picker overlay). Diff-painted in place every tick.
+ *   welcome card / route lines when due. Written once at the top of the
+ *   tracked region; overflow scrolls into the terminal's native scrollback.
+ * - `live` — open rows of the current turn + input box + footer. Diffed
+ *   in place every tick.
  */
 
 import type { AgentRunState, Channel, SessionRoute, SessionUsage, TranscriptRow } from '../adapter/channel.js'
 import { renderMarkdown } from './markdown.js'
 import { renderPicker, type PickerState } from './picker.js'
 import { theme } from './theme.js'
+import { stringWidth } from './width.js'
 import { wrapWidth } from './width.js'
 
 export interface FrameContext {
@@ -33,14 +38,14 @@ export interface FrameContext {
   readonly usage: SessionUsage
   /** Wall-clock now, for the live thought timer. */
   readonly now: number
-  /** Active `/model` picker overlay lines, rendered above the status bar. */
+  /** Active `/model` picker overlay lines, rendered above the input box. */
   readonly picker: PickerState | null
 }
 
 export interface ChatFrame {
-  /** Newly sealed lines + the banner on change — written once, never repainted. */
+  /** Newly sealed lines + one-time cards — written once, never repainted. */
   readonly stream: readonly string[]
-  /** Open rows + chrome — diff-painted in place. */
+  /** Open rows + input box + footer — diff-painted in place. */
   readonly live: readonly string[]
 }
 
@@ -58,7 +63,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     stream.push(...renderRow(row, ctx))
   }
 
-  // Live region: open rows of the current turn + the chrome.
+  // Live region: open rows of the current turn + the bottom chrome.
   const openRows = ctx.channel.rows.slice(sealedTo)
   let openLines: string[] = []
   for (const row of openRows) {
@@ -75,26 +80,41 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     live.push(...renderPicker(ctx.picker, width))
     live.push('')
   }
-  live.push(statusLine(ctx.channel.runState, width))
-  live.push(inputLine(ctx.editorText, width))
+  live.push(...inputBox(ctx.editorText, width))
   live.push(theme.muted('Enter 发送 · /model 切换模型 · Esc 清空/取消 · Ctrl+C 退出'))
+  live.push(footerLine(ctx.channel.runState, ctx.route, ctx.usage, width))
   return { stream, live }
 }
 
-/** The session banner — pushed into the stream whenever it changes. */
-export function bannerLine(cwd: string, route: SessionRoute | null, usage: SessionUsage, sessionId: string | null): string {
-  const parts: string[] = [`── orca · ${short(cwd)}`]
-  if (route) {
-    const effort = route.reasoningEffort ? `(${route.reasoningEffort})` : ''
-    parts.push(theme.warn(`${route.provider}/${route.model}${effort}`))
-  } else {
-    parts.push(theme.muted('route/默认'))
+/** One-time welcome card — the only banner orca ever prints. */
+export function welcomeCard(cwd: string, width: number): string[] {
+  const boxWidth = Math.min(Math.max(34, width - 4), 64)
+  const inner = boxWidth - 2
+  const border = theme.primary('╭' + '─'.repeat(inner) + '╮')
+  const bottom = theme.primary('╰' + '─'.repeat(inner) + '╯')
+  const row = (content: string): string => {
+    const visible = stringWidth(content.replaceAll(/\x1b\[[0-9;?]*[A-Za-z]/g, ''))
+    const pad = Math.max(0, inner - 2 - visible)
+    return '│  ' + content + ' '.repeat(pad) + theme.primary(' │')
   }
-  if (usage.messages > 0) {
-    parts.push(theme.muted(`↑${fmtTokens(usage.input)} ↓${fmtTokens(usage.output)}${usage.reasoning > 0 ? ` ✻${fmtTokens(usage.reasoning)}` : ''}`))
-  }
-  if (sessionId) parts.push(theme.muted(`#${shortSession(sessionId)}`))
-  return parts.join(' · ')
+  return [
+    border,
+    row(theme.primary('✻ orca') + ' — DeepSeek Harness 终端前端'),
+    row(theme.muted(short(cwd))),
+    row(theme.muted('/model 切换模型 · Esc 取消 · Ctrl+C 退出')),
+    bottom,
+    '',
+  ]
+}
+
+/** Slim in-stream line announcing the active route (on connect / change). */
+export function routeLine(route: SessionRoute): string {
+  const effort = route.reasoningEffort ? `(${route.reasoningEffort})` : ''
+  return theme.accent(`↳ 模型 ${route.provider}/${route.model}${effort}`)
+}
+
+export function routeKey(route: SessionRoute): string {
+  return `${route.provider}/${route.model}/${route.reasoningEffort ?? ''}`
 }
 
 function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
@@ -104,7 +124,7 @@ function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
     case 'user':
       return [theme.strong('❯ ' + (wrapped[0] ?? '')), ...wrapped.slice(1).map(theme.muted)]
     case 'assistant':
-      // Markdown for the model's voice; the md layer owns base indentation.
+      // Markdown for the model's voice; the md layer owns indentation.
       return renderMarkdown(row.text || '…', width)
     case 'thought': {
       // Sealed: one collapsed summary line (full text stays in the session log).
@@ -120,29 +140,28 @@ function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
     case 'tool': {
       const out: string[] = []
       const mark =
-        row.status === 'ok'
-          ? theme.ok('✔')
-          : row.status === 'failed'
-            ? theme.fail('✘')
-            : theme.muted('◌')
+        row.status === 'running'
+          ? theme.primary('⏺')
+          : row.status === 'ok'
+            ? theme.ok('⏺')
+            : row.status === 'failed'
+              ? theme.fail('⏺')
+              : theme.muted('⏺')
       const diff = row.diff
       if (diff) {
-        // Diff card: header with path and +/- counts, then colored hunks.
-        const head = truncateCells(`  ┌─ ${mark} ${row.tool ?? 'tool'} · ${diff.path}`, Math.max(12, width - 10))
+        const head = truncateCells(`  ${mark} ${row.tool ?? 'tool'} ${diff.path}`, Math.max(12, width - 10))
         const removed = diff.removed > 0 ? ` ${theme.fail(`−${diff.removed}`)}` : ''
-        out.push(theme.strong(head) + ` ${theme.ok(`+${diff.added}`)}${removed}`)
+        out.push(head + ` ${theme.ok(`+${diff.added}`)}${removed}`)
         for (const line of diff.lines) {
           const text = truncateCells(line.text, Math.max(8, width - 8))
           if (line.kind === 'add') out.push(theme.ok(`  │ + ${text}`))
           else if (line.kind === 'del') out.push(theme.fail(`  │ - ${text}`))
           else out.push(theme.muted(`  │   ${text}`))
         }
-        out.push(theme.muted('  └─'))
         return out
       }
-      const head = `  [${mark}] ${row.tool ?? 'tool'}${row.status === 'running' ? theme.muted(' …') : ''}`
-      out.push(truncateCells(head, width))
-      out.push(...wrapped.slice(0, 3).map((line) => theme.muted('      ' + line)))
+      out.push(truncateCells(`  ${mark} ${row.tool ?? 'tool'}${row.status === 'running' ? theme.muted(' …') : ''}`, width))
+      out.push(...wrapped.slice(0, 3).map((line) => theme.muted('    └ ' + line)))
       return out
     }
     case 'system':
@@ -150,26 +169,39 @@ function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
   }
 }
 
-function statusLine(state: AgentRunState, width: number): string {
-  const label = state === 'idle' ? '就绪' : state === 'thinking' ? '思考中…' : '执行工具…'
-  const dot = state === 'idle' ? theme.ok('●') : theme.live('◐')
-  return truncateCells(theme.strong(`${dot} ${label}`), width)
+/** Rounded input box, Claude-Code style, pinned at the bottom. */
+function inputBox(text: string, width: number): string[] {
+  const w = Math.max(20, width)
+  const inner = Math.max(1, w - 4)
+  const content = theme.strong('❯ ') + (text !== '' ? text : theme.muted('说点什么…'))
+  const visible = stringWidth(content.replaceAll(/\x1b\[[0-9;?]*[A-Za-z]/g, ''))
+  const pad = Math.max(0, inner - visible)
+  return [
+    theme.primary('╭' + '─'.repeat(w - 2) + '╮'),
+    '│ ' + content + ' '.repeat(pad) + ' │',
+    theme.primary('╰' + '─'.repeat(w - 2) + '╯'),
+  ]
 }
 
-function inputLine(text: string, width: number): string {
-  const prompt = theme.strong('❯ ')
-  const body = text.length > 0 ? text : theme.muted('说点什么…')
-  return truncateCells(prompt + body, width)
+/** Bottom footer: run state + active route + cumulative usage. */
+function footerLine(state: AgentRunState, route: SessionRoute | null, usage: SessionUsage, width: number): string {
+  const dot = state === 'idle' ? theme.ok('●') : theme.live('◐')
+  const label = state === 'idle' ? '就绪' : state === 'thinking' ? '思考中…' : '执行工具…'
+  const parts = [theme.strong(`${dot} ${label}`)]
+  if (route) {
+    const effort = route.reasoningEffort ? `(${route.reasoningEffort})` : ''
+    parts.push(theme.muted(`${route.provider}/${route.model}${effort}`))
+  }
+  if (usage.messages > 0) {
+    parts.push(theme.muted(`↑${fmtTokens(usage.input)} ↓${fmtTokens(usage.output)}${usage.reasoning > 0 ? ` ✻${fmtTokens(usage.reasoning)}` : ''}`))
+  }
+  return truncateCells(parts.join(' · '), width)
 }
 
 function fmtTokens(count: number): string {
   if (count >= 100000) return `${Math.round(count / 1000)}k`
   if (count >= 1000) return `${(count / 1000).toFixed(1)}k`
   return String(count)
-}
-
-function shortSession(id: string): string {
-  return id.replace(/^session-/, '').slice(0, 8)
 }
 
 function short(cwd: string): string {

@@ -50,6 +50,12 @@ export class Renderer {
       for (const line of frame) {
         out.push(CLEAR_LINE, line, '\r\n')
       }
+      // Clear whatever is left of the old region below the new frame — the
+      // seal flush often SHRINKS the live region (previous turn's rows left),
+      // and uncleared rows kept ghost copies of the chrome on screen.
+      const written = stream.length + frame.length
+      const stale = n - written
+      if (stale > 0) out.push(CLEAR_LINE, '\x1b[0J')
       if (frame.length > 0) out.push('\x1b[1A')
       this.stdout.write(out.join(''))
       this.last = [...frame]

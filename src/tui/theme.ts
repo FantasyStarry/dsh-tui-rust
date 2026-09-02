@@ -15,7 +15,9 @@ function wrap(open: string, close: string): Paint {
 }
 
 export const theme = {
-  /** Primary accent — header, active markers. */
+  /** Brand / primary accent — welcome card, active tool marker (amber). */
+  primary: wrap('\x1b[33m', '\x1b[39m'),
+  /** Secondary accent — headings, bullets, inline code (cyan). */
   accent: wrap('\x1b[36m', '\x1b[39m'),
   /** De-emphasized content — hints, sealed thoughts, secondary lines. */
   muted: wrap('\x1b[2m', '\x1b[22m'),
