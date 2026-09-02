@@ -24,5 +24,5 @@ Orca 采用**路线 2 的自建实现**（`src/tui/renderer.ts`）：组件产�
 ## 后果与待办
 
 - 行宽度计算必须按 terminal cell：骨架用占位实现（`src/tui/width.ts`），生产必须换 `get-east-asian-width`（pi-tui 同款依赖）；
-- inline 主屏的 scrollback 密封（已完成的转录行提交进终端原生滚动缓冲）是下一个渲染里程碑；
+- ~~inline 主屏的 scrollback 密封~~ ✅（M2b 已落地）：帧拆为「流 + 活动区」——已定稿行在 `turn/start` 封存，随渲染流一次性写入（写在活动区顶部、溢出自然滚入回滚区，之后不再跟踪重绘）；头部横幅改为变更即入流（成为回滚区里的回合分隔条）；活动区只剩当前回合开行 + 界面框架，永不增长；
 - 备用屏（fullscreen）、鼠标选区、OSC 52 复制、Kitty 键盘协议按 pi-tui 的实现逐个对齐。

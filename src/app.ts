@@ -22,7 +22,7 @@ import type { SessionRoute } from './adapter/channel.js'
 import type { OrcaConfig } from './index.js'
 import type { Agent, AgentHandle, KernelAgentDefaultModel, KernelAgentsService, KernelContext, KernelLlmService, KernelLoader, SessionEvent, UserMessage } from './kernel/types.js'
 import { KERNEL_EVENTS } from './kernel/types.js'
-import { buildFrame } from './tui/chat.js'
+import { bannerLine, buildFrame } from './tui/chat.js'
 import { classify, Keyboard } from './tui/input.js'
 import type { KeyPress } from './tui/input.js'
 import { openPicker, movePicker, pickedItem, type PickerItem, type PickerState } from './tui/picker.js'
@@ -381,20 +381,33 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
   })
 
+  let flushedSealed = 0
+  let lastBanner = ''
   const render = (): void => {
-    renderer.render(
-      buildFrame({
-        channel,
-        editorText: editor,
-        width: stdout.columns ?? 80,
-        cwd: process.cwd(),
-        sessionId: agent?.session.id ?? null,
-        route: selection ?? channel.route,
-        usage: channel.usage,
-        now: Date.now(),
-        picker,
-      }),
-    )
+    const route = selection ?? channel.route
+    const banner = bannerLine(process.cwd(), route, channel.usage, agent?.session.id ?? null)
+    const stream: string[] = []
+    if (banner !== lastBanner) {
+      // The banner lives in the stream: it lands in scrollback with each
+      // turn's sealed content instead of pinning the top of the screen.
+      stream.push(banner)
+      lastBanner = banner
+    }
+    const frame = buildFrame({
+      channel,
+      sealedFrom: flushedSealed,
+      editorText: editor,
+      width: stdout.columns ?? 80,
+      cwd: process.cwd(),
+      sessionId: agent?.session.id ?? null,
+      route,
+      usage: channel.usage,
+      now: Date.now(),
+      picker,
+    })
+    stream.push(...frame.stream)
+    renderer.render(frame.live, stream)
+    flushedSealed = Math.min(channel.sealedRowCount, channel.rows.length)
   }
 
   // ~30fps render tick; the diff painter collapses no-op frames to zero

@@ -1,18 +1,29 @@
 /**
- * Chat view: transcript rows + single-line editor → frame lines.
+ * Chat view: transcript rows → (stream, live) frame lines.
  *
  * Pure function of (channel, editor, width, live UI state) — rebuilt per
  * render tick, never mutating inputs. All color goes through the theme
  * tokens; the frame never embeds raw SGR itself.
+ *
+ * Frame split (the scrollback-sealing contract, ADR-0001):
+ * - `stream` — newly sealed transcript rows (final, immutable) plus the
+ *   banner line whenever it changed. The renderer writes them once at the
+ *   top of the tracked region; the overflow past the screen bottom scrolls
+ *   into the terminal's native scrollback.
+ * - `live` — open rows of the current turn + the chrome (status, editor,
+ *   hints, picker overlay). Diff-painted in place every tick.
  */
 
 import type { AgentRunState, Channel, SessionRoute, SessionUsage, TranscriptRow } from '../adapter/channel.js'
+import { renderMarkdown } from './markdown.js'
 import { renderPicker, type PickerState } from './picker.js'
 import { theme } from './theme.js'
 import { wrapWidth } from './width.js'
 
 export interface FrameContext {
   readonly channel: Channel
+  /** First row index not yet flushed to scrollback (the app's cursor). */
+  readonly sealedFrom: number
   readonly editorText: string
   readonly width: number
   readonly cwd: string
@@ -26,48 +37,63 @@ export interface FrameContext {
   readonly picker: PickerState | null
 }
 
-const MAX_TRANSCRIPT_LINES = 512
-
-export function buildFrame(ctx: FrameContext): string[] {
-  const width = Math.max(20, ctx.width)
-  const lines: string[] = []
-
-  lines.push(truncateCells(headerLine(ctx), width))
-  lines.push('')
-
-  const transcript: string[] = []
-  for (const row of ctx.channel.rows) {
-    transcript.push(...renderRow(row, ctx))
-  }
-  for (const line of transcript.slice(-MAX_TRANSCRIPT_LINES)) {
-    lines.push(line)
-  }
-
-  lines.push('')
-  if (ctx.picker) {
-    lines.push(...renderPicker(ctx.picker, width))
-    lines.push('')
-  }
-  lines.push(statusLine(ctx.channel.runState, width))
-  lines.push(inputLine(ctx.editorText, width))
-  lines.push(theme.muted('Enter 发送 · /model 切换模型 · Esc 清空/取消 · Ctrl+C 退出'))
-  return lines
+export interface ChatFrame {
+  /** Newly sealed lines + the banner on change — written once, never repainted. */
+  readonly stream: readonly string[]
+  /** Open rows + chrome — diff-painted in place. */
+  readonly live: readonly string[]
 }
 
-function headerLine(ctx: FrameContext): string {
-  const parts: string[] = [`── orca · ${short(ctx.cwd)}`]
-  const route = ctx.route
+/** Hard cap for open-row lines in the live region (safety on tiny viewports). */
+const MAX_OPEN_LINES = 120
+
+export function buildFrame(ctx: FrameContext): ChatFrame {
+  const width = Math.max(20, ctx.width)
+  const stream: string[] = []
+  const live: string[] = []
+
+  // Newly sealed transcript rows → written once into scrollback.
+  const sealedTo = Math.min(ctx.channel.sealedRowCount, ctx.channel.rows.length)
+  for (const row of ctx.channel.rows.slice(ctx.sealedFrom, sealedTo)) {
+    stream.push(...renderRow(row, ctx))
+  }
+
+  // Live region: open rows of the current turn + the chrome.
+  const openRows = ctx.channel.rows.slice(sealedTo)
+  let openLines: string[] = []
+  for (const row of openRows) {
+    openLines.push(...renderRow(row, ctx))
+  }
+  if (openLines.length > MAX_OPEN_LINES) {
+    const dropped = openLines.length - MAX_OPEN_LINES
+    openLines = [theme.muted(`… 本回合前 ${dropped} 行暂省（回合结束后进历史）`), ...openLines.slice(-MAX_OPEN_LINES)]
+  }
+
+  if (openLines.length > 0) live.push('', ...openLines)
+  live.push('')
+  if (ctx.picker) {
+    live.push(...renderPicker(ctx.picker, width))
+    live.push('')
+  }
+  live.push(statusLine(ctx.channel.runState, width))
+  live.push(inputLine(ctx.editorText, width))
+  live.push(theme.muted('Enter 发送 · /model 切换模型 · Esc 清空/取消 · Ctrl+C 退出'))
+  return { stream, live }
+}
+
+/** The session banner — pushed into the stream whenever it changes. */
+export function bannerLine(cwd: string, route: SessionRoute | null, usage: SessionUsage, sessionId: string | null): string {
+  const parts: string[] = [`── orca · ${short(cwd)}`]
   if (route) {
     const effort = route.reasoningEffort ? `(${route.reasoningEffort})` : ''
     parts.push(theme.warn(`${route.provider}/${route.model}${effort}`))
   } else {
     parts.push(theme.muted('route/默认'))
   }
-  const usage = ctx.usage
   if (usage.messages > 0) {
     parts.push(theme.muted(`↑${fmtTokens(usage.input)} ↓${fmtTokens(usage.output)}${usage.reasoning > 0 ? ` ✻${fmtTokens(usage.reasoning)}` : ''}`))
   }
-  if (ctx.sessionId) parts.push(theme.muted(`#${shortSession(ctx.sessionId)}`))
+  if (sessionId) parts.push(theme.muted(`#${shortSession(sessionId)}`))
   return parts.join(' · ')
 }
 
@@ -78,7 +104,8 @@ function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
     case 'user':
       return [theme.strong('❯ ' + (wrapped[0] ?? '')), ...wrapped.slice(1).map(theme.muted)]
     case 'assistant':
-      return ['  ' + (wrapped[0] ?? ''), ...wrapped.slice(1).map((line) => '  ' + line)]
+      // Markdown for the model's voice; the md layer owns base indentation.
+      return renderMarkdown(row.text || '…', width)
     case 'thought': {
       // Sealed: one collapsed summary line (full text stays in the session log).
       if (row.seconds !== undefined) {
@@ -91,14 +118,32 @@ function renderRow(row: TranscriptRow, ctx: FrameContext): string[] {
       return [head, ...tail]
     }
     case 'tool': {
+      const out: string[] = []
       const mark =
         row.status === 'ok'
           ? theme.ok('✔')
           : row.status === 'failed'
             ? theme.fail('✘')
             : theme.muted('◌')
+      const diff = row.diff
+      if (diff) {
+        // Diff card: header with path and +/- counts, then colored hunks.
+        const head = truncateCells(`  ┌─ ${mark} ${row.tool ?? 'tool'} · ${diff.path}`, Math.max(12, width - 10))
+        const removed = diff.removed > 0 ? ` ${theme.fail(`−${diff.removed}`)}` : ''
+        out.push(theme.strong(head) + ` ${theme.ok(`+${diff.added}`)}${removed}`)
+        for (const line of diff.lines) {
+          const text = truncateCells(line.text, Math.max(8, width - 8))
+          if (line.kind === 'add') out.push(theme.ok(`  │ + ${text}`))
+          else if (line.kind === 'del') out.push(theme.fail(`  │ - ${text}`))
+          else out.push(theme.muted(`  │   ${text}`))
+        }
+        out.push(theme.muted('  └─'))
+        return out
+      }
       const head = `  [${mark}] ${row.tool ?? 'tool'}${row.status === 'running' ? theme.muted(' …') : ''}`
-      return [truncateCells(head, width), ...wrapped.slice(0, 3).map((line) => theme.muted('      ' + line))]
+      out.push(truncateCells(head, width))
+      out.push(...wrapped.slice(0, 3).map((line) => theme.muted('      ' + line)))
+      return out
     }
     case 'system':
       return wrapped.map((line) => theme.warn('  ⚑ ' + line))

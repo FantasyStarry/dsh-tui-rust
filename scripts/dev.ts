@@ -273,12 +273,9 @@ class FakeKernel implements KernelContext {
       header: { config: { provider: 'default-provider', model: 'default-model' } },
       reason: 'initial',
     })
-    at(40, 'assistant/chunk', { turn, step, chunk: { type: 'text-delta', index: 0, text: '你好，Orca。' } })
-    at(120, 'assistant/chunk', { turn, step, chunk: { type: 'text-delta', index: 0, text: '流式增量上屏测试。' } })
-    // Reasoning spans a long window so the live thought preview is
-    // well inside the render tick even under scheduler jitter.
+    at(40, 'assistant/chunk', { turn, step, chunk: { type: 'text-delta', index: 0, text: '**你好**，Orca。\n\n- 列表一\n- 列表二\n\n```ts\nconst n = 1 // 注释\n```\n\n流式增量上屏测试。' } })
     at(150, 'assistant/chunk', { turn, step, chunk: { type: 'reasoning-delta', index: 1, text: '思考一下。' } })
-    at(200, 'tool/call', { turn, step, callId: 'call-1', name: 'read', arguments: '{"path":"src/app.ts"}' })
+    at(200, 'tool/call', { turn, step, callId: 'call-1', name: 'edit', arguments: '{"path":"src/app.ts"}' })
     at(260, 'tool/result', {
       turn,
       step,
@@ -288,6 +285,7 @@ class FakeKernel implements KernelContext {
         content: [{ type: 'tool-result', toolCallId: 'call-1', content: [{ type: 'text', text: 'ok' }] }],
         source: { kind: 'tool', callId: 'call-1' },
       },
+      meta: { diffs: [{ path: 'src/app.ts', oldText: 'const a = 1\n', newText: 'const a = 2\nconst b = 3\n' }] },
     })
     at(560, 'assistant/message', {
       turn,
@@ -295,7 +293,7 @@ class FakeKernel implements KernelContext {
       message: {
         id: 'msg-assistant-1',
         role: 'assistant',
-        content: [{ type: 'text', text: '你好，Orca。流式增量上屏测试。' }],
+        content: [{ type: 'text', text: '**你好**，Orca。\n\n- 列表一\n- 列表二\n\n```ts\nconst n = 1 // 注释\n```\n\n流式增量上屏测试。' }],
         source: { kind: 'model', provider: 'default-provider', model: 'default-model' },
       },
       usage: { inputTokens: 120, outputTokens: 45, reasoningTokens: 30 },
@@ -321,19 +319,22 @@ async function main(): Promise<void> {
   }
 
   // ── Phase 0.5: renderer contract — the diff painter must reproduce the
-  // frame on screen, including pure-append growth (the parked-cursor
-  // regression: new lines used to overwrite the old last row).
+  // frame on screen: live append, the scrollback-seal stream path (sealed
+  // lines land between previously sealed content and the live rows, in
+  // order), and post-seal live growth.
   {
     const rw: string[] = []
     const renderer = new Renderer(makeStdout(rw), () => 80)
-    renderer.render(['A', 'B'])
-    renderer.render(['A', 'B', 'C']) // pure append below the old frame
-    renderer.render(['A', 'X', 'C']) // mid-frame change
-    renderer.render(['A', 'X']) // shrink clears stale lines below
+    renderer.render(['a1', 'a2']) // first frame
+    renderer.render(['a1', 'a2', 'a3']) // live append below
+    renderer.render(['a3'], ['s1', 's2']) // seal flush: sealed at top of tracked region
+    renderer.render(['a3', 'a4']) // post-seal live growth
+    renderer.render(['a5'], ['s3']) // second seal (replaces the sealed row's open text)
     const screen = paintScreen(rw)
     renderer.dispose()
     while (screen.length > 0 && screen[screen.length - 1] === '') screen.pop()
-    if (screen.join('\n') !== 'A\nX') problems.push(`phase0.5：渲染契约失真：${JSON.stringify(screen)}`)
+    const expected = 's1\ns2\ns3\na5'
+    if (screen.join('\n') !== expected) problems.push(`phase0.5：渲染契约失真：${JSON.stringify(screen)}`)
   }
 
   // ── Phase 1: degraded boot (#183) — no `agents` service, never a throw ───
@@ -398,9 +399,14 @@ async function main(): Promise<void> {
   if (!painted2.includes('帮我看看')) problems.push('phase2：user/message 未投影（session 非真源）')
   if (!painted2.includes('你好，Orca。')) problems.push('phase2：assistant 流式转录缺失')
   if (!painted2.includes('流式增量上屏测试。')) problems.push('phase2：增量 chunk 未并入同一行')
+  if (!painted2.includes('• 列表一') || !painted2.includes('• 列表二')) problems.push('phase2：markdown 列表未渲染')
+  if (!painted2.includes('┌─ ts ')) problems.push('phase2：围栏代码块未渲染')
+  if (!painted2.includes('const n = 1')) problems.push('phase2：代码行未渲染')
   if (!painted2.includes('思考一下。')) problems.push('phase2：reasoning-delta 未进思考行')
   if (!/已思考 \d+(\.\d+)?s/.test(painted2)) problems.push('phase2：思考块未折叠为时长摘要')
-  if (!painted2.includes('[✔] read')) problems.push('phase2：工具行未落到成功态')
+  if (!painted2.includes('┌─ ✔ edit · src/app.ts')) problems.push('phase2：工具 diff 卡头未渲染')
+  if (!painted2.includes('+ const a = 2') || !painted2.includes('- const a = 1')) problems.push('phase2：diff 增删行未着色渲染')
+  if (!painted2.includes('+ const b = 3')) problems.push('phase2：diff 新增行缺失')
   if (!painted2.includes('default-provider/default-model')) problems.push('phase2：状态栏未显示 request/header 路由')
   if (!painted2.includes('↑120') || !painted2.includes('↓45')) problems.push('phase2：token 用量未上屏')
   if (!painted2.includes('就绪')) problems.push('phase2：turn/end 后状态未回就绪')

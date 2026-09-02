@@ -24,11 +24,37 @@ export class Renderer {
     private readonly getWidth: () => number,
   ) {}
 
-  /** Repaint the frame; no-op when nothing changed. */
-  render(lines: readonly string[]): void {
+  /**
+   * Repaint the frame; no-op when nothing changed.
+   *
+   * `stream` lines are NEWLY SEALED history: written once at the top of the
+   * tracked region (below previously sealed content, above the live rows),
+   * then never tracked again — the overflow past the screen bottom scrolls
+   * into the terminal's own scrollback. The live frame is fully repainted in
+   * the same synchronized block, and afterwards only the live rows are
+   * diff-tracked.
+   */
+  render(live: readonly string[], stream: readonly string[] = []): void {
     const width = Math.max(1, this.getWidth())
-    const frame = lines.map((line) => truncateToCells(line, width))
-    if (sameFrame(frame, this.last) && frame.length === this.last.length) return
+    const frame = live.map((line) => truncateToCells(line, width))
+    if (stream.length === 0 && sameFrame(frame, this.last) && frame.length === this.last.length) return
+
+    if (stream.length > 0) {
+      const out: string[] = [SYNC_START]
+      const n = this.last.length
+      if (n > 1) out.push(`\x1b[${n - 1}A`)
+      out.push('\r')
+      for (const line of stream) {
+        out.push(CLEAR_LINE, truncateToCells(line, width), '\r\n')
+      }
+      for (const line of frame) {
+        out.push(CLEAR_LINE, line, '\r\n')
+      }
+      if (frame.length > 0) out.push('\x1b[1A')
+      this.stdout.write(out.join(''))
+      this.last = [...frame]
+      return
+    }
 
     let firstDiff = 0
     while (

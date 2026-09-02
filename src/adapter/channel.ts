@@ -26,15 +26,34 @@ export interface TranscriptRow {
   status?: 'pending' | 'running' | 'ok' | 'failed'
   /** Tool rows: tool display name. */
   tool?: string
-  /** Thought rows: wall-clock start while streaming (drives the live timer). */
+  /** Tool rows: thought-style live timer. */
   startMs?: number
   /** Thought rows: sealed duration in seconds (collapses the block). */
   seconds?: number
+  /** Tool rows: result diff card (dsh-tool-fs write/edit meta). */
+  diff?: ToolDiffView
   /** Monotonic frame counter bump marker for the renderer. */
   seq: number
 }
 
 export type AgentRunState = 'idle' | 'thinking' | 'working'
+
+/** One rendered line of a tool-result diff card. */
+export interface DiffLineView {
+  readonly kind: 'add' | 'del' | 'ctx'
+  readonly text: string
+}
+
+/** The diff card attached to a tool row (from `tool/result.meta.diffs`). */
+export interface ToolDiffView {
+  readonly path: string
+  readonly added: number
+  readonly removed: number
+  readonly lines: readonly DiffLineView[]
+}
+
+/** Hard cap on diff lines kept per tool row (excess collapses into a note). */
+const MAX_DIFF_LINES = 14
 
 /** The request route the log last recorded (`request/header` — the truth). */
 export interface SessionRoute {
@@ -126,6 +145,75 @@ function numOf(record: Record<string, unknown>, key: string): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
+/** One hunk's line diff: context / removed / added, via prefix-suffix trim. */
+function hunkDiffLines(oldText: string | null, newText: string): DiffLineView[] {
+  const dropTrailingEmpty = (lines: string[]): string[] => {
+    const copy = [...lines]
+    if (copy.length > 0 && copy[copy.length - 1] === '') copy.pop()
+    return copy
+  }
+  const oldLines = oldText === null ? [] : dropTrailingEmpty(oldText.split('\n'))
+  const newLines = dropTrailingEmpty(newText.split('\n'))
+
+  if (oldText === null) {
+    return newLines.map((text) => ({ kind: 'add', text }))
+  }
+  let prefix = 0
+  const min = Math.min(oldLines.length, newLines.length)
+  while (prefix < min && oldLines[prefix] === newLines[prefix]) prefix++
+  let suffix = 0
+  while (
+    suffix < min - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++
+  }
+  const lines: DiffLineView[] = []
+  for (let i = 0; i < prefix; i++) lines.push({ kind: 'ctx', text: oldLines[i] ?? '' })
+  for (let i = prefix; i < oldLines.length - suffix; i++) lines.push({ kind: 'del', text: oldLines[i] ?? '' })
+  for (let i = prefix; i < newLines.length - suffix; i++) lines.push({ kind: 'add', text: newLines[i] ?? '' })
+  for (let i = 0; i < suffix; i++) lines.push({ kind: 'ctx', text: oldLines[oldLines.length - suffix + i] ?? '' })
+  return lines
+}
+
+/**
+ * Narrow the dsh-tool-fs write/edit result meta (`{ diffs: FileDiff[] }`,
+ * one FileDiff per applied hunk with 3 lines of context) into a renderable
+ * diff card. Malformed meta returns undefined — replay must never throw.
+ */
+function diffViewFromMeta(meta: unknown): ToolDiffView | undefined {
+  const record = recordOf(meta)
+  const diffs = record?.['diffs']
+  if (!Array.isArray(diffs) || diffs.length === 0) return undefined
+
+  const lines: DiffLineView[] = []
+  let added = 0
+  let removed = 0
+  let path = ''
+  let truncated = 0
+  for (const entry of diffs) {
+    const hunk = recordOf(entry)
+    if (!hunk) continue
+    const hunkPath = hunk['path']
+    if (path === '' && typeof hunkPath === 'string') path = hunkPath
+    const oldText = typeof hunk['oldText'] === 'string' ? hunk['oldText'] : null
+    const newText = typeof hunk['newText'] === 'string' ? hunk['newText'] : null
+    if (newText === null) continue
+    for (const line of hunkDiffLines(oldText, newText)) {
+      if (lines.length >= MAX_DIFF_LINES) {
+        truncated++
+        continue
+      }
+      lines.push(line)
+      if (line.kind === 'add') added++
+      else if (line.kind === 'del') removed++
+    }
+  }
+  if (path === '' || (added === 0 && removed === 0)) return undefined
+  const view = truncated > 0 ? [...lines, { kind: 'ctx' as const, text: `… 还有 ${truncated} 行变更` }] : lines
+  return { path, added, removed, lines: view }
+}
+
 /**
  * Defensive event ingest. Unknown event types are ignored (the kernel is a
  * developer preview; new types appear without notice). Chunk semantics:
@@ -137,6 +225,13 @@ export class Channel {
   runState: AgentRunState = 'idle'
   /** Bumped on every projection change; render loops compare against it. */
   version = 0
+  /**
+   * Rows [0, sealedRowCount) are FINAL: their text will never change again,
+   * so the view may flush them into terminal scrollback. Advanced on
+   * `turn/start` — everything the previous turns produced is history by
+   * then; rows arriving during the current turn stream in the live region.
+   */
+  sealedRowCount = 0
   /** Latest route recorded by `request/header` — session truth, not UI state. */
   route: SessionRoute | null = null
   /** Cumulative token usage accumulated from `assistant/message` events. */
@@ -148,6 +243,11 @@ export class Channel {
   ingest(event: SessionEvent): void {
     switch (event.type) {
       case 'turn/start': {
+        // The previous turns' rows are final — seal them into scrollback.
+        if (this.sealedRowCount < this.rows.length) {
+          this.sealedRowCount = this.rows.length
+          this.version++
+        }
         this.runState = 'thinking'
         break
       }
@@ -251,8 +351,14 @@ export class Channel {
             data['isError'] === true ||
             (firstBlock && firstBlock['isError'] === true)
           last.status = failed ? 'failed' : 'ok'
-          const out = toolResultText(data) || str(data, 'output', 'text')
-          if (out) last.text = preview(out)
+          const diff = diffViewFromMeta(data['meta'])
+          if (diff) {
+            last.diff = diff
+            last.text = ''
+          } else {
+            const out = toolResultText(data) || str(data, 'output', 'text')
+            if (out) last.text = preview(out)
+          }
         }
         this.runState = 'thinking'
         break
