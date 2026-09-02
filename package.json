@@ -16,7 +16,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/fantasystarry/dsh-tui-rust.git"
+    "url": "https://github.com/FantasyStarry/dsh-orca.git"
   },
   "type": "module",
   "main": "lib/index.js",
