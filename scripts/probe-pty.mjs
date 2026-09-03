@@ -298,6 +298,11 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+function markSettledSafe(timer) {
+  timer.settled = true
+  clearTimeout(timer)
+}
+
 function waitMarker(name, regex, timeoutMs = STEP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const started = Date.now()
@@ -356,6 +361,57 @@ function assertInputBox(step, expectedEditor = null) {
     }
   }
   if (DUMP) console.log(`--- ${step} (cursor=${screen.cy},${screen.cx}) ---\n${screen.plain()}\n`)
+}
+
+// ── live-turn verification (--live): one tiny real prompt, streaming + ──────
+// thinking collapse/expand checked against the app-truth screen. Costs one
+// minimal API call — only run deliberately.
+if (process.argv.includes('--live')) {
+  const globalTimer = setTimeout(() => fail(`全局超时 ${GLOBAL_TIMEOUT_MS}ms`), GLOBAL_TIMEOUT_MS)
+  try {
+    await waitMarker('TUI 启动', /DeepSeek Harness 终端前端/)
+    await waitMarker('session 已连接', /session 已连接：session-[0-9a-f-]+/)
+    await settle()
+
+    proc.write('用一句话说明你是谁')
+    await settle()
+    proc.write('\r') // submit the turn
+    // Streaming phase: the footer badge must show live state, and either a
+    // thinking spinner or an assistant row must appear while the turn runs.
+    await waitMarker('回合运行中（思考徽标或助手行）', /(思考中|执行工具)/, 60_000)
+    // Wait for the turn to end: the sealed thought line or the assistant
+    // bullet row shows up in the transcript, then the editor is back.
+    await waitMarker('回合结束（已思考或助手内容）', /(已思考 \d|●)/, 120_000)
+    await settle(600)
+    assertInputBox('回合结束后', '')
+
+    // Thinking expand (Ctrl+O = \x0f): if a sealed thought line is present,
+    // toggling must reveal the ✻ expanded header, toggling again collapses.
+    const hadThought = screen.plain().includes('已思考 ')
+    if (hadThought) {
+      proc.write('\x0f')
+      await settle()
+      if (!screen.plain().includes('思考过程')) fail('[Ctrl+O 展开] 展开后未出现「思考过程」头部')
+      proc.write('\x0f')
+      await settle()
+      if (!screen.plain().includes('已思考 ')) fail('[Ctrl+O 折叠] 再次切换后未恢复「已思考」行')
+      console.log('思考折叠/展开 ✔（Ctrl+O 两个方向）')
+    } else {
+      console.log('（本回合无思考行，跳过折叠断言）')
+    }
+    assertInputBox('切换后输入框完好', '')
+
+    markSettledSafe(globalTimer)
+    proc.write('\x03')
+    await sleep(500)
+    try {
+      proc.kill()
+    } catch {}
+    console.log('live probe 通过 ✔（流式渲染 + 回合收尾 + 输入框完好）')
+    process.exit(0)
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error))
+  }
 }
 
 try {

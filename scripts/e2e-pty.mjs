@@ -87,22 +87,29 @@ function sleep(ms) {
 }
 
 /**
- * Select the picker item whose visible line contains `needle`: count the
- * item lines before it in the current picker screen and press ↓ that many
- * times, then Enter. Matching is normalized (ids like `gpt-5.6-sol` match
- * display names like "GPT-5.6 Sol").
+ * Select the picker item whose visible line contains `needle`: locate the
+ * picker screen by its `title` row (the M2c picker uses flat `─` borders),
+ * count the item rows before the target and press ↓ that many times, then
+ * Enter. Matching is normalized (ids like `gpt-5.6-sol` match display names
+ * like "GPT-5.6 Sol").
  */
-function pickItemContaining(needle) {
+function pickItemContaining(title, needle) {
   const normalize = (text) => text.toLowerCase().replaceAll(' ', '-')
   const target = normalize(needle)
   const plain = stripAnsi(buffer)
-  const region = plain.slice(plain.lastIndexOf('╭─ 选择'))
+  const region = plain.slice(plain.lastIndexOf(title))
   const lines = region.split('\r\n').map((line) => line.trim())
-  const titleIndex = lines.findIndex((line) => line.startsWith('╭─'))
-  if (titleIndex < 0) throw new Error(`picker 未在屏上：找不到标题行（needle=${needle}）`)
-  const itemIndex = lines.findIndex((line, i) => i > titleIndex && !line.startsWith('╰') && normalize(line).includes(target))
-  if (itemIndex < 0) throw new Error(`picker 中找不到包含「${needle}」的项（可见项：${lines.slice(titleIndex + 1, titleIndex + 8).join(' | ')}）`)
-  for (let i = 0; i < itemIndex - titleIndex - 1; i++) proc.write('\x1b[B')
+  const titleIndex = lines.findIndex((line) => line.includes(title))
+  if (titleIndex < 0) throw new Error(`picker 未在屏上：找不到标题行「${title}」`)
+  // Item region: after the title/hint/blank header, until the flat bottom border.
+  let itemStart = titleIndex + 1
+  while (itemStart < lines.length && (lines[itemStart] === '' || lines[itemStart].includes('↑/↓') || lines[itemStart].includes('▲'))) itemStart++
+  let itemEnd = itemStart
+  while (itemEnd < lines.length && !lines[itemEnd].startsWith('─') && !lines[itemEnd].includes('▼')) itemEnd++
+  const itemLines = lines.slice(itemStart, itemEnd)
+  const itemIndex = itemLines.findIndex((line) => normalize(line).includes(target))
+  if (itemIndex < 0) throw new Error(`picker 中找不到包含「${needle}」的项（可见项：${itemLines.join(' | ')}）`)
+  for (let i = 0; i < itemIndex; i++) proc.write('\x1b[B')
   proc.write('\r')
 }
 
@@ -127,10 +134,10 @@ try {
   proc.write('/model\r')
   await waitMarker('选择 Provider', /选择 Provider/)
   await sleep(500)
-  pickItemContaining(provider)
+  pickItemContaining('选择 Provider', provider)
   await waitMarker('选择模型', new RegExp(`选择模型（${provider}）`))
   await sleep(800)
-  pickItemContaining(model)
+  pickItemContaining(`选择模型（${provider}）`, model)
   await waitMarker('选择思考强度', /选择思考强度（/)
   await waitMarker('思考档位加载完成', /默认（模型默认行为）/)
   proc.write('\r') // 默认（模型默认行为）— first item, cursor already there

@@ -63,6 +63,13 @@ dsh --profile orca          # 或安装后直接 orca
 
 `ORCA_RESUME_SESSION=<id>` 恢复会话；`ORCA_PROVIDER`/`ORCA_MODEL` 成对覆盖模型路由（默认空 = 组合默认 `agentDefaultModel`，内核自身不会兜底缺省模型）；`ORCA_FULLSCREEN=1` 切备用屏（骨架期默认 inline 主屏）。
 
+真机回归探针（ConPTY 启动真实 profile，驱动 `/` 菜单、`/model` 三段选择器、Esc、中文输入与光标停靠，零 API 成本）：
+
+```sh
+node scripts/probe-pty.mjs         # 全流程回归
+node scripts/probe-pty.mjs --live  # 追加一次极小真回合：流式上屏 + Ctrl+O 思考展开/折叠
+```
+
 ## 路线图
 
 - [x] **M0 骨架**：插件契约、cordis.patch.yml、差分渲染器、键盘、Channel 投影、假内核 dev harness
@@ -72,6 +79,7 @@ dsh --profile orca          # 或安装后直接 orca
 - [x] **M2c 视觉改版**（kimi-code 风格，代码就绪待真终端验收）：调色板对齐 kimi-code dark palette——蓝色 primary `#4FA8FF`、琥珀 roleUser `#FFCB6B`、灰阶 text/textDim/textMuted、teal accent（原珊瑚暖色系移除）；用户消息 `✨` 琥珀加粗角色前缀（无气泡）、助手 `● ` 正文色圆点 + markdown、thinking braille spinner + 斜体 dim 预览、封存折叠为 `● 已思考 Ns`；工具卡保留背景面板，状态标记改 `⠋`/✓/✗；chrome 对齐 kimi——primary 圆角输入框（`> ` 提示符位于第 2 列）、两行纯文本页脚（状态徽标 · 路由 · cwd + 右对齐 `context:` 用量，无背景填充）、欢迎信息盒（logo + Directory/Session/Model 行）、选择器平直 `─` 顶底边框 + `❯` 选中 + ` ← current` 成功标记 + `▼ N more` 滚动指示；1 格图片式 chrome 排水沟对齐转录区；**inline 布局：chrome 跟随内容浮动不撑满整屏**，open 行窗口按终端高度封顶；渲染器末行免尾随换行（整屏重绘不再丢行/漂移，phase 0.6 契约）；主题 token 精简为 19 个语义色（kimi colors.ts 映射），精确 SGR 复位保留，`NO_COLOR`/256 色降级保留
 - [x] **M3 会话**（假内核冒烟 ✔，待真终端验收）：`/` 内联命令菜单（kimi 式：过滤/↑↓/Tab/Enter 补全后分发）· `/help`（分组/别名/内核命令追加，未知命令回退普通消息）· `/new`（别名 `/clear`）· `/resume`（别名 `/sessions`，`sessionQuery.listSessions` + 标题快照浏览器，50 条封顶）· `/title`（查看/`sessionTitle.rename`，`session/title` 事件折叠进页脚）· `/compact [hint]`（经 `commands.execute`，`compaction/*` 投影为系统行并封存）· `/usage` 明细 · rewind（空闲双击 Esc，经 `sessions.fork` 到上一 `turn/start` 边界后切换，`OPEN_TURN` 等失败降级提示）；`command/run-done`、`todo/write` 一并投影；欢迎卡延迟到连接后（Session/Model 行带真实值）+ 连接中徽标；可选接缝全部懒探测（启动时序竞态不再误报"未挂载"）
 - [x] **M4 壳层**（假内核冒烟 ✔，待真终端验收）：审批面板（`approval/request` waterfall 应答者，FIFO 模态 picker，Enter/`1` 放行单次、`2`/Esc 拒绝，abort/`dispose` 以 `cancelled` 结算；`/yolo [on|off]` 为本地自动放行，开启时强制 policy 回 `ask` 以便请求到达；`/permission` 查看；`approval/asked-decided` 审计投影）· hooks 投影（`hook/invoked-result` 系统行，非常拦截只展示）· 状态栏插槽（标题 · yolo/never · `⑂` git 分支（`.git/HEAD` 2s 缓存，无子进程）· 压缩中徽标，kimi 两行式）· fullscreen 备用屏（`ORCA_FULLSCREEN=1` 进 `\x1b[?1049h`、退出恢复，不捕获鼠标以便终端原生选区复制）· 同进程热重载静默恢复（复用同一会话 + `sessionQuery.readSession` 日志重放，不再建新会话/刷欢迎卡；`agents.get/list` 与 `readSession` 镜像已对齐 dsh 0.1.2-alpha.5）
+- [x] **M5 体验加固**（真机 PTY 探针 ✔ 全流程 + live 真回合）：自建键盘解析器取代 node:readline keypress——根除孤立 ESC ~500ms `escapeCodeTimeout` 延迟与 Esc+按键被拼成 alt 组合、原始 CSI 灌入输入框的"菜单/picker 关不掉、输入框错乱"类问题（40ms Esc 窗口、序列跨块续传、未知 CSI 吞除、UTF-8 分片安全）；渲染器帧收缩后光标停靠修正（关菜单/关 picker 光标回到输入框行）；宽度换 `get-east-asian-width`，`…`/`⋯` 歧义省略号按 2 格计（占位符/工具卡不再撑破边框换行）；思考过程 `Ctrl+O` 展开/折叠双向（页脚提示与 `/help` 同步）；`scripts/probe-pty.mjs` 以 ORCA_LOG 应用层字节流为断言真源的 ConPTY 回归探针（含 `--live` 流式真回合验证）
 
 ## License
 

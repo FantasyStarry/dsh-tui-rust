@@ -2,3 +2,8 @@ node_modules/
 lib/
 *.log
 .DS_Store
+probe-orca-app*.log
+probe-last-screen.txt
+probe-last-raw.log
+live-dump.txt
+e2e-last-buffer.log
