@@ -396,7 +396,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     for (const [group, lines] of groups) {
       channel.pushSystem(`【${group}】${lines.join(' · ')}`)
     }
-    channel.pushSystem('未知 /命令将作为普通消息发给模型')
+    channel.pushSystem('快捷键：Ctrl+O 展开思考过程 · 双击 Esc 回退上一轮 · 未知 /命令将作为普通消息发给模型')
   }
 
   const showUsage = (): void => {
@@ -1086,7 +1086,15 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   let editor = ''
   let lastEscAt = 0
+  /** Ctrl+O: full thinking text instead of the short live preview (kimi expand). */
+  let thoughtExpanded = false
   const keyboard = new Keyboard(stdin, (key) => {
+    // Thinking expand/collapse is a pure view toggle — works everywhere,
+    // including while a picker or the approval panel is on screen.
+    if (key.ctrl && key.name === 'o') {
+      thoughtExpanded = !thoughtExpanded
+      return
+    }
     // The picker captures every key except the exit chord.
     if (picker && classify(key) !== 'exit') {
       handlePickerKey(key)
@@ -1220,6 +1228,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       now: Date.now(),
       picker,
       commandMenu: menu,
+      thoughtExpanded,
       connecting: agent === null,
       title,
       policy: approvalPolicy,
@@ -1245,6 +1254,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         now: Date.now(),
         picker,
         commandMenu: menu,
+        thoughtExpanded,
         connecting: agent === null,
         title,
         policy: approvalPolicy,

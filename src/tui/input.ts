@@ -1,11 +1,25 @@
 /**
- * Raw-mode keyboard input. Uses node:readline keypress events (works on
- * Windows ConPTY without extra native deps). The skeleton parses the keys
- * the editor needs; Kitty keyboard protocol and mouse events are roadmap
- * items (see docs/adr/0001).
+ * Raw-mode keyboard input with an in-house escape-sequence parser.
+ *
+ * node:readline's keypress emitter holds a lone ESC for ~500ms
+ * (escapeCodeTimeout) waiting to see whether a CSI sequence follows: every
+ * Esc press lags half a second, and Esc+key pairs merge into alt+keys — the
+ * "菜单/picker 关不掉、输入框残留脏字符" class of bugs (verified under
+ * ConPTY: a lone ESC emitted its keypress ~520ms late). This module parses
+ * the raw byte stream itself with a 40ms escape window.
+ *
+ * Parser guarantees:
+ * - recognized CSI/SS3 map to named keys; UNKNOWN sequences (mouse reports,
+ *   focus events, paste markers, Kitty extras) are swallowed — raw escape
+ *   bytes can never smear into the prompt;
+ * - a lone ESC flushes instantly when the next burst is clearly not a
+ *   sequence continuation, else after 40ms (double-Esc rewind stays usable);
+ * - multibyte UTF-8 survives chunk splits (StringDecoder);
+ * - names mirror the old readline surface the app already keys off
+ *   ('return' for \r, 'backspace' for \x7f/\x08, ctrl+letter for C0).
  */
 
-import { emitKeypressEvents } from 'node:readline'
+import { StringDecoder } from 'node:string_decoder'
 
 export interface KeyPress {
   /** Printable character for text keys, else the named key. */
@@ -18,9 +32,57 @@ export interface KeyPress {
 
 export type KeyHandler = (key: KeyPress) => void
 
+const ESC = '\x1b'
+/** How long a lone ESC waits for a CSI prefix before flushing as Esc. */
+const ESC_FLUSH_MS = 40
+const CSI_RE = /^\x1b\[([0-9;:<=>?]*)([A-Za-z~])/
+const SS3_RE = /^\x1bO([A-Za-z])/
+
+const CSI_KEYS: Readonly<Record<string, string>> = {
+  A: 'up',
+  B: 'down',
+  C: 'right',
+  D: 'left',
+  H: 'home',
+  F: 'end',
+}
+
+const SS3_KEYS: Readonly<Record<string, string>> = {
+  A: 'up',
+  B: 'down',
+  C: 'right',
+  D: 'left',
+  H: 'home',
+  F: 'end',
+  P: 'f1',
+  Q: 'f2',
+  R: 'f3',
+  S: 'f4',
+}
+
+/** `CSI n ~` tilde keys (insert/delete/pages/Home/End, F1-F10). */
+function csiTildeKey(params: string): string | null {
+  const head = params.split(';')[0] ?? ''
+  const n = parseInt(head, 10)
+  if (!Number.isFinite(n)) return null
+  if (n === 2) return 'insert'
+  if (n === 3) return 'delete'
+  if (n === 5) return 'pageup'
+  if (n === 6) return 'pagedown'
+  if (n === 7) return 'home'
+  if (n === 8) return 'end'
+  if (n >= 11 && n <= 15) return `f${n - 10}`
+  if (n >= 17 && n <= 21) return `f${n - 11}`
+  return null // 200/201 paste markers and everything else — swallowed
+}
+
 export class Keyboard {
   private readonly handler: KeyHandler
   private active = false
+  /** Decoded but not yet parsed input (partial sequences wait here). */
+  private pending = ''
+  private readonly decoder = new StringDecoder('utf8')
+  private escTimer: NodeJS.Timeout | null = null
 
   constructor(
     private readonly stdin: NodeJS.ReadStream,
@@ -31,31 +93,130 @@ export class Keyboard {
 
   start(): void {
     if (this.active || !this.stdin.isTTY) return
-    emitKeypressEvents(this.stdin)
     this.stdin.setRawMode(true)
     this.stdin.resume()
-    this.stdin.on('keypress', this.onKeypress)
+    this.stdin.on('data', this.onData)
     this.active = true
   }
 
   stop(): void {
     if (!this.active) return
-    this.stdin.removeListener('keypress', this.onKeypress)
+    this.stdin.removeListener('data', this.onData)
     this.stdin.setRawMode(false)
     this.stdin.pause()
+    this.clearEscTimer()
+    this.pending = ''
     this.active = false
   }
 
-  private readonly onKeypress = (ch: string, key?: { name?: string; ctrl?: boolean; alt?: boolean; shift?: boolean; sequence?: string }): void => {
-    if (!key) return
+  private clearEscTimer(): void {
+    if (this.escTimer !== null) {
+      clearTimeout(this.escTimer)
+      this.escTimer = null
+    }
+  }
+
+  private readonly onData = (chunk: string | Buffer): void => {
+    // Chunk boundaries may split multibyte chars or escape sequences — the
+    // decoder holds partial bytes back, parse() holds partial sequences.
+    this.pending += this.decoder.write(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk)
+    this.clearEscTimer()
+    this.parse()
+    this.armEscTimer()
+  }
+
+  /**
+   * Arm the lone-ESC flush: pending is either a bare ESC (flush as the Esc
+   * key) or an unterminated sequence prefix (swallow — anti-smear wins over
+   * recovering junk bytes the terminal should never send half of).
+   */
+  private armEscTimer(): void {
+    if (this.pending === '') return
+    if (!this.pending.startsWith(ESC)) return
+    this.escTimer = setTimeout(() => {
+      this.escTimer = null
+      if (this.pending === ESC) {
+        this.pending = ''
+        this.handler({ name: 'escape', ctrl: false, alt: false, shift: false, sequence: ESC })
+      } else if (this.pending.startsWith(ESC)) {
+        this.pending = '' // unterminated junk — dropped, never smeared
+      }
+    }, ESC_FLUSH_MS)
+  }
+
+  private parse(): void {
+    for (;;) {
+      if (this.pending === '') return
+      if (!this.pending.startsWith(ESC)) {
+        // Plain run: everything up to the next ESC (or the end).
+        const next = this.pending.indexOf(ESC, 1)
+        const run = next === -1 ? this.pending : this.pending.slice(0, next)
+        this.pending = next === -1 ? '' : this.pending.slice(next)
+        for (const ch of run) this.handler(decodeChar(ch))
+        continue
+      }
+      if (this.pending === ESC) return // lone ESC — timer decides
+      const csi = CSI_RE.exec(this.pending)
+      if (csi) {
+        const match = csi[0]
+        this.pending = this.pending.slice(match.length)
+        this.emitCsi(csi[1] ?? '', csi[2] ?? '', match)
+        continue
+      }
+      const ss3 = SS3_RE.exec(this.pending)
+      if (ss3) {
+        const match = ss3[0]
+        this.pending = this.pending.slice(match.length)
+        const name = SS3_KEYS[ss3[1] ?? '']
+        if (name) this.handler({ name, ctrl: false, alt: false, shift: false, sequence: match })
+        continue
+      }
+      if (this.pending.startsWith(ESC + ESC)) {
+        // Two fast Esc presses: emit one now, keep the second pending.
+        this.pending = this.pending.slice(1)
+        this.handler({ name: 'escape', ctrl: false, alt: false, shift: false, sequence: ESC })
+        continue
+      }
+      const follower = this.pending[1] ?? ''
+      if (follower === '[' || follower === 'O') return // partial sequence — wait for more
+      // ESC + ordinary char: flush the Esc FIRST (instant cancel), then
+      // parse the char as fresh input. Alt-chords are deliberately not
+      // recognized — nothing in Orca binds one, and guessing wrong is what
+      // used to smear escape bytes into the editor.
+      this.pending = this.pending.slice(1)
+      this.handler({ name: 'escape', ctrl: false, alt: false, shift: false, sequence: ESC })
+    }
+  }
+
+  /** CSI → named key; unknown finals (mouse/focus/paste) vanish. */
+  private emitCsi(params: string, final: string, sequence: string): void {
+    let name: string | null
+    if (final === '~') name = csiTildeKey(params)
+    else if (final === 'Z') name = 'tab' // shift-tab: shift flag not needed
+    else name = CSI_KEYS[final] ?? null
+    if (!name) return
+    // `1;5A` style modifiers: second param = bitmask+1 (1 shift, 2 alt, 4 ctrl).
+    const parts = params.split(';')
+    const modifier = parts.length >= 2 ? parseInt(parts[1] ?? '', 10) : Number.NaN
+    const bits = Number.isFinite(modifier) && modifier >= 2 ? modifier - 1 : 0
     this.handler({
-      name: key.name ?? ch,
-      ctrl: key.ctrl ?? false,
-      alt: key.alt ?? false,
-      shift: key.shift ?? false,
-      sequence: key.sequence ?? ch,
+      name,
+      ctrl: (bits & 4) !== 0,
+      alt: (bits & 2) !== 0,
+      shift: (bits & 1) !== 0,
+      sequence,
     })
   }
+}
+
+/** Map one decoded character to a KeyPress with readline-compatible names. */
+function decodeChar(ch: string): KeyPress {
+  const code = ch.codePointAt(0) ?? 0
+  if (ch === '\r' || ch === '\n') return { name: 'return', ctrl: false, alt: false, shift: false, sequence: ch }
+  if (ch === '\t') return { name: 'tab', ctrl: false, alt: false, shift: false, sequence: ch }
+  if (ch === '\x7f' || ch === '\x08') return { name: 'backspace', ctrl: false, alt: false, shift: false, sequence: ch }
+  if (code < 0x20) return { name: String.fromCharCode(code + 0x60), ctrl: true, alt: false, shift: false, sequence: ch }
+  return { name: ch, ctrl: false, alt: false, shift: false, sequence: ch }
 }
 
 /** Submit / cancel / text-entry classification used by the editor. */

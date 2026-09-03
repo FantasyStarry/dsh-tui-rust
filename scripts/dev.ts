@@ -117,7 +117,11 @@ function stripSgr(text: string): string {
   return text.replace(/\x1b\[[0-9;?]*[@-~]/g, '')
 }
 
-/** Fake TTY stdin: keypress events are emitted directly by the harness. */
+/**
+ * Fake TTY stdin: feeds RAW byte sequences ('data' chunks) so the smoke
+ * drives the real Keyboard parser — the same escape decoding the terminal
+ * exercises, not a keypress-event bypass.
+ */
 class FakeStdin extends EventEmitter {
   isTTY = true
   setRawMode(mode: boolean): boolean {
@@ -126,20 +130,30 @@ class FakeStdin extends EventEmitter {
   resume(): void {}
   pause(): void {}
 
-  /** A named key (return / escape / up / down …). */
-  key(name: string, opts: { ctrl?: boolean; sequence?: string } = {}): void {
-    this.emit('keypress', '', {
-      name,
-      ctrl: opts.ctrl ?? false,
-      alt: false,
-      shift: false,
-      sequence: opts.sequence ?? name,
-    })
+  private write(text: string): void {
+    this.emit('data', Buffer.from(text, 'utf8'))
   }
 
-  /** A plain text key (printable sequence, CJK included). */
+  /** A named key (return / escape / up / down / tab / backspace …). */
+  key(name: string, opts: { ctrl?: boolean } = {}): void {
+    if (opts.ctrl) {
+      this.write(String.fromCharCode(name.toLowerCase().charCodeAt(0) - 0x60))
+      return
+    }
+    if (name === 'return') this.write('\r')
+    else if (name === 'escape') this.write('\x1b')
+    else if (name === 'tab') this.write('\t')
+    else if (name === 'backspace') this.write('\x7f')
+    else if (name === 'up') this.write('\x1b[A')
+    else if (name === 'down') this.write('\x1b[B')
+    else if (name === 'left') this.write('\x1b[D')
+    else if (name === 'right') this.write('\x1b[C')
+    else this.write(name)
+  }
+
+  /** Plain text (printable sequence, CJK included) as one burst. */
   text(sequence: string): void {
-    this.emit('keypress', sequence, { name: sequence, ctrl: false, alt: false, shift: false, sequence })
+    this.write(sequence)
   }
 }
 
@@ -735,7 +749,7 @@ async function main(): Promise<void> {
   // (top → prompt → bottom) + footer L1 → L2, each exactly once.
   while (rows2.length > 0 && rows2[rows2.length - 1] === '') rows2.pop()
   const tail = rows2.slice(-5)
-  const hint = 'Enter 发送  ·  /model 模型  ·  Esc 取消  ·  Ctrl+C 退出'
+  const hint = 'Enter 发送  ·  /model 模型  ·  Ctrl+O 思考  ·  Esc 取消  ·  Ctrl+C 退出'
   if (tail.length !== 5) problems.push(`phase2：最终画面尾部不足 5 行：${JSON.stringify(rows2.slice(-7))}`)
   const promptRow = rows2.find((row) => row.includes('> 说点什么…'))
   if (promptRow === undefined) {

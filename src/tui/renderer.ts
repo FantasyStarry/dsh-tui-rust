@@ -83,8 +83,8 @@ export class Renderer {
       // and uncleared rows kept ghost copies of the chrome on screen.
       const written = stream.length + frame.length
       const stale = this.last.length - written
-      this.clearStale(out, stale, frame.length)
-      this.placeCursor(out, frame.length, cursor)
+      const steppedDown = this.clearStale(out, stale, frame.length)
+      this.placeCursor(out, frame.length, cursor, steppedDown)
       out.push(SYNC_END)
       this.stdout.write(out.join(''))
       this.last = [...frame]
@@ -116,8 +116,8 @@ export class Renderer {
     // Clear stale lines below the new frame (shrink case) and park the
     // cursor on the final input line.
     const stale = this.last.length - frame.length
-    this.clearStale(out, stale, frame.length)
-    this.placeCursor(out, frame.length, cursor)
+    const steppedDown = this.clearStale(out, stale, frame.length)
+    this.placeCursor(out, frame.length, cursor, steppedDown)
     out.push(SYNC_END)
 
     this.stdout.write(out.join(''))
@@ -137,24 +137,32 @@ export class Renderer {
    * Clear `stale` leftover rows below the frame. The cursor sits at the end
    * of the last frame row, so step down first — but only when a frame was
    * actually written (an empty frame leaves the cursor on the first stale
-   * row already, and a `\r\n` there would skip one).
+   * row already, and a `\r\n` there would skip one). Returns whether the
+   * cursor stepped down: placeCursor must climb one extra row so the park
+   * lands inside the editor, not on the cleared line below it.
    */
-  private clearStale(out: string[], stale: number, frameLength: number): void {
-    if (stale <= 0) return
-    if (frameLength > 0) out.push('\r\n')
+  private clearStale(out: string[], stale: number, frameLength: number): boolean {
+    if (stale <= 0) return false
+    if (frameLength > 0) {
+      out.push('\r\n')
+      out.push(CLEAR_LINE, '\x1b[0J')
+      return true
+    }
     out.push(CLEAR_LINE, '\x1b[0J')
+    return false
   }
 
   /** Move the cursor to its in-frame home (the input row) after painting. */
-  private placeCursor(out: string[], frameLength: number, cursor?: CursorPlacement): void {
+  private placeCursor(out: string[], frameLength: number, cursor?: CursorPlacement, steppedDown = false): void {
     if (!cursor || frameLength === 0) {
       this.cursorFromEnd = 0
       return
     }
     // The cursor rests at the end of the LAST frame row (no trailing
-    // newline), so parking is exactly `fromEnd` rows up from there.
-    const up = Math.max(0, Math.min(cursor.fromEnd, frameLength - 1))
-    this.cursorFromEnd = up
+    // newline) — or one row below it when clearStale stepped down — so
+    // parking climbs exactly `fromEnd` (+ step) rows from there.
+    const up = Math.max(0, Math.min(cursor.fromEnd + (steppedDown ? 1 : 0), frameLength))
+    this.cursorFromEnd = up - (steppedDown ? 1 : 0)
     if (up > 0) out.push(`\x1b[${up}A`)
     out.push(`\x1b[${Math.max(1, cursor.col)}G`)
   }

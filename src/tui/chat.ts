@@ -54,6 +54,8 @@ export interface FrameContext {
   readonly picker: PickerState | null
   /** Inline slash-command completion (kimi `/` menu), above the input box. */
   readonly commandMenu?: { readonly items: readonly PickerItem[]; readonly index: number } | null
+  /** Ctrl+O toggle: show full thinking text instead of the short preview. */
+  readonly thoughtExpanded?: boolean
   /** True while the agent is still connecting (footer shows 连接中 badge). */
   readonly connecting?: boolean
   /** Folded session title for the footer (M3). */
@@ -75,7 +77,7 @@ export interface ChatFrame {
   readonly cursor: { readonly fromEnd: number; readonly col: number }
 }
 
-const HINT = 'Enter 发送  ·  /model 模型  ·  Esc 取消  ·  Ctrl+C 退出'
+const HINT = 'Enter 发送  ·  /model 模型  ·  Ctrl+O 思考  ·  Esc 取消  ·  Ctrl+C 退出'
 
 /** kimi symbols.ts: role bullets, status marks; `✨` carries VS16 so both our
  *  cell math (1+1) and real emoji rendering (2 cells) agree on 3. */
@@ -240,17 +242,29 @@ function assistantLines(text: string, width: number): string[] {
 }
 
 function thoughtLines(row: TranscriptRow, ctx: FrameContext, width: number): string[] {
-  // Sealed: one collapsed summary line (full text stays in the session log).
-  if (row.seconds !== undefined) {
+  const expanded = ctx.thoughtExpanded ?? false
+  const elapsed = row.seconds ?? (row.startMs !== undefined ? Math.round((ctx.now - row.startMs) / 100) / 10 : 0)
+  // Sealed + collapsed: one summary line (full text stays in the session log).
+  if (row.seconds !== undefined && !expanded) {
     return ['', theme.subtle(STATUS_BULLET) + theme.placeholder(`已思考 ${row.seconds}s`)]
   }
-  // Streaming: spinner + timer, then the last two wrapped lines as a preview.
-  const elapsed = row.startMs !== undefined ? Math.round((ctx.now - row.startMs) / 100) / 10 : 0
-  const tick = row.startMs !== undefined ? Math.floor((ctx.now - row.startMs) / 80) % SPIN.length : 0
-  const head = theme.subtle(`${SPIN[tick] ?? SPIN[0]} 思考中 ${elapsed}s`)
+  // Expanded (Ctrl+O): the full thinking text, live or sealed.
+  if (expanded) {
+    const head = row.seconds === undefined
+      ? theme.subtle(`${SPIN[tickOf(row, ctx)] ?? SPIN[0]} 思考中 ${elapsed}s · Ctrl+O 折叠`)
+      : theme.subtle(`✻ 思考过程 ${row.seconds}s · Ctrl+O 折叠`)
+    const wrapped = wrapWidth(row.text || '（空）', Math.max(8, width - 4))
+    return ['', head, ...wrapped.map((line) => theme.placeholder(MESSAGE_INDENT + '│ ' + line))]
+  }
+  // Streaming + collapsed: spinner + timer, last two wrapped lines as preview.
+  const head = theme.subtle(`${SPIN[tickOf(row, ctx)] ?? SPIN[0]} 思考中 ${elapsed}s · Ctrl+O 展开`)
   const wrapped = wrapWidth(row.text || '', Math.max(8, width - 4))
   const tail = wrapped.slice(-2).map((line) => theme.placeholder(MESSAGE_INDENT + '⋯ ' + line))
   return ['', head, ...tail]
+}
+
+function tickOf(row: TranscriptRow, ctx: FrameContext): number {
+  return row.startMs !== undefined ? Math.floor((ctx.now - row.startMs) / 80) % SPIN.length : 0
 }
 
 /** Tool run: backgrounded card; status mark + counts in the frame. */
