@@ -236,6 +236,10 @@ export class Channel {
   route: SessionRoute | null = null
   /** Cumulative token usage accumulated from `assistant/message` events. */
   usage: SessionUsage = { input: 0, output: 0, reasoning: 0, messages: 0 }
+  /** Latest folded `session/title` text — session truth for footer/browser. */
+  title: string | null = null
+  /** True while a `compaction/start` … `compaction/end` cycle is open. */
+  compacting = false
 
   private openAssistantId: number | null = null
   private openThoughtId: number | null = null
@@ -363,6 +367,120 @@ export class Channel {
         this.runState = 'thinking'
         break
       }
+      case 'session/title': {
+        const data = dataOf(event)
+        const title = str(data, 'title')
+        if (title) {
+          this.title = title
+          this.version++
+        }
+        break
+      }
+      case 'command/run': {
+        const data = dataOf(event)
+        const name = str(data, 'name')
+        const args = str(data, 'args')
+        if (name) this.pushSystem(`› /${name}${args ? ` ${args.trim()}` : ''}`)
+        break
+      }
+      case 'command/done': {
+        const data = dataOf(event)
+        const kind = str(data, 'kind')
+        const text = str(data, 'text')
+        if (kind === 'error') {
+          this.pushSystem(`命令失败：${text || '未知错误'}`)
+        } else if (text) {
+          this.pushSystem(preview(text, 240))
+        }
+        break
+      }
+      case 'compaction/start': {
+        this.compacting = true
+        this.version++
+        this.pushSystem('正在压缩上下文…')
+        break
+      }
+      case 'compaction/summary': {
+        const data = dataOf(event)
+        const count = numOf(data, 'shadowedTokenCount')
+        const summary = blockText(data['summary'])
+        const note = count > 0 ? `（释放约 ${count} tokens）` : ''
+        // The shadowed range leaves the surface; seal everything rendered so
+        // far so the summary becomes the new visible boundary. The full log
+        // stays replayable — this only moves the scrollback cursor.
+        if (this.sealedRowCount < this.rows.length) {
+          this.sealedRowCount = this.rows.length
+        }
+        this.pushSystem(`压缩完成${note}${summary ? `：${preview(summary, 200)}` : ''}`)
+        break
+      }
+      case 'compaction/end': {
+        this.compacting = false
+        const data = dataOf(event)
+        const error = str(data, 'error')
+        if (error) this.pushSystem(`压缩失败：${error}`)
+        this.version++
+        break
+      }
+      case 'compaction/prune': {
+        if (this.sealedRowCount < this.rows.length) {
+          this.sealedRowCount = this.rows.length
+        }
+        this.pushSystem('已裁剪过期上下文')
+        break
+      }
+      case 'hook/invoked': {
+        const data = dataOf(event)
+        const point = str(data, 'point') || 'hook'
+        const matcher = str(data, 'matcher')
+        this.pushSystem(`hook 运行中：${point}${matcher ? `（${matcher}）` : ''}`)
+        break
+      }
+      case 'hook/result': {
+        const data = dataOf(event)
+        const decision = str(data, 'decision')
+        const stderr = str(data, 'stderrSummary')
+        if (decision && decision !== 'pass') {
+          this.pushSystem(`hook 结果：${decision}${stderr ? ` — ${preview(stderr, 160)}` : ''}`)
+        } else {
+          this.version++
+        }
+        break
+      }
+      case 'approval/asked': {
+        const data = dataOf(event)
+        const tool = str(data, 'toolName') || 'tool'
+        const reason = str(data, 'reason')
+        this.pushSystem(`请求审批：${tool}${reason ? ` — ${preview(reason, 160)}` : ''}`)
+        break
+      }
+      case 'approval/decided': {
+        const data = dataOf(event)
+        const outcome = str(data, 'outcome')
+        const label =
+          outcome === 'allowed-once' ? '已放行（单次）' : outcome === 'rejected' ? '已拒绝' : outcome === 'cancelled' ? '已撤回' : '无应答者（已 fail-closed）'
+        this.pushSystem(`审批结果：${label}`)
+        break
+      }
+      case 'todo/write': {
+        const data = dataOf(event)
+        const todos = Array.isArray(data['todos']) ? data['todos'] : []
+        if (todos.length > 0) {
+          const lines = todos
+            .map((item) => {
+              const record = recordOf(item)
+              if (!record) return null
+              const content = str(record, 'content')
+              const status = str(record, 'status')
+              const mark = status === 'completed' ? '✓' : status === 'in_progress' ? '◐' : '○'
+              return content ? `${mark} ${preview(content, 80)}` : null
+            })
+            .filter((line): line is string => line !== null)
+          if (lines.length > 0) this.pushSystem(`待办（${lines.length}）：${lines.slice(0, 5).join(' · ')}`)
+          else this.version++
+        }
+        break
+      }
       default: {
         // Reasoning/thought chunk naming is not pinned across kernel versions;
         // accept common side-channel shapes but never guess a type that
@@ -388,6 +506,30 @@ export class Channel {
   /** Local notice (connection loss, resume hint, …) — never model-visible. */
   pushSystem(text: string): void {
     this.rows.push({ id: ++rowId, kind: 'system', text, seq: ++this.version })
+  }
+
+  /**
+   * Reset the view for a session switch (`/new`, `/resume`, rewind fork).
+   * The durable logs stay on disk; only the live projection is replaced.
+   * Usage/route/title reset — the new session's `request/header` and
+   * `session/title` events repopulate them.
+   */
+  clearForSwitch(): void {
+    this.rows.length = 0
+    this.sealedRowCount = 0
+    this.openAssistantId = null
+    this.openThoughtId = null
+    this.runState = 'idle'
+    this.route = null
+    this.usage = { input: 0, output: 0, reasoning: 0, messages: 0 }
+    this.title = null
+    this.compacting = false
+    this.version++
+  }
+
+  /** Replay a persisted log into this projection (resume without live events). */
+  replay(events: readonly SessionEvent[]): void {
+    for (const event of events) this.ingest(event)
   }
 
   /** Stamp the sealed duration onto the open thought row and close it. */

@@ -371,6 +371,106 @@ export interface KernelAgentsService {
 }
 
 /**
+ * Live session store (`ctx.sessions`, dsh-session `SessionStore` — the fork
+ * subset Orca needs for rewind). Checked against dsh 0.1.2-alpha.5.
+ */
+export interface KernelSessionsService {
+  fork(source: string | Session, boundary?: number, childSessionId?: string): Session
+}
+
+/**
+ * Unified session history reads (`ctx.sessionQuery`, dsh-session-query
+ * `SessionQueryEngine` — the browser subset). All reads are live-preferred
+ * and defensive: any rejection degrades to “no history”.
+ * Checked against dsh 0.1.2-alpha.5.
+ */
+export interface KernelSessionRecord {
+  readonly header: { readonly id: string; readonly cwd?: string; readonly createdAt: number }
+  readonly live: boolean
+  readonly persisted: boolean
+}
+
+export interface KernelTitleSnapshot {
+  readonly title: string
+  readonly updatedAt: number
+}
+
+export interface KernelSessionQueryService {
+  listSessions(signal?: AbortSignal): Promise<KernelSessionRecord[]>
+  readTitle(sessionId: string, signal?: AbortSignal): Promise<KernelTitleSnapshot | undefined>
+  readTitleSnapshots(sessionIds: readonly string[], signal?: AbortSignal): Promise<
+    ReadonlyArray<
+      | { readonly sessionId: string; readonly status: 'fulfilled'; readonly value: { readonly title?: KernelTitleSnapshot } }
+      | { readonly sessionId: string; readonly status: 'rejected'; readonly reason: unknown }
+    >
+  >
+}
+
+/**
+ * Log-backed title service (`ctx.sessionTitle`, dsh-session-title).
+ * `rename` pins the title (user source); `get` folds the latest event.
+ * Checked against dsh 0.1.2-alpha.5.
+ */
+export interface KernelSessionTitleSnapshot {
+  readonly title: string
+  readonly updatedAt: number
+}
+
+export interface KernelSessionTitleService {
+  get(session: Session): KernelSessionTitleSnapshot | undefined
+  rename(session: Session, title: string): KernelSessionTitleSnapshot
+  refresh(session: Session, signal?: AbortSignal): Promise<KernelSessionTitleSnapshot | undefined>
+}
+
+/**
+ * Human-command registry (`ctx.commands`, dsh-commands `CommandRuntime`).
+ * Orca dispatches `/compact` etc. through `execute` so the kernel-owned
+ * handler (and its `command/run`/`command/done` audit pair) runs verbatim;
+ * unknown lines resolve to `undefined` and fall back to a normal prompt.
+ * Checked against dsh 0.1.2-alpha.5.
+ */
+export interface KernelCommandDescriptor {
+  readonly name: string
+  readonly description: string
+}
+
+export interface KernelCommandExecution {
+  readonly commandId: string
+  readonly result: { readonly kind: 'success'; readonly text?: string } | { readonly kind: 'error'; readonly text: string }
+}
+
+export interface KernelCommandsService {
+  list(agent: Agent): readonly KernelCommandDescriptor[]
+  find(agent: Agent, name: string): { readonly name: string } | undefined
+  execute(agent: Agent, line: string, images: readonly unknown[], signal: AbortSignal): Promise<KernelCommandExecution | undefined>
+}
+
+/**
+ * Approval seam (`ctx.approval`, dsh-user-approval). Orca only switches the
+ * session policy (`ask` ⇄ `never` for `/yolo`) and answers the
+ * `approval/request` waterfall as the interactive answerer; the audit pair
+ * (`approval/asked` + `approval/decided`) is projected from the log.
+ * Checked against dsh 0.1.2-alpha.5.
+ */
+export type KernelApprovalPolicy = 'ask' | 'never'
+
+export interface KernelApprovalRequest {
+  readonly agent: Agent
+  readonly toolName: string
+  readonly callId?: string
+  readonly reason?: string
+  readonly signal?: AbortSignal
+}
+
+export type KernelApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+
+export interface KernelApprovalService {
+  setPolicy(agent: Agent, policy: KernelApprovalPolicy): void
+  overrideOf(session: Session): KernelApprovalPolicy | undefined
+  request(req: KernelApprovalRequest): Promise<KernelApprovalOutcome>
+}
+
+/**
  * The subset of the Cordis `Context` Orca relies on.
  *
  * Discipline (dsh-ecosystem-spec #183): code-level inject stays empty; every
@@ -402,6 +502,8 @@ export interface KernelContext {
  * - `session/disposed` → `(session)` emit
  * - `agent/status` → `({ agent, status })` emit
  * - `agent/error` → `({ agent, turn, step, error })` emit
+ * - `approval/request` → `(req, next)` waterfall (scoped to the agent)
+ * - `commands/change` → `()` emit (command list changed)
  * Payloads are parsed defensively either way.
  */
 export const KERNEL_EVENTS = {
@@ -409,4 +511,6 @@ export const KERNEL_EVENTS = {
   agentStatus: 'agent/status',
   sessionDisposed: 'session/disposed',
   agentError: 'agent/error',
+  approvalRequest: 'approval/request',
+  commandsChange: 'commands/change',
 } as const
