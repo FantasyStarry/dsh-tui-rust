@@ -110,6 +110,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
     // No optimistic echo: the user row is projected from the kernel's
     // `user/message` event, so the transcript stays a pure log projection.
+    conversationStarted = true
     agent.followup(buildUserMessage(text))
   }
 
@@ -386,6 +387,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   let flushedSealed = 0
   let welcomed = false
   let lastRouteKey = ''
+  let conversationStarted = false
   const render = (): void => {
     const route = selection ?? channel.route
     const stream: string[] = []
@@ -406,12 +408,20 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         stream.push(routeLine(route))
       }
     }
-    const frame = buildFrame({
+    let frame = buildFrame({
       channel,
       sealedFrom: flushedSealed,
       editorText: editor,
       width: stdout.columns ?? 80,
       height: stdout.rows ?? 24,
+      // Include rows about to be written into scrollback in this frame's
+      // budget. Otherwise the first welcome frame (or a route-change line)
+      // plus a full-height padded live frame would scroll the terminal.
+      // Only rows written by THIS render occupy space above the live frame.
+      // Historical welcome/route rows are already in scrollback and must not
+      // permanently reduce the chat viewport.
+      reservedRows: stream.length,
+      anchorChrome: conversationStarted || picker !== null,
       cwd: process.cwd(),
       sessionId: agent?.session.id ?? null,
       route,
@@ -419,6 +429,26 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       now: Date.now(),
       picker,
     })
+    // Sealed transcript rows are discovered while building the frame; fold
+    // their stream height into a second pass so bottom chrome remains fixed
+    // even when a turn ends while a picker is open.
+    if (frame.stream.length > 0) {
+      frame = buildFrame({
+        channel,
+        sealedFrom: flushedSealed,
+        editorText: editor,
+        width: stdout.columns ?? 80,
+        height: stdout.rows ?? 24,
+        reservedRows: stream.length + frame.stream.length,
+        anchorChrome: conversationStarted || picker !== null,
+        cwd: process.cwd(),
+        sessionId: agent?.session.id ?? null,
+        route,
+        usage: channel.usage,
+        now: Date.now(),
+        picker,
+      })
+    }
     stream.push(...frame.stream)
     renderer.render(frame.live, stream, frame.cursor)
     flushedSealed = Math.min(channel.sealedRowCount, channel.rows.length)

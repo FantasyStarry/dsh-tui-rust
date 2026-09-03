@@ -21,6 +21,7 @@ import { bootstrapApp } from '../src/app.js'
 import { Config } from '../src/index.js'
 import type { OrcaConfig } from '../src/index.js'
 import { Renderer } from '../src/tui/renderer.js'
+import { buildFrame } from '../src/tui/chat.js'
 import type {
   AgentHandle,
   CreateAgentOptions,
@@ -361,6 +362,98 @@ async function main(): Promise<void> {
     if (screen.join('\n') !== expected) problems.push(`phase0.5：渲染契约失真：${JSON.stringify(screen)}`)
   }
 
+  // ── Phase 0.7: picker height contract — model lists must not push the
+  // editor/footer below the terminal viewport (the source of ghost chrome
+  // after closing /model on a short terminal).
+  {
+    const picker = {
+      title: '选择模型（provider）',
+      items: Array.from({ length: 40 }, (_, i) => ({ value: `m${i}`, label: `model-${i}` })),
+      index: 20,
+    }
+    const frame = buildFrame({
+      channel: {
+        rows: [], sealedRowCount: 0, runState: 'idle', route: null,
+        usage: { input: 0, output: 0, reasoning: 0, messages: 0 },
+      } as never,
+      sealedFrom: 0,
+      editorText: '',
+      width: 80,
+      height: 12,
+      cwd: '.',
+      sessionId: null,
+      route: null,
+      usage: { input: 0, output: 0, reasoning: 0, messages: 0 },
+      now: Date.now(),
+      picker,
+    })
+    if (frame.live.length > 12) problems.push(`phase0.7：选择器溢出终端高度：${frame.live.length}`)
+
+    const reserved = buildFrame({
+      channel: {
+        rows: [], sealedRowCount: 0, runState: 'idle', route: null,
+        usage: { input: 0, output: 0, reasoning: 0, messages: 0 },
+      } as never,
+      sealedFrom: 0,
+      editorText: '',
+      width: 80,
+      height: 12,
+      reservedRows: 5,
+      cwd: '.',
+      sessionId: null,
+      route: null,
+      usage: { input: 0, output: 0, reasoning: 0, messages: 0 },
+      now: Date.now(),
+      picker,
+    })
+    if (reserved.live.length + 5 > 12) problems.push(`phase0.7：已有 scrollback 偏移时选择器溢出：${reserved.live.length}`)
+  }
+
+  // ── Phase 0.75: historical welcome rows do not permanently reserve
+  // viewport height once conversation content starts streaming.
+  {
+    const channel = {
+      rows: [{ kind: 'user', text: '你好' }],
+      sealedRowCount: 0,
+      runState: 'thinking',
+      route: null,
+      usage: { input: 0, output: 0, reasoning: 0, messages: 1 },
+    } as never
+    const frame = buildFrame({
+      channel,
+      sealedFrom: 0,
+      editorText: '',
+      width: 80,
+      height: 24,
+      reservedRows: 0,
+      anchorChrome: true,
+      cwd: '.',
+      sessionId: null,
+      route: null,
+      usage: { input: 0, output: 0, reasoning: 0, messages: 1 },
+      now: Date.now(),
+      picker: null,
+    })
+    if (frame.live.length !== 24) problems.push(`phase0.75：聊天态未填满底部 chrome：${frame.live.length}`)
+    if (frame.live.at(-5) === undefined || !frame.live.at(-5)?.includes('╭')) problems.push('phase0.75：输入框未锚定到底部')
+  }
+
+  // ── Phase 0.8: closing /model with a route stream must remove the old
+  // picker border instead of leaving it above the replacement editor.
+  {
+    const rw: string[] = []
+    const renderer = new Renderer(makeStdout(rw), () => 80)
+    const cursor = { fromEnd: 3, col: 5 }
+    renderer.render(['picker-top', 'picker-row', 'picker-bottom', '╭────╮', '│ >  │', '╰────╯', 'footer-1', 'footer-2'], [], cursor)
+    renderer.render(['system: 模型已切换', '╭────╮', '│ >  │', '╰────╯', 'footer-1', 'footer-2'], ['↳ 模型 provider/model'], cursor)
+    const screen = paintScreen(rw)
+    const visible = screen.join('\n')
+    if (visible.includes('picker-top') || visible.includes('picker-row')) {
+      problems.push(`phase0.8：关闭 picker 后残留旧边框：${JSON.stringify(screen)}`)
+    }
+  }
+
+
   // ── Phase 0.6: full-height repaint must NOT scroll — the last frame row
   // carries no trailing newline, so a top-row change on a screen-filling
   // frame keeps every row visible (the chrome-drift regression).
@@ -377,6 +470,19 @@ async function main(): Promise<void> {
     // The seal rows overflow a full screen into scrollback; the frame itself
     // must come through intact — no lost top row, no drift, no stale tail.
     if (screen.join('\n') !== 'b1\na2\na3\nc4') problems.push(`phase0.6：整屏重绘丢行/漂移：${JSON.stringify(screen)}`)
+  }
+
+  // ── Phase 0.65: expanding from the post-stream live height to a full
+  // viewport must repaint as a frame, keeping the input at the bottom.
+  {
+    const rw: string[] = []
+    const renderer = new Renderer(makeStdout(rw), () => 40)
+    const cursor = { fromEnd: 3, col: 5 }
+    renderer.render(['old-1', 'old-2', 'old-3', 'old-input', 'old-f1', 'old-f2'], ['welcome-1', 'welcome-2'], cursor)
+    renderer.render(['', '', '', '', 'new-1', 'new-2', 'new-3', 'new-input', 'new-f1', 'new-f2'], [], cursor)
+    const screen = paintScreen(rw, 10)
+    const tail = screen.slice(-5).join('\n')
+    if (!tail.includes('new-input') || !tail.includes('new-f2')) problems.push(`phase0.65：live 扩展后 chrome 未锚底：${JSON.stringify(screen)}`)
   }
 
   // ── Phase 1: degraded boot (#183) — no `agents` service, never a throw ───

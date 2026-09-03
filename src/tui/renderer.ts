@@ -58,7 +58,9 @@ export class Renderer {
   render(live: readonly string[], stream: readonly string[] = [], cursor?: CursorPlacement): void {
     const width = Math.max(1, this.getWidth())
     const frame = live.map((line) => truncateToCells(line, width))
-    const forceFull = stream.length > 0 || width !== this.lastWidth
+    // A live-frame height change moves the bottom chrome's physical anchor;
+    // repaint from the frame start instead of treating it as tail growth.
+    const forceFull = stream.length > 0 || width !== this.lastWidth || frame.length !== this.last.length
     if (!forceFull && sameFrame(frame, this.last) && frame.length === this.last.length) return
 
     if (forceFull) {
@@ -66,6 +68,12 @@ export class Renderer {
       const parkRow = this.last.length - 1 - this.cursorFromEnd
       if (parkRow > 0) out.push(`\x1b[${parkRow}A`)
       out.push('\r')
+      // Stream rows are inserted above the live frame. Clear the old live
+      // region first so a picker/dialog border cannot survive when the new
+      // frame is shorter (for example, immediately after /model closes).
+      // This also makes the physical anchor independent of how many stale
+      // rows the previous frame had.
+      if (this.last.length > 0) out.push('\x1b[0J')
       for (const line of stream) {
         out.push(CLEAR_LINE, truncateToCells(line, width), '\r\n')
       }
@@ -77,6 +85,7 @@ export class Renderer {
       const stale = this.last.length - written
       this.clearStale(out, stale, frame.length)
       this.placeCursor(out, frame.length, cursor)
+      out.push(SYNC_END)
       this.stdout.write(out.join(''))
       this.last = [...frame]
       this.lastWidth = width

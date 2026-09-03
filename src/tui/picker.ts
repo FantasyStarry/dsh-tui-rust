@@ -58,15 +58,22 @@ const POINTER_W = 2
 const HINT = '↑/↓ 选择 · Enter 确认 · Esc 取消'
 
 /** Render the picker as a flat-bordered overlay block (already themed). */
-export function renderPicker(state: PickerState, width: number): string[] {
+export function renderPicker(state: PickerState, width: number, maxItems = 17): string[] {
   const lines: string[] = []
   lines.push(theme.primary('─'.repeat(width)))
   lines.push(' ' + theme.title(state.title))
   lines.push(theme.subtle(' ' + HINT))
   lines.push('')
 
-  const from = Math.max(0, state.index - 8)
-  const visible = state.items.slice(from, from + 17)
+  // The picker is embedded in the live frame, so callers can reserve a
+  // terminal-height budget. Keep at least the selected item visible even on
+  // very short terminals.
+  const itemLimit = Math.max(1, Math.floor(maxItems))
+  const before = Math.floor((itemLimit - 1) / 2)
+  const from = Math.max(0, Math.min(Math.max(0, state.items.length - itemLimit), state.index - before))
+  const visible = state.items.slice(from, from + itemLimit)
+  const above = from
+  if (above > 0) lines.push(theme.subtle(` ▲ ${above} more`))
   for (let i = 0; i < visible.length; i++) {
     const item = visible[i]
     if (!item) continue

@@ -40,6 +40,9 @@ export interface FrameContext {
   readonly width: number
   /** Terminal rows; used to keep the prompt anchored at the bottom. */
   readonly height?: number
+  /** Rows written above this live frame during the current render. */
+  readonly reservedRows?: number
+  readonly anchorChrome?: boolean
   readonly cwd: string
   readonly sessionId: string | null
   /** Live selection override (picker result) — wins over the logged route. */
@@ -76,6 +79,8 @@ const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '�
 export function buildFrame(ctx: FrameContext): ChatFrame {
   const width = Math.max(20, ctx.width)
   const height = Math.max(8, ctx.height ?? 24)
+  const anchorChrome = ctx.anchorChrome ?? ctx.picker !== null
+  const reservedRows = anchorChrome ? Math.max(0, Math.min(height - 1, ctx.reservedRows ?? 0)) : 0
   const stream: string[] = []
   const live: string[] = []
   // Content area: transcript + panels sit inside a 1-cell chrome gutter
@@ -90,28 +95,48 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     stream.push(...renderRow(row, ctx, inner).map(gutter))
   }
 
-  // Live region: open rows of the current turn + the bottom chrome. The
-  // chrome FOLLOWS the content (kimi inline layout) — no spacer pads the
-  // frame to the screen height, so a fresh session shows the welcome card
-  // and the editor stacked at the top instead of a wall of blank rows.
+  // Live region: open rows of the current turn + optional picker + bottom
+  // chrome. The chrome is bottom-anchored; spacer rows absorb free height.
   const openRows = ctx.channel.rows.slice(sealedTo)
   let openLines: string[] = []
   for (const row of openRows) {
     openLines.push(...renderRow(row, ctx, inner).map(gutter))
   }
 
-  const pickerLines = ctx.picker ? renderPicker(ctx.picker, inner).map(gutter) : []
   const bottom = [...inputBox(ctx.editorText, width), ...footerLines(ctx, width)]
+  // A picker is part of the live frame (unlike sealed transcript stream), so
+  // its visible rows must fit above the input/footer chrome. Without this
+  // budget a long provider/model list makes the terminal scroll mid-frame;
+  // the next route stream then repaints against the wrong physical row and
+  // leaves a ghost input box at the top of the screen.
+  const availableRows = anchorChrome ? Math.max(bottom.length + 2, height - reservedRows) : height
+  const pickerItemBudget = Math.max(1, availableRows - bottom.length - 7)
+  let pickerLines = ctx.picker ? renderPicker(ctx.picker, inner, pickerItemBudget).map(gutter) : []
+  if (pickerLines.length > 0) {
+    // Keep one row for the separator before the editor. On very short
+    // terminals the picker may still have a "more" marker; trim that marker
+    // (and any excess items) rather than allowing the terminal to scroll.
+    const maxPickerLines = Math.max(1, availableRows - bottom.length - 1)
+    pickerLines = pickerLines.slice(0, maxPickerLines)
+  }
   // The open-row window is capped so the frame never outgrows the terminal —
   // the diff painter can only repaint rows that are on screen. Overflow
   // collapses into a note and resumes into scrollback at the next seal.
   const pickerReserve = pickerLines.length > 0 ? pickerLines.length + 1 : 0
-  const maxOpen = Math.max(2, height - bottom.length - pickerReserve)
+  const maxOpen = Math.max(0, availableRows - bottom.length - pickerReserve)
   if (openLines.length > maxOpen) {
     const dropped = openLines.length - maxOpen
-    openLines = [theme.muted(`… 本回合前 ${dropped} 行暂省（回合结束后进历史）`), ...openLines.slice(-(maxOpen - 1))]
+    if (maxOpen > 0) {
+      const tailCount = Math.max(0, maxOpen - 1)
+      openLines = [theme.muted(`… 本回合前 ${dropped} 行暂省（回合结束后进历史）`), ...openLines.slice(-tailCount)]
+    } else {
+      openLines = []
+    }
   }
-  live.push(...openLines)
+  // The chrome is bottom-anchored: consume the remaining viewport with blank
+  // rows between transcript/picker content and the input box/footer.
+  const spacer = anchorChrome ? Math.max(0, maxOpen - openLines.length) : 0
+  live.push(...openLines, ...Array.from({ length: spacer }, () => ''))
 
   if (pickerLines.length > 0) {
     live.push(...pickerLines)
