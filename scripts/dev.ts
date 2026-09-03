@@ -17,6 +17,9 @@
  */
 
 import { EventEmitter } from 'node:events'
+import { rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { bootstrapApp } from '../src/app.js'
 import { Config } from '../src/index.js'
 import type { OrcaConfig } from '../src/index.js'
@@ -142,6 +145,8 @@ class FakeStdin extends EventEmitter {
 
 interface KernelRecord {
   createOptions: CreateAgentOptions | null
+  createCalls: number
+  resumedId: string | null
   followupMessage: UserMessage | null
   cancelCause: { kind: string } | null
   selectionSaved: { provider: string; model: string; reasoningEffort?: string } | null
@@ -162,6 +167,8 @@ interface KernelRecord {
 class FakeKernel implements KernelContext {
   readonly record: KernelRecord = {
     createOptions: null,
+    createCalls: 0,
+    resumedId: null,
     followupMessage: null,
     cancelCause: null,
     selectionSaved: null,
@@ -180,6 +187,10 @@ class FakeKernel implements KernelContext {
   private fakeTitle: string | null = null
   /** When true, `sessionQuery` reads as unregistered (late-registration probe). */
   hideSessionQuery = false
+  /** Live agents by session id (removed on dispose, like the real store). */
+  private readonly liveAgents = new Map<string, AgentHandle['agent']>()
+  /** Sessions durable on "disk" (survive dispose, loadable via resume). */
+  private readonly persistedSessions = new Set<string>()
 
   constructor(private readonly mounted: boolean) {}
 
@@ -243,6 +254,18 @@ class FakeKernel implements KernelContext {
             status: 'fulfilled' as const,
             value: sessionId === 'session-aaa' ? { title: { title: '假标题A', updatedAt: Date.now() } } : {},
           })),
+        readSession: async (_sessionId: string) => ({
+          events: [
+            { type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } },
+            {
+              type: 'user/message',
+              seq: 1,
+              time: Date.now(),
+              data: { content: [{ type: 'text', text: 'hi 历史' }], source: { kind: 'user' } },
+            },
+            { type: 'turn/end', seq: 2, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } },
+          ],
+        }),
       } as T
     }
     if (name === 'sessionTitle') {
@@ -308,6 +331,7 @@ class FakeKernel implements KernelContext {
         throw new Error('no agent factory registered (load an agent-loop plugin)')
       }
       this.record.createOptions = options
+      this.record.createCalls++
       const kernel = this
       const session: Session = {
         id: options.sessionId,
@@ -339,16 +363,28 @@ class FakeKernel implements KernelContext {
         },
         whenIdle: async (): Promise<void> => {},
       }
+      kernel.liveAgents.set(options.sessionId, agent)
+      kernel.persistedSessions.add(options.sessionId)
       return {
         agent,
         dispose: async (): Promise<void> => {
           kernel.record.disposed = true
+          kernel.liveAgents.delete(options.sessionId)
         },
       }
     },
     resume: async (options: ResumeAgentOptions): Promise<AgentHandle> => {
+      // Unknown sessions reject like the real persistence backend; each fake
+      // kernel owns its persistence, so cross-kernel resumes fail and the app
+      // must fall back to a fresh create.
+      if (!this.persistedSessions.has(options.resumeSessionId)) {
+        throw new Error(`session not found: ${options.resumeSessionId}`)
+      }
+      this.record.resumedId = options.resumeSessionId
       return this.agentsService.create({ sessionId: options.resumeSessionId, agentOptions: options.agentOptions })
     },
+    get: (id: string) => this.liveAgents.get(id) as AgentHandle['agent'] | undefined,
+    list: () => [...this.liveAgents.values()] as Array<AgentHandle['agent']>,
   }
 
   /**
@@ -400,6 +436,15 @@ class FakeKernel implements KernelContext {
 
 async function main(): Promise<void> {
   const problems: string[] = []
+  // Sandbox the same-process remount marker: the harness mounts several
+  // bootstraps in ONE process, and without isolation every later mount
+  // would silently resume the first mount's session.
+  process.env['ORCA_LAST_SESSION_FILE'] = join(tmpdir(), `orca-smoke-${process.pid}.json`)
+  try {
+    rmSync(process.env['ORCA_LAST_SESSION_FILE'])
+  } catch {
+    // Absent on the first run — nothing to clear.
+  }
 
   // ── Phase 0: the Config Standard Schema contract ──────────────────────────
   const schema = Config['~standard']
@@ -889,6 +934,40 @@ async function main(): Promise<void> {
   await sleep(120)
   if (!visible4().includes('用量：')) problems.push('phase4：补全后回车未分发 /usage')
   dispose4()
+  await sleep(20)
+
+  // ── Phase 5: 同进程静默重挂载（热重载不再叠欢迎卡/建新会话）────────────────
+  const writes5a: string[] = []
+  const kernel5 = new FakeKernel(true)
+  const dispose5a = bootstrapApp(
+    kernel5,
+    { provider: '', model: '', fullscreen: false },
+    { stdout: () => makeStdout(writes5a), stdin: () => new FakeStdin() },
+  )
+  await sleep(300)
+  const session5 = kernel5.record.createOptions?.sessionId
+  if (!session5) problems.push('phase5：首次挂载未建会话')
+  if (!stripSgr(writes5a.join('')).includes('✦ orca')) problems.push('phase5：首次挂载缺欢迎卡')
+  dispose5a()
+  await sleep(50)
+  // Same process, same pid-file, previous agent disposed: the remount must
+  // RESUME the session (no fresh create) with no welcome card, replaying the
+  // durable log into the fresh channel.
+  const createsBefore = kernel5.record.createCalls
+  const writes5b: string[] = []
+  const stdin5b = new FakeStdin()
+  const dispose5b = bootstrapApp(
+    kernel5,
+    { provider: '', model: '', fullscreen: false },
+    { stdout: () => makeStdout(writes5b), stdin: () => stdin5b },
+  )
+  await sleep(300)
+  const visible5b = stripSgr(writes5b.join(''))
+  if (kernel5.record.resumedId !== session5) problems.push(`phase5：重挂载未恢复同一会话：${kernel5.record.resumedId}`)
+  if (kernel5.record.createCalls > createsBefore + 1) problems.push('phase5：重挂载建了多余会话')
+  if (visible5b.includes('✦ orca')) problems.push('phase5：重挂载不应再刷欢迎卡')
+  if (!visible5b.includes('hi 历史')) problems.push('phase5：持久化日志未重放进转录')
+  dispose5b()
   await sleep(20)
 
   if (problems.length > 0) {

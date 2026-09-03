@@ -362,12 +362,15 @@ export interface KernelAgentDefaultModel {
 
 /**
  * The kernel agent factory (`ctx.agents`, dsh-agent `AgentRegistry` — the
- * creation subset). Creation/resume are async and return owned handles;
- * the real registry additionally exposes get/list/roots/register.
+ * creation subset plus live lookup). Creation/resume are async and return
+ * owned handles; `get`/`list` read the live registry without owning.
+ * Checked against dsh 0.1.2-alpha.5.
  */
 export interface KernelAgentsService {
   create(options: CreateAgentOptions): Promise<AgentHandle>
   resume(options: ResumeAgentOptions): Promise<AgentHandle>
+  get(id: string): Agent | undefined
+  list(): Agent[]
 }
 
 /**
@@ -404,6 +407,13 @@ export interface KernelSessionQueryService {
       | { readonly sessionId: string; readonly status: 'rejected'; readonly reason: unknown }
     >
   >
+  /**
+   * Read and replay-validate one complete logical session log without making
+   * it live (dsh-session-query `readSession`). Orca replays the events into
+   * a fresh channel after a same-process silent remount so the transcript
+   * survives hot reload.
+   */
+  readSession(sessionId: string): Promise<{ readonly events: readonly SessionEvent[] }>
 }
 
 /**

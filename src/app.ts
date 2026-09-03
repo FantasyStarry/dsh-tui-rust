@@ -17,7 +17,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, readFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Channel } from './adapter/channel.js'
 import type { SessionRoute } from './adapter/channel.js'
@@ -552,6 +552,56 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
     attachAgent(handle.agent)
     channel.pushSystem(`session 已连接：${handle.agent.session.id}`)
+    // Remember the live session for a same-process silent remount (hot
+    // reload): the next bootstrap resumes THIS session instead of minting a
+    // new one, so rebuilds stop stacking welcomes on the screen.
+    writeLastSession(handle.agent.session.id)
+  }
+
+  /**
+   * Same-process silent remount (hot reload path). When the previous mount
+   * in THIS process owned `lastSessionId` and its agent is gone (its effect
+   * disposer ran `handle.dispose()`), resume it from persistence and replay
+   * the durable log into the fresh channel: no new session, no welcome card,
+   * no route line — the rebuild is invisible. Any failure falls through to
+   * the normal fresh-create path. An explicit ORCA_RESUME_SESSION always
+   * wins and bypasses this.
+   */
+  const trySilentRemount = async (): Promise<boolean> => {
+    const agentFactory = getAgents()
+    if (!agentFactory) return false
+    const last = readLastSession()
+    if (!last || last.pid !== process.pid) return false
+    // Still live = still owned by its mount (its effect never unwound).
+    // Adopting foreign ownership would race its disposal — stay out.
+    try {
+      if (agentFactory.get(last.sessionId)) return false
+    } catch {
+      return false
+    }
+    const agentOptions = currentAgentOptions()
+    try {
+      handle = await agentFactory.resume(
+        agentOptions ? { resumeSessionId: last.sessionId, agentOptions } : { resumeSessionId: last.sessionId },
+      )
+    } catch {
+      return false
+    }
+    attachAgent(handle.agent)
+    welcomed = true // suppress the one-time welcome AND route line on remount
+    try {
+      const snapshot = await getSessionQuery()?.readSession(last.sessionId)
+      const events = snapshot?.events
+      if (events && events.length > 0) {
+        channel.replay(events)
+        channel.sealedRowCount = channel.rows.length
+        conversationStarted = true
+      }
+    } catch {
+      // Empty transcript — live events are the truth from here on.
+    }
+    writeLastSession(handle.agent.session.id)
+    return true
   }
 
   const currentAgentOptions = (): { provider: string; model: string } | undefined => {
@@ -1030,6 +1080,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     // targeted factory retry in createAgent as a safety net.
     const loader = ctx.get<KernelLoader>('loader', false)
     await loader?.await()
+    if (!resumeId && (await trySilentRemount())) return
     await createAgent(resumeId)
   }
 
@@ -1285,6 +1336,44 @@ function formatTime(epochMs: number): string {
   const date = new Date(epochMs)
   const pad = (n: number): string => String(n).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/** Override point for tests — the harness sandboxes this to a temp file. */
+function lastSessionFile(): string {
+  const override = process.env['ORCA_LAST_SESSION_FILE']
+  if (override) return override
+  const home = process.env['USERPROFILE'] ?? process.env['HOME'] ?? ''
+  return join(home, '.dsh', 'orca-last-session.json')
+}
+
+interface LastSessionRecord {
+  readonly pid: number
+  readonly sessionId: string
+}
+
+/** Best-effort read of the last live session marker (null on any failure). */
+function readLastSession(): LastSessionRecord | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(lastSessionFile(), 'utf8'))
+    const record = recordOf(parsed)
+    const pid = record?.['pid']
+    const sessionId = record?.['sessionId']
+    if (typeof pid === 'number' && Number.isInteger(pid) && typeof sessionId === 'string' && sessionId !== '') {
+      return { pid, sessionId }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** Best-effort write of the last live session marker (never throws). */
+function writeLastSession(sessionId: string): void {
+  try {
+    writeFileSync(lastSessionFile(), JSON.stringify({ pid: process.pid, sessionId }))
+  } catch {
+    // Marker loss only costs a silent remount, never the session.
+  }
 }
 
 function defaultDeps(): AppIoDeps {
