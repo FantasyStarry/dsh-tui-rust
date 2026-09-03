@@ -17,7 +17,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { appendFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Channel } from './adapter/channel.js'
 import type { SessionRoute } from './adapter/channel.js'
@@ -58,6 +58,9 @@ const FACTORY_RETRY_DELAY_MS = 100
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }
+
+/** In-process mount counter — attributes ORCA_LOG lines to one bootstrap. */
+let bootSeq = 0
 
 type PickerStage =
   | { readonly kind: 'providers' }
@@ -103,6 +106,38 @@ function parseSlash(text: string): { readonly name: string; readonly args: strin
 export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIoDeps = defaultDeps()): () => void {
   const stdout = deps.stdout()
   const stdin = deps.stdin()
+  const bootId = ++bootSeq
+
+  // Byte-level forensics (opt-in): ORCA_LOG=<path> records every stdout
+  // write with its terminal geometry. Used to diagnose viewport artifacts
+  // (truncation/misalignment) against the exact byte stream. Never affects
+  // rendering; failures are swallowed so logging can never break the TUI.
+  const logPath = process.env['ORCA_LOG']
+  if (logPath) {
+    try {
+      appendFileSync(
+        logPath,
+        `\n### boot#${bootId} pid=${process.pid} cols=${String(stdout.columns)} rows=${String(stdout.rows)} at=${new Date().toISOString()}\n`,
+      )
+      const origWrite = stdout.write.bind(stdout) as (...args: unknown[]) => boolean
+      let writeNo = 0
+      stdout.write = ((...args: unknown[]): boolean => {
+        try {
+          const head = args[0]
+          const body = typeof head === 'string' ? head : '<non-string chunk>'
+          appendFileSync(
+            logPath,
+            `--- boot#${bootId} write#${writeNo++} cols=${String(stdout.columns)} rows=${String(stdout.rows)} bytes=${Buffer.byteLength(body)} ---\n${body}\n`,
+          )
+        } catch {
+          // Logging must never break the TUI.
+        }
+        return origWrite(...args)
+      }) as typeof stdout.write
+    } catch {
+      // Logging must never break the TUI.
+    }
+  }
 
   const channel = new Channel()
   const renderer = new Renderer(stdout, () => stdout.columns ?? 80)
