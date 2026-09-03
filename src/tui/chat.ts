@@ -52,6 +52,14 @@ export interface FrameContext {
   readonly now: number
   /** Active `/model` picker overlay lines, rendered above the input box. */
   readonly picker: PickerState | null
+  /** Folded session title for the footer (M3). */
+  readonly title?: string | null
+  /** Effective approval policy for the footer (M4: ask/never). */
+  readonly policy?: string
+  /** Yolo auto-allow flag for the footer badge (M4). */
+  readonly yolo?: boolean
+  /** Git branch for the footer slot (M4 status slot, best-effort). */
+  readonly branch?: string | null
 }
 
 export interface ChatFrame {
@@ -267,13 +275,24 @@ function footerLines(ctx: FrameContext, width: number): string[] {
   const state = ctx.channel.runState
   const route = ctx.route
   const usage = ctx.usage
-  const badge =
-    state === 'thinking' ? theme.subtle('⠋ 思考中…') : state === 'working' ? theme.subtle('⏺ 执行工具…') : ''
+  const compacting = ctx.channel.compacting
+  const badge = compacting
+    ? theme.subtle('◌ 压缩中…')
+    : state === 'thinking'
+      ? theme.subtle('⠋ 思考中…')
+      : state === 'working'
+        ? theme.subtle('⏺ 执行工具…')
+        : ''
   const routeText = route
     ? theme.text(`${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}`)
     : ''
+  // M3/M4 status slots: title · yolo/policy · git branch — all best-effort,
+  // all truncated by the gutter guard. Empty slots vanish, never blank gaps.
+  const titleText = ctx.title ? theme.text(`「${ctx.title}」`) : ''
+  const modeText = ctx.yolo ? theme.warn('yolo') : ctx.policy === 'never' ? theme.warn('never') : ''
+  const branchText = ctx.branch ? theme.muted(`⑂ ${ctx.branch}`) : ''
   const dir = theme.muted(short(ctx.cwd))
-  const line1 = [badge, routeText, dir].filter((part) => part !== '').join(theme.subtle('  '))
+  const line1 = [badge, routeText, titleText, modeText, dir, branchText].filter((part) => part !== '').join(theme.subtle('  '))
 
   const context =
     usage.messages > 0

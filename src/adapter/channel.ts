@@ -240,13 +240,24 @@ export class Channel {
   title: string | null = null
   /** True while a `compaction/start` … `compaction/end` cycle is open. */
   compacting = false
+  /** Last observed event seq (for rewind boundaries). Null before any event. */
+  lastSeq: number | null = null
+  /** Seqs of observed `turn/start` events (for rewind boundaries). */
+  turnSeqs: number[] = []
 
   private openAssistantId: number | null = null
   private openThoughtId: number | null = null
 
   ingest(event: SessionEvent): void {
+    if (typeof event.seq === 'number' && Number.isFinite(event.seq)) {
+      this.lastSeq = event.seq
+    }
     switch (event.type) {
       case 'turn/start': {
+        if (typeof event.seq === 'number' && Number.isFinite(event.seq)) {
+          this.turnSeqs.push(event.seq)
+          if (this.turnSeqs.length > 50) this.turnSeqs.splice(0, this.turnSeqs.length - 50)
+        }
         // The previous turns' rows are final — seal them into scrollback.
         if (this.sealedRowCount < this.rows.length) {
           this.sealedRowCount = this.rows.length
@@ -524,6 +535,8 @@ export class Channel {
     this.usage = { input: 0, output: 0, reasoning: 0, messages: 0 }
     this.title = null
     this.compacting = false
+    this.lastSeq = null
+    this.turnSeqs = []
     this.version++
   }
 

@@ -17,6 +17,8 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { Channel } from './adapter/channel.js'
 import type { SessionRoute } from './adapter/channel.js'
 import type { OrcaConfig } from './index.js'
@@ -855,6 +857,93 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
   }
 
+  // ── rewind: double-Esc forks to the previous turn boundary (M3) ────────────
+  // pi `/tree` + kimi `/undo` spirit, kernel-native via `ctx.sessions.fork`:
+  // the child keeps the prefix through the previous turn, later turns stay in
+  // the parent log on disk. Idle-only; needs ≥2 observed turns.
+
+  const doRewind = async (): Promise<void> => {
+    if (!agent || !handle || !agentFactory) {
+      channel.pushSystem('agent 未就绪，无法回退')
+      return
+    }
+    if (!sessions) {
+      channel.pushSystem('sessions 服务未挂载：无法回退（内核需挂载 dsh-session）')
+      return
+    }
+    if (channel.runState !== 'idle') {
+      channel.pushSystem('回合运行中，先按 Esc 打断再双击 Esc 回退')
+      return
+    }
+    const turns = channel.turnSeqs
+    if (turns.length < 2) {
+      channel.pushSystem('没有可回退的回合（至少需要两轮对话）')
+      return
+    }
+    const boundary = turns[turns.length - 2]
+    if (boundary === undefined) {
+      channel.pushSystem('没有可回退的回合')
+      return
+    }
+    const childId = mintSessionId()
+    let child: { id: string } | null = null
+    try {
+      child = sessions.fork(agent.session, boundary, childId) as unknown as { id: string }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (/OPEN_TURN/i.test(message)) {
+        channel.pushSystem('回退失败：边界落在未闭合回合内，稍后重试')
+      } else {
+        channel.pushSystem(`回退失败：${message}`)
+      }
+      return
+    }
+    const childSessionId = typeof child?.id === 'string' ? child.id : childId
+    channel.pushSystem(`已回退到上一轮（fork ${shortSessionLabel(childSessionId)}），正在切换…`)
+    const previous = handle
+    handle = null
+    agent = null
+    try {
+      await previous?.dispose()
+    } catch {
+      // Teardown failures must not block the rewound session.
+    }
+    channel.clearForSwitch()
+    conversationStarted = true // keep chrome anchored after a rewind
+    welcomed = true
+    await createAgent(childSessionId)
+  }
+
+  // M4 status slot: git branch, cached 2s (file read only, no spawn).
+  let branchCache: { readonly at: number; readonly cwd: string; readonly value: string | null } | null = null
+
+  const gitBranch = (cwd: string): string | null => {
+    const now = Date.now()
+    if (branchCache && branchCache.cwd === cwd && now - branchCache.at < 2000) return branchCache.value
+    let value: string | null = null
+    try {
+      const head = readFileSync(join(cwd, '.git', 'HEAD'), 'utf8').trim()
+      const match = /^ref:\s*refs\/heads\/(.+)$/.exec(head)
+      value = match?.[1] ?? null
+    } catch {
+      value = null
+    }
+    branchCache = { at: now, cwd, value }
+    return value
+  }
+
+  // Title for the footer: channel.title (event fold) wins; the service is a
+  // 1s-cached fallback so the 30fps render never folds the log per tick.
+  let titleCache: { readonly at: number; readonly value: string | null } | null = null
+
+  const safeTitleGetCached = (): string | null => {
+    const now = Date.now()
+    if (titleCache && now - titleCache.at < 1000) return titleCache.value
+    const value = safeTitleGet()
+    titleCache = { at: now, value }
+    return value
+  }
+
   // ── agent lifecycle ───────────────────────────────────────────────────────
 
   const start = async (): Promise<void> => {
@@ -870,6 +959,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   }
 
   let editor = ''
+  let lastEscAt = 0
   const keyboard = new Keyboard(stdin, (key) => {
     // The picker captures every key except the exit chord.
     if (picker && classify(key) !== 'exit') {
@@ -883,8 +973,26 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         break
       }
       case 'cancel': {
-        if (editor) editor = ''
-        else agent?.cancel({ kind: 'user' })
+        if (editor) {
+          editor = ''
+          break
+        }
+        if (picker) {
+          // Approval Esc is handled inside handlePickerKey (explicit
+          // reject); other pickers just close here.
+          handlePickerKey(key)
+          break
+        }
+        // Double-Esc on an empty idle editor = rewind to the previous turn
+        // (pi /tree + kimi /undo spirit). Single Esc still cancels the turn.
+        const now = Date.now()
+        const doubleEsc = now - lastEscAt < 600
+        lastEscAt = now
+        if (doubleEsc && channel.runState === 'idle') {
+          void doRewind()
+        } else {
+          agent?.cancel({ kind: 'user' })
+        }
         break
       }
       case 'submit': {
@@ -913,6 +1021,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   let conversationStarted = false
   const render = (): void => {
     const route = selection ?? channel.route
+    const cwd = process.cwd()
+    const title = channel.title ?? safeTitleGetCached()
     const stream: string[] = []
     // One-time welcome card; afterwards only route changes print a slim
     // line — the scrollback stream never accumulates repeated banners.
@@ -945,12 +1055,16 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // permanently reduce the chat viewport.
       reservedRows: stream.length,
       anchorChrome: conversationStarted || picker !== null,
-      cwd: process.cwd(),
+      cwd,
       sessionId: agent?.session.id ?? null,
       route,
       usage: channel.usage,
       now: Date.now(),
       picker,
+      title,
+      policy: approvalPolicy,
+      yolo: yoloMode,
+      branch: gitBranch(cwd),
     })
     // Sealed transcript rows are discovered while building the frame; fold
     // their stream height into a second pass so bottom chrome remains fixed
@@ -964,12 +1078,16 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         height: stdout.rows ?? 24,
         reservedRows: stream.length + frame.stream.length,
         anchorChrome: conversationStarted || picker !== null,
-        cwd: process.cwd(),
+        cwd,
         sessionId: agent?.session.id ?? null,
         route,
         usage: channel.usage,
         now: Date.now(),
         picker,
+        title,
+        policy: approvalPolicy,
+        yolo: yoloMode,
+        branch: gitBranch(cwd),
       })
     }
     stream.push(...frame.stream)
