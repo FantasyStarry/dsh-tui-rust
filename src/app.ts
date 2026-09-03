@@ -62,6 +62,7 @@ type PickerStage =
   | { readonly kind: 'models'; readonly provider: string }
   | { readonly kind: 'effort'; readonly provider: string; readonly model: string }
   | { readonly kind: 'sessions' }
+  | { readonly kind: 'approval' }
 
 /** Slash command metadata — kimi-style grouping, aliases, idle gating. */
 interface SlashCommand {
@@ -122,14 +123,97 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   let handle: AgentHandle | null = null
   let agent: Agent | null = null
   let disposed = false
-  /** Effective approval policy for the footer (`ask` default, `never` = yolo). */
+  /**
+   * Effective approval policy folded from the log (`ask` default,
+   * `never` = headless auto-reject). Yolo (auto-allow) is NOT a policy —
+   * the kernel has no allow-all policy; Orca implements it as an
+   * auto-answering `approval/request` waterfall (see below).
+   */
   let approvalPolicy: KernelApprovalPolicy = 'ask'
+  /** Yolo mode: auto-answer every approval ask with `allowed-once`. */
+  let yoloMode = false
 
   /** Live model selection — overrides the request route via the waterfall. */
   let selection: SessionRoute | null = null
   let picker: PickerState | null = null
   let pickerStage: PickerStage | null = null
   const listenerDisposers: Array<() => void> = []
+
+  // ── approval panel (M4) ───────────────────────────────────────────────────
+  // One-shot FIFO: the kernel may ask concurrently (parallel tools); Orca
+  // shows the head and queues the rest. Each entry resolves its waterfall
+  // exactly once — dispose/cancel resolves `cancelled`, yolo `allowed-once`.
+
+  interface PendingApproval {
+    readonly toolName: string
+    readonly reason: string
+    resolve: (outcome: 'allowed-once' | 'rejected' | 'cancelled') => void
+    settled: boolean
+  }
+
+  const approvalQueue: PendingApproval[] = []
+
+  const showApprovalPanel = (): void => {
+    const head = approvalQueue[0]
+    if (!head) return
+    // Approval is modal: it supersedes any picker (the model picker can be
+    // reopened with /model after the decision).
+    pickerStage = { kind: 'approval' }
+    picker = openPicker(
+      `审批：${head.toolName}${head.reason ? ` — ${head.reason}` : ''}`,
+      [
+        { value: 'allowed-once', label: '放行单次', hint: '1' },
+        { value: 'rejected', label: '拒绝', hint: '2/Esc' },
+      ],
+    )
+  }
+
+  const settleApprovalHead = (outcome: 'allowed-once' | 'rejected' | 'cancelled'): void => {
+    const head = approvalQueue.shift()
+    if (!head || head.settled) {
+      if (pickerStage?.kind === 'approval') closePicker()
+      return
+    }
+    head.settled = true
+    if (pickerStage?.kind === 'approval') closePicker()
+    head.resolve(outcome)
+    // Show the next queued ask, if any.
+    if (approvalQueue.length > 0) showApprovalPanel()
+  }
+
+  const answerApproval = (
+    toolName: string,
+    reason: string,
+    signal: AbortSignal | undefined,
+  ): Promise<'allowed-once' | 'rejected' | 'cancelled'> => {
+    // Yolo: auto-allow without ever showing the panel.
+    if (yoloMode) return Promise.resolve('allowed-once')
+    if (disposed) return Promise.resolve('cancelled')
+    return new Promise<'allowed-once' | 'rejected' | 'cancelled'>((resolve) => {
+      const entry: PendingApproval = {
+        toolName: toolName === '' ? 'tool' : toolName,
+        reason,
+        resolve,
+        settled: false,
+      }
+      approvalQueue.push(entry)
+      if (approvalQueue.length === 1) showApprovalPanel()
+      signal?.addEventListener(
+        'abort',
+        () => {
+          const index = approvalQueue.indexOf(entry)
+          if (index !== -1) approvalQueue.splice(index, 1)
+          if (!entry.settled) {
+            entry.settled = true
+            if (pickerStage?.kind === 'approval' && approvalQueue.length === 0) closePicker()
+            else if (pickerStage?.kind === 'approval') showApprovalPanel()
+            resolve('cancelled')
+          }
+        },
+        { once: true },
+      )
+    })
+  }
 
   // Kernel → channel: session events are the single source of truth. The
   // listener shape is (session, event); both arrive unknown-typed and are
@@ -297,39 +381,39 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     if (agent && approval) {
       try {
         const override = approval.overrideOf(agent.session)
-        channel.pushSystem(`审批策略：${override ?? approvalPolicy}（ask = 逐次确认，never = 全放行/yolo）`)
+        const effective = override ?? approvalPolicy
+        channel.pushSystem(`审批策略：${effective}${yoloMode ? ' · yolo 开（自动放行单次）' : ''}（ask = 逐次确认，never = 全拒绝）`)
         return
       } catch {
         // Fall through to the cached value.
       }
     }
-    channel.pushSystem(`审批策略：${approvalPolicy}（approval 服务未挂载时为本地估计值）`)
+    channel.pushSystem(`审批策略：${approvalPolicy}${yoloMode ? ' · yolo 开' : ''}（approval 服务未挂载时为本地估计值）`)
   }
 
   const doYolo = (args: string): void => {
     const normalized = args.trim().toLowerCase()
-    let next: KernelApprovalPolicy | null = null
-    if (normalized === 'on' || normalized === 'true' || normalized === '1') next = 'never'
-    else if (normalized === 'off' || normalized === 'false' || normalized === '0') next = 'ask'
-    else if (normalized === '') next = approvalPolicy === 'ask' ? 'never' : 'ask'
-    if (!next) {
+    let next: boolean | null = null
+    if (normalized === 'on' || normalized === 'true' || normalized === '1') next = true
+    else if (normalized === 'off' || normalized === 'false' || normalized === '0') next = false
+    else if (normalized === '') next = !yoloMode
+    if (next === null) {
       channel.pushSystem('用法：/yolo [on|off]')
       return
     }
-    if (!agent || !approval) {
-      // No seam to persist — keep a local estimate so the footer still
-      // reflects intent; the next session fold corrects it.
-      approvalPolicy = next
-      channel.pushSystem(`approval 服务未挂载：本地切换为 ${next}（仅显示）`)
-      return
+    yoloMode = next
+    // Yolo needs asks to reach our answerer: force the session policy back
+    // to `ask` when enabling (a `never` policy would auto-reject before we
+    // ever see the request). Best-effort; local flag still drives the panel.
+    if (next && agent && approval) {
+      try {
+        approval.setPolicy(agent, 'ask')
+        approvalPolicy = 'ask'
+      } catch {
+        // Local flag stands on its own.
+      }
     }
-    try {
-      approval.setPolicy(agent, next)
-      approvalPolicy = next
-      channel.pushSystem(next === 'never' ? 'yolo 已开启：审批全放行（never）' : 'yolo 已关闭：恢复逐次确认（ask）')
-    } catch (error) {
-      channel.pushSystem(`切换审批策略失败：${error instanceof Error ? error.message : String(error)}`)
-    }
+    channel.pushSystem(next ? 'yolo 已开启：工具审批自动放行（单次授权）' : 'yolo 已关闭：恢复逐次确认')
   }
 
   const doTitle = (args: string): void => {
@@ -470,6 +554,37 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       })()
     })
     listenerDisposers.push(disposeWaterfall)
+    // Interactive answerer for `approval/request` (dsh-user-approval
+    // waterfall, scoped to this agent — dies with the agent). Yolo
+    // short-circuits inside answerApproval; the audit pair still lands via
+    // session/event. A throwing answerer must never break the turn — the
+    // service normalizes it to `unavailable`, but we fail closed to
+    // `rejected` ourselves so the panel can never grant by accident.
+    const disposeApproval = next.ctx.on(KERNEL_EVENTS.approvalRequest, (...args: unknown[]) => {
+      const req = recordOf(args[0])
+      const waterfallNext = typeof args[1] === 'function' ? (args[1] as () => Promise<string>) : undefined
+      return (async (): Promise<string> => {
+        let toolName = ''
+        let reason = ''
+        let signal: AbortSignal | undefined
+        if (req) {
+          if (typeof req['toolName'] === 'string') toolName = req['toolName']
+          if (typeof req['reason'] === 'string') reason = req['reason']
+          if (req['signal'] instanceof AbortSignal) signal = req['signal']
+        }
+        try {
+          return await answerApproval(toolName, reason, signal)
+        } catch {
+          return 'rejected'
+        } finally {
+          // Keep the chain honest: if we did not claim the ask (e.g. yolo
+          // short-circuit still counts as a claim — we returned), nothing to
+          // delegate. We always claim, so `next` is never called.
+          void waterfallNext
+        }
+      })()
+    })
+    listenerDisposers.push(disposeApproval)
   }
 
   // ── /model picker ─────────────────────────────────────────────────────────
@@ -512,6 +627,12 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
     if (pickerStage.kind === 'sessions') {
       confirmResumePicker()
+      return
+    }
+    if (pickerStage.kind === 'approval') {
+      const item = pickedItem(picker)
+      if (!item || item.disabled) return
+      settleApprovalHead(item.value === 'allowed-once' ? 'allowed-once' : 'rejected')
       return
     }
     if (!llm) {
@@ -582,8 +703,25 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   const handlePickerKey = (key: KeyPress): void => {
     if (!picker) return
+    // Approval shortcuts (kimi 1/2/3): answer without moving the cursor.
+    if (pickerStage?.kind === 'approval' && classify(key) === 'text') {
+      if (key.sequence === '1') {
+        settleApprovalHead('allowed-once')
+        return
+      }
+      if (key.sequence === '2') {
+        settleApprovalHead('rejected')
+        return
+      }
+    }
     const action = classify(key)
     if (action === 'cancel') {
+      // Esc on the approval panel is an explicit reject (kimi behavior);
+      // on other pickers it just closes.
+      if (pickerStage?.kind === 'approval') {
+        settleApprovalHead('rejected')
+        return
+      }
       closePicker()
       return
     }
@@ -857,6 +995,9 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     keyboard.stop()
     renderer.dispose()
     if (config.fullscreen) stdout.write('\x1b[?1049l')
+    // Unblock any pending approval asks — late answers are discarded by the
+    // service once the signal fires, but our promise must still settle.
+    while (approvalQueue.length > 0) settleApprovalHead('cancelled')
     for (const disposeListener of listenerDisposers) disposeListener()
     void handle?.dispose()
   }
