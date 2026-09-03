@@ -27,6 +27,7 @@
 
 import type { AgentRunState, Channel, SessionRoute, SessionUsage, TranscriptRow } from '../adapter/channel.js'
 import { renderMarkdown } from './markdown.js'
+import { asciiEllipses } from './width.js'
 import { renderPicker, type PickerItem, type PickerState } from './picker.js'
 import { boxed, boxLine, boxTop, boxBottom, type BoxStyle } from './box.js'
 import { theme } from './theme.js'
@@ -288,7 +289,7 @@ function toolCard(row: TranscriptRow, width: number): string[] {
   }
   const mark =
     row.status === 'running' ? theme.primary('⠋') : row.status === 'failed' ? theme.fail(FAILURE_MARK) : theme.ok(SUCCESS_MARK)
-  const suffix = row.status === 'running' ? theme.subtle(' …') : ''
+  const suffix = row.status === 'running' ? theme.subtle(' ...') : ''
   const title = mark + theme.strong(name) + suffix
   const wrapped = wrapWidth(row.text || '', Math.max(8, width - 8))
   const content = wrapped.slice(0, 3).map((line) => theme.subtle(line))
@@ -303,7 +304,7 @@ function wrappedLines(text: string, width: number): string[] {
 function inputBox(text: string, width: number): string[] {
   const w = Math.max(20, width)
   const style: BoxStyle = { bg: (t) => t, border: theme.primary }
-  const body = text !== '' ? text : theme.placeholder('说点什么…')
+  const body = text !== '' ? text : theme.placeholder('说点什么...')
   return [boxTop(w, style), boxLine('> ' + body, w, style), boxBottom(w, style)]
 }
 
@@ -314,13 +315,13 @@ function footerLines(ctx: FrameContext, width: number): string[] {
   const usage = ctx.usage
   const compacting = ctx.channel.compacting
   const badge = compacting
-    ? theme.subtle('◌ 压缩中…')
+    ? theme.subtle('◌ 压缩中...')
     : state === 'thinking'
-      ? theme.subtle('⠋ 思考中…')
+      ? theme.subtle('⠋ 思考中...')
       : state === 'working'
-        ? theme.subtle('⏺ 执行工具…')
+        ? theme.subtle('⏺ 执行工具...')
         : ctx.connecting
-          ? theme.subtle('○ 连接中…')
+          ? theme.subtle('○ 连接中...')
           : ''
   const routeText = route
     ? theme.text(`${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}`)
@@ -352,9 +353,11 @@ function footerLines(ctx: FrameContext, width: number): string[] {
   return [gutterLine(line1, width), gutterLine(line2, width)]
 }
 
-/** 1-cell gutter strip (kimi CHROME_GUTTER): ` content ` within `width`. */
+/** 1-cell gutter strip (kimi CHROME_GUTTER): ` content ` within `width`.
+ *  The row is padded to EXACTLY the terminal width, so ambiguous ellipses
+ *  are stripped first (a CJK-wide `…` here wraps the whole footer). */
 function gutterLine(content: string, width: number): string {
-  return ' ' + truncateWidth(content, width - 2) + ' '
+  return ' ' + truncateWidth(asciiEllipses(content), width - 2) + ' '
 }
 
 function fmtTokens(count: number): string {
@@ -370,7 +373,7 @@ function short(cwd: string): string {
 }
 
 function shortSession(id: string): string {
-  return id.length > 18 ? '…' + id.slice(-12) : id
+  return id.length > 18 ? '..' + id.slice(-12) : id
 }
 
 function truncateCells(line: string, width: number): string {

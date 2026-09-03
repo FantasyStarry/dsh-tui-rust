@@ -5,20 +5,32 @@
  *
  * One deliberate override on top of the library default: `…` (U+2026) and
  * `⋯` (U+22EF) count as TWO cells. They are East-Asian-Width "ambiguous" —
- * the library (like most terminals' default config) says narrow, but CJK
- * terminals and fonts render them double-cell, and both appear inside
- * width-critical rows (the editor placeholder, boxed tool/diff cards).
- * Over-counting costs a 1-cell gap; under-counting pushes the box border
- * past the terminal edge and wraps the line — the "输入框错乱" class of
- * visual bugs. Safe direction wins for a Chinese-first TUI.
- *
- * Never use `string.length` for layout.
+ * the library (like ConPTY's internal table) says narrow, but CJK terminals
+ * render them double-cell, so a row padded with our count wraps in the
+ * terminal (or vice versa). Rows that must occupy EXACTLY the terminal
+ * width therefore never contain these glyphs at all — see `asciiEllipses`
+ * (the box/gutter primitives apply it) — and free-form transcript rows can
+ * tolerate the 1-cell drift either way. Never use `string.length`.
  */
 
 import { eastAsianWidth } from 'get-east-asian-width'
 
 /** Ambiguous-width ellipses rendered double-cell by CJK terminals. */
 const FORCE_WIDE = new Set([0x2026, 0x22ef])
+
+/**
+ * Strip the ambiguous ellipses from text that will be padded to EXACTLY the
+ * terminal width (box cards, editor box, footer gutter). These rows must
+ * occupy the same number of cells under every width table: the app counts
+ * `…` as 2, ConPTY's table counts 1 (and re-emits a fill space), while a
+ * CJK-configured Windows Terminal renders 2 — the row lands one cell over
+ * and wraps, eating the row below it (the "输入框底边框消失" bug). Free-form
+ * transcript rows are exempt: nothing aligns against their trailing edge.
+ */
+export function asciiEllipses(text: string): string {
+  if (!text.includes('…') && !text.includes('⋯')) return text
+  return text.replaceAll('…', '...').replaceAll('⋯', '...')
+}
 
 export function charWidth(code: number): number {
   if (code === 0) return 0

@@ -137,7 +137,9 @@ function toolResultText(data: Record<string, unknown>): string {
 
 function preview(text: string, max = ARGS_PREVIEW_MAX): string {
   const clean = text.replace(/\s+/g, ' ').trim()
-  return clean.length > max ? clean.slice(0, max) + '…' : clean
+  // ASCII ellipsis: the preview lands inside boxed tool cards whose padding
+  // must agree with every terminal's width table (U+2026 is ambiguous).
+  return clean.length > max ? clean.slice(0, max) + '...' : clean
 }
 
 function numOf(record: Record<string, unknown>, key: string): number {
@@ -210,7 +212,7 @@ function diffViewFromMeta(meta: unknown): ToolDiffView | undefined {
     }
   }
   if (path === '' || (added === 0 && removed === 0)) return undefined
-  const view = truncated > 0 ? [...lines, { kind: 'ctx' as const, text: `… 还有 ${truncated} 行变更` }] : lines
+  const view = truncated > 0 ? [...lines, { kind: 'ctx' as const, text: `... 还有 ${truncated} 行变更` }] : lines
   return { path, added, removed, lines: view }
 }
 

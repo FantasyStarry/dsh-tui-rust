@@ -659,9 +659,9 @@ async function main(): Promise<void> {
   {
     const snap = paintScreen(writes2)
     const countOf = (needle: string): number => snap.filter((row) => row.includes(needle)).length
-    if (countOf('> 说点什么…') !== 1) problems.push('phase2：编辑后输入行重复/缺失')
+    if (countOf('> 说点什么...') !== 1) problems.push('phase2：编辑后输入行重复/缺失')
     if (countOf('Enter 发送') !== 1) problems.push('phase2：编辑后提示行重复/缺失')
-    if (snap.some((row) => row.includes('思考中…'))) problems.push('phase2：idle 页脚不应显示思考中徽标')
+    if (snap.some((row) => row.includes('思考中...'))) problems.push('phase2：idle 页脚不应显示思考中徽标')
     if (!snap.some((row) => row.includes('context: ↑120'))) problems.push('phase2：turn/end 后用量未上屏')
     if (snap.some((row) => row.includes('试说'))) problems.push('phase2：退格后占位符残留输入字符')
   }
@@ -751,13 +751,13 @@ async function main(): Promise<void> {
   const tail = rows2.slice(-5)
   const hint = 'Enter 发送  ·  /model 模型  ·  Ctrl+O 思考  ·  Esc 取消  ·  Ctrl+C 退出'
   if (tail.length !== 5) problems.push(`phase2：最终画面尾部不足 5 行：${JSON.stringify(rows2.slice(-7))}`)
-  const promptRow = rows2.find((row) => row.includes('> 说点什么…'))
+  const promptRow = rows2.find((row) => row.includes('> 说点什么...'))
   if (promptRow === undefined) {
     problems.push(`phase2：输入行不完整：${JSON.stringify(rows2.slice(-8))}`)
   }
   if (!rows2.some((row) => row.includes(hint))) problems.push(`phase2：提示行缺失或不唯一：${JSON.stringify(tail)}`)
   // The q1 submit opened the second turn — the footer badge is mid-turn here.
-  const footerRow = rows2.find((row) => row.includes('思考中…'))
+  const footerRow = rows2.find((row) => row.includes('思考中...'))
   if (footerRow === undefined) problems.push(`phase2：页脚缺失或状态不符：${JSON.stringify(tail)}`)
   // The /model switch happened before q1 — the footer must show the LIVE selection.
   if (footerRow === undefined || !footerRow.includes('fake-a/fake-a-m1(low)')) problems.push(`phase2：页脚未反映切换后路由：${JSON.stringify(footerRow)}`)

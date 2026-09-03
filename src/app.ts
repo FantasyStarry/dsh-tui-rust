@@ -1332,7 +1332,7 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
 }
 
 function shortSessionLabel(id: string): string {
-  return id.length > 18 ? '…' + id.slice(-12) : id
+  return id.length > 18 ? '..' + id.slice(-12) : id
 }
 
 function shortPath(cwd: string): string {

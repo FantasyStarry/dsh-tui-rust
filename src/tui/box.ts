@@ -13,7 +13,7 @@
  * (never hard-wrapped here — callers pre-wrap with wrapSpans/wrapWidth).
  */
 
-import { stringWidth, truncateWidth } from './width.js'
+import { asciiEllipses, stringWidth, truncateWidth } from './width.js'
 import type { Paint } from './theme.js'
 
 export interface BoxStyle {
@@ -43,10 +43,10 @@ export function boxTop(width: number, style: BoxStyle, right?: string): string {
   const innerW = inner(width)
   let label = ''
   if (style.title) {
-    const t = style.titlePaint ? style.titlePaint(style.title) : style.title
+    const t = style.titlePaint ? style.titlePaint(style.title) : asciiEllipses(style.title)
     label = `─ ${t} `
   }
-  const rightPart = right === undefined ? '' : ` ${right}`
+  const rightPart = right === undefined ? '' : ` ${asciiEllipses(right)}`
   const labelW = stringWidth(label)
   const rightW = stringWidth(rightPart)
   const fill = H.repeat(Math.max(1, innerW - labelW - rightW))
@@ -56,7 +56,7 @@ export function boxTop(width: number, style: BoxStyle, right?: string): string {
 /** Bottom border: `╰──[hint]───╯`. `hint` is pre-painted; truncated to fit. */
 export function boxBottom(width: number, style: BoxStyle, hint?: string): string {
   const innerW = inner(width)
-  let h = hint === undefined ? '' : `─ ${hint} `
+  let h = hint === undefined ? '' : `─ ${asciiEllipses(hint)} `
   if (stringWidth(h) > innerW) h = truncateWidth(h, innerW)
   const fill = H.repeat(Math.max(1, innerW - stringWidth(h)))
   return style.bg(style.border(BL) + h + fill + style.border(BR))
@@ -64,10 +64,13 @@ export function boxBottom(width: number, style: BoxStyle, hint?: string): string
 
 /**
  * Body line: `│ content …pad… │` with the whole line background-filled.
+ * Content is sanitized of ambiguous ellipses first — the padding math must
+ * agree with every terminal's width table or the border wraps (see
+ * asciiEllipses).
  */
 export function boxLine(content: string, width: number, style: BoxStyle): string {
   const innerW = inner(width)
-  let c = content
+  let c = asciiEllipses(content)
   if (stringWidth(c) > innerW - 2) c = truncateWidth(c, innerW - 2)
   const pad = Math.max(0, innerW - 2 - stringWidth(c))
   return style.bg(style.border(V) + ' ' + c + ' '.repeat(pad) + ' ' + style.border(V))

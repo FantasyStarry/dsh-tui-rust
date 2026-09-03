@@ -16,8 +16,8 @@ import { writeFileSync, readFileSync } from 'node:fs'
 const DSH_PKG = 'C:/Users/Mayn/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/package.json'
 const DSH_BIN = 'C:/Users/Mayn/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js'
 const CWD = process.env['ORCA_E2E_CWD'] ?? 'C:/Users/Mayn/Desktop/File_Manager_Legacy'
-const COLS = 110
-const ROWS = 45
+const COLS = Number(process.env['ORCA_PROBE_COLS']) || 110
+const ROWS = Number(process.env['ORCA_PROBE_ROWS']) || 45
 const STEP_TIMEOUT_MS = 30_000
 const GLOBAL_TIMEOUT_MS = 150_000
 const DUMP = process.argv.includes('--dump')
@@ -53,6 +53,7 @@ class Screen {
     // Escape sequences may split across ConPTY chunks — buffer until each
     // one is complete before interpreting (same design as the app's parser).
     this.buf = ''
+    this.pendingWrap = false
   }
 
   text(row) {
@@ -99,12 +100,15 @@ class Screen {
   handleChar(c) {
     if (c === '\r') {
       this.cx = 0
+      this.pendingWrap = false
     } else if (c === '\n') {
       this.lineFeed()
     } else if (c === '\b') {
       if (this.cx > 0) this.cx--
+      this.pendingWrap = false
     } else if (c === '\t') {
       this.cx = Math.min(this.cols - 1, (Math.floor(this.cx / 8) + 1) * 8)
+      this.pendingWrap = false
     } else if (c < ' ') {
       // other control — ignore
     } else {
@@ -113,22 +117,31 @@ class Screen {
   }
 
   put(ch) {
-    if (this.cx >= this.cols) {
+    // DECAWM deferred wrap (real-terminal semantics): writing INTO the last
+    // column arms the wrap; it fires only when the NEXT glyph is put, and
+    // any explicit cursor move (CR/CHA/CUP…) cancels it. Immediate wrap
+    // would drop a row for every exactly-terminal-wide line.
+    if (this.pendingWrap) {
+      this.pendingWrap = false
+      this.cx = 0
+      this.lineFeed()
+    }
+    const wide = isWide(ch.codePointAt(0))
+    if (wide && this.cx === this.cols - 1) {
+      // A wide glyph cannot split across the edge — wrap whole.
       this.cx = 0
       this.lineFeed()
     }
     const row = this.grid[this.cy]
     if (row) row[this.cx] = ch
     this.cx++
-    if (isWide(ch.codePointAt(0))) {
-      // Wide glyph: the follower cell is claimed by an invisible filler so
-      // column math matches what a real CJK terminal shows.
-      if (this.cx >= this.cols) {
-        this.cx = 0
-        this.lineFeed()
-      }
+    if (wide) {
       if (row && this.cy === this.grid.indexOf(row)) row[this.cx] = '\x00'
       this.cx++
+    }
+    if (this.cx >= this.cols) {
+      this.cx = this.cols
+      this.pendingWrap = true
     }
   }
 
@@ -148,24 +161,30 @@ class Screen {
     const n = nums[0] ?? 0
     switch (final) {
       case 'A':
+        this.pendingWrap = false
         this.cy = Math.max(0, this.cy - Math.max(1, n))
         break
       case 'B':
+        this.pendingWrap = false
         this.cy = Math.min(this.rows - 1, this.cy + Math.max(1, n))
         break
       case 'C':
+        this.pendingWrap = false
         this.cx = Math.min(this.cols - 1, this.cx + Math.max(1, n))
         break
       case 'D':
+        this.pendingWrap = false
         this.cx = Math.max(0, this.cx - Math.max(1, n))
         break
       case 'G':
+        this.pendingWrap = false
         this.cx = Math.max(0, Math.min(this.cols - 1, n - 1))
         break
       case 'H':
       case 'f': {
         const row = (nums[0] || 1) - 1
         const col = (nums[1] || 1) - 1
+        this.pendingWrap = false
         this.cy = Math.max(0, Math.min(this.rows - 1, row))
         this.cx = Math.max(0, Math.min(this.cols - 1, col))
         break
@@ -222,6 +241,10 @@ try {
 } catch {}
 
 const screen = new Screen(COLS, ROWS)
+// ConPTY-layer mirror: fed with the raw pseudoconsole stream (what Windows
+// Terminal actually renders). Divergence between the two screens localizes
+// width/scroll bugs to the ConPTY re-render vs the app's own frame.
+const conpty = new Screen(COLS, ROWS)
 let raw = ''
 let logOffset = 0
 let logTail = ''
@@ -274,6 +297,7 @@ const proc = pty.spawn(process.execPath, [DSH_BIN, '--profile', 'orca'], {
   env: { ...process.env, ORCA_LOG: APP_LOG },
 })
 proc.onData((data) => {
+  conpty.feed(data)
   raw += data
 })
 proc.onExit(({ exitCode }) => {
@@ -349,6 +373,36 @@ function assertInputBox(step, expectedEditor = null) {
   if (screen.cy !== editorRow) {
     fail(`[${step}] 光标不在输入框行：cursor=(${screen.cy},${screen.cx}) editor 行=${editorRow}\n${screen.plain()}`)
   }
+  // Empty editor: the caret belongs right after `> ` (0-based col 4). A far
+  // right caret means the CHA park was lost in some terminal layer.
+  if (expectedEditor === '' || expectedEditor === null) {
+    if (screen.cx !== 4) {
+      fail(`[${step}] 空输入框光标列异常：期望 col=4，实际 ${screen.cx}\n${screen.plain()}`)
+    }
+  }
+  // The box bottom border must directly follow the editor content row — on
+  // BOTH layers: the app's own frame and the ConPTY render the user sees.
+  const below = lines[editorRow + 1] ?? ''
+  if (!below.startsWith('╰')) {
+    fail(`[${step}] 输入框底边框缺失：editor 行=${editorRow} 下一行=「${below.slice(0, 40)}」\n${screen.plain()}`)
+  }
+  const clines = []
+  for (let r = 0; r < ROWS; r++) clines.push(conpty.text(r))
+  const cEditorRows = []
+  for (let r = 0; r < ROWS; r++) {
+    if (/^│ > /.test(clines[r])) cEditorRows.push(r)
+  }
+  if (cEditorRows.length === 1) {
+    const cBelow = clines[cEditorRows[0] + 1] ?? ''
+    if (!cBelow.startsWith('╰')) {
+      fail(
+        `[${step}] ConPTY 层底边框缺失：editor 行=${cEditorRows[0]} 下一行=「${cBelow.slice(0, 40)}」\n` +
+          `=== ConPTY 层 ===\n${conpty.plain()}`,
+      )
+    }
+  } else {
+    fail(`[${step}] ConPTY 层编辑行数量异常：${cEditorRows.length}\n=== ConPTY 层 ===\n${conpty.plain()}`)
+  }
   if (expectedEditor !== null) {
     const raw = lines[editorRow] ?? ''
     const m = /^│ > (.*?) *│ *$/.exec(raw)
@@ -356,7 +410,7 @@ function assertInputBox(step, expectedEditor = null) {
     if (expectedEditor !== '' && !shown.startsWith(expectedEditor)) {
       fail(`[${step}] 输入框内容不符：期望以「${expectedEditor}」开头，实际「${shown}」`)
     }
-    if (expectedEditor === '' && shown !== '' && shown !== '说点什么…') {
+    if (expectedEditor === '' && shown !== '' && shown !== '说点什么...') {
       fail(`[${step}] 输入框应为空/占位符，实际「${shown}」`)
     }
   }
@@ -485,6 +539,9 @@ try {
   assertInputBox('picker 中途 Esc', '')
 
   markSettled()
+  try {
+    writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-raw.log', raw)
+  } catch {}
   proc.write('\x03')
   await sleep(500)
   try {
