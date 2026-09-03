@@ -102,9 +102,10 @@ function paintScreen(writes: string[], height = Number.POSITIVE_INFINITY): strin
   return screen
 }
 
-function makeStdout(writes: string[]): NodeJS.WriteStream {
+function makeStdout(writes: string[], rows?: number): NodeJS.WriteStream {
   return {
     columns: 100,
+    ...(rows === undefined ? {} : { rows }),
     write(chunk: string): boolean {
       writes.push(chunk)
       return true
@@ -983,6 +984,78 @@ async function main(): Promise<void> {
   if (!visible5b.includes('hi 历史')) problems.push('phase5：持久化日志未重放进转录')
   dispose5b()
   await sleep(20)
+
+  // ── Phase 6: sticky bottom-anchor — closing the /model picker must NOT
+  // drop the chrome back to floating (the "切完模型 UI 上移" jump). Fresh
+  // boot (no conversation): the picker latches the anchor; after it closes
+  // there must still be a spacer gap between the transcript and the editor.
+  {
+    const rw: string[] = []
+    const stdin6 = new FakeStdin()
+    const kernel6 = new FakeKernel(true)
+    const dispose6 = bootstrapApp(
+      kernel6,
+      { provider: '', model: '', fullscreen: false },
+      { stdout: () => makeStdout(rw), stdin: () => stdin6 },
+    )
+    await sleep(250)
+    for (const ch of '/model') stdin6.text(ch)
+    stdin6.key('return')
+    await sleep(150)
+    stdin6.key('return') // provider
+    await sleep(150)
+    stdin6.key('return') // model
+    await sleep(150)
+    stdin6.key('return') // effort 默认
+    await sleep(250) // selection applies + route line flushes
+    const snap6 = paintScreen(rw)
+    const editorRow6 = snap6.findIndex((row) => row.includes('> 说点什么...'))
+    if (editorRow6 < 0) {
+      problems.push('phase6：picker 关闭后编辑框缺失')
+    } else {
+      // Blank spacer rows directly above the editor box top border prove the
+      // chrome stayed bottom-anchored after the picker went away.
+      let blanks6 = 0
+      for (let i = editorRow6 - 2; i >= 0 && snap6[i] === ''; i--) blanks6++
+      if (blanks6 < 5) {
+        problems.push(`phase6：picker 关闭后 chrome 未保持锚底（上方空行 ${blanks6}）`)
+      }
+      if (!snap6.some((row) => row.includes('模型已切换：fake-a/fake-a-m1'))) {
+        problems.push('phase6：模型切换提示缺失')
+      }
+    }
+    dispose6()
+    await sleep(20)
+  }
+
+  // ── Phase 7: fullscreen (alternate screen) — the frame fills EXACTLY the
+  // terminal height, the footer is pinned to the last row, the transcript is
+  // a sliding window (head note when it overflows), and nothing ever seals.
+  {
+    const rw: string[] = []
+    const stdin7 = new FakeStdin()
+    const kernel7 = new FakeKernel(true)
+    const dispose7 = bootstrapApp(
+      kernel7,
+      { provider: '', model: '', fullscreen: true },
+      { stdout: () => makeStdout(rw, 24), stdin: () => stdin7 },
+    )
+    await sleep(250)
+    for (const ch of '测') stdin7.text(ch)
+    stdin7.key('return')
+    await sleep(850) // first scripted turn
+    for (const ch of '再') stdin7.text(ch)
+    stdin7.key('return')
+    await sleep(850) // second turn overflows the window
+    const snap7 = paintScreen(rw, 24)
+    if (snap7.length !== 24) problems.push(`phase7：fullscreen 屏高应为 24 行，实际 ${snap7.length}`)
+    if (!snap7[23].includes('Ctrl+C 退出')) problems.push('phase7：fullscreen 页脚未钉在末行')
+    if (!snap7.some((row) => row.includes('> 说点什么...'))) problems.push('phase7：fullscreen 编辑框缺失')
+    if (!snap7.some((row) => row.includes('上方还有'))) problems.push('phase7：窗口溢出后缺头注')
+    if (!snap7.some((row) => row.includes('你好，Orca。'))) problems.push('phase7：转录窗口缺首轮内容')
+    dispose7()
+    await sleep(20)
+  }
 
   if (problems.length > 0) {
     console.error(`smoke 失败：${problems.join('；')}`)

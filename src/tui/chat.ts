@@ -67,6 +67,8 @@ export interface FrameContext {
   readonly yolo?: boolean
   /** Git branch for the footer slot (M4 status slot, best-effort). */
   readonly branch?: string | null
+  /** Alternate-screen mode: whole-viewport window, chrome always pinned. */
+  readonly fullscreen?: boolean
 }
 
 export interface ChatFrame {
@@ -94,7 +96,8 @@ const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '�
 export function buildFrame(ctx: FrameContext): ChatFrame {
   const width = Math.max(20, ctx.width)
   const height = Math.max(8, ctx.height ?? 24)
-  const anchorChrome = ctx.anchorChrome ?? ctx.picker !== null
+  const fullscreen = ctx.fullscreen ?? false
+  const anchorChrome = fullscreen || (ctx.anchorChrome ?? ctx.picker !== null)
   const reservedRows = anchorChrome ? Math.max(0, Math.min(height - 1, ctx.reservedRows ?? 0)) : 0
   const stream: string[] = []
   const live: string[] = []
@@ -103,6 +106,55 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   // the editor box and welcome card span the full width.
   const inner = Math.max(18, width - 2)
   const gutter = (line: string): string => (line === '' ? '' : ' ' + line + ' ')
+  // Diff-painted rows must never depend on terminal-ambiguous cell widths:
+  // a row the terminal wraps (its width table disagrees with ours) shifts
+  // every row below it and desyncs the painter. Ellipses are the known
+  // offender; strip them from tracked rows. Sealed scrollback rows are
+  // written once and never tracked, so they keep the verbatim text.
+  const paintRow = (row: TranscriptRow): string[] =>
+    renderRow(row, ctx, inner).map((line) => (line === '' ? '' : gutter(asciiEllipses(line))))
+
+  const bottom = [...inputBox(ctx.editorText, width), ...footerLines(ctx, width)]
+
+  // ── fullscreen (alternate screen): pi-tui style whole-viewport mode ────────
+  // No native scrollback exists there, so nothing is ever sealed to a
+  // stream; the transcript renders as a sliding window over the channel
+  // rows, the chrome is pinned to the bottom, and the frame fills EXACTLY
+  // the terminal height.
+  if (fullscreen) {
+    const pickerItemBudget = Math.max(1, height - bottom.length - 7)
+    let pickerLines = ctx.picker ? renderPicker(ctx.picker, inner, pickerItemBudget).map(gutter) : []
+    if (pickerLines.length > 0) {
+      pickerLines = pickerLines.slice(0, Math.max(1, height - bottom.length - 1))
+    }
+    let menuLines: string[] = []
+    if (!ctx.picker && ctx.commandMenu && ctx.commandMenu.items.length > 0) {
+      const menuBudget = Math.max(1, Math.min(9, height - bottom.length - 7))
+      const menuState: PickerState = {
+        title: '命令',
+        items: ctx.commandMenu.items,
+        index: Math.max(0, Math.min(ctx.commandMenu.items.length - 1, ctx.commandMenu.index)),
+      }
+      menuLines = renderPicker(menuState, inner, menuBudget).map(gutter)
+      menuLines = menuLines.slice(0, Math.max(1, height - bottom.length - pickerLines.length - 1))
+    }
+    const pickerReserve = pickerLines.length > 0 ? pickerLines.length + 1 : 0
+    const menuReserve = menuLines.length > 0 ? menuLines.length + 1 : 0
+    const windowCap = Math.max(1, height - bottom.length - pickerReserve - menuReserve)
+    let windowLines: string[] = []
+    for (const row of ctx.channel.rows) windowLines.push(...paintRow(row))
+    if (windowLines.length > windowCap) {
+      const dropped = windowLines.length - windowCap
+      windowLines = [theme.muted(`… 上方还有 ${dropped} 行`), ...windowLines.slice(-(windowCap - 1))]
+    }
+    const spacer = Math.max(0, height - bottom.length - pickerReserve - menuReserve - windowLines.length)
+    live.push(...windowLines, ...Array.from({ length: spacer }, () => ''))
+    if (pickerLines.length > 0) live.push(...pickerLines, '')
+    if (menuLines.length > 0) live.push(...menuLines, '')
+    live.push(...bottom)
+    const cursor = { fromEnd: bottom.length - 2, col: 5 + stringWidth(ctx.editorText) }
+    return { stream, live, cursor }
+  }
 
   // Newly sealed transcript rows → written once into scrollback.
   const sealedTo = Math.min(ctx.channel.sealedRowCount, ctx.channel.rows.length)
@@ -115,10 +167,9 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   const openRows = ctx.channel.rows.slice(sealedTo)
   let openLines: string[] = []
   for (const row of openRows) {
-    openLines.push(...renderRow(row, ctx, inner).map(gutter))
+    openLines.push(...paintRow(row))
   }
 
-  const bottom = [...inputBox(ctx.editorText, width), ...footerLines(ctx, width)]
   // A picker is part of the live frame (unlike sealed transcript stream), so
   // its visible rows must fit above the input/footer chrome. Without this
   // budget a long provider/model list makes the terminal scroll mid-frame;

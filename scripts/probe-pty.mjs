@@ -294,7 +294,11 @@ const proc = pty.spawn(process.execPath, [DSH_BIN, '--profile', 'orca'], {
   cols: COLS,
   rows: ROWS,
   cwd: CWD,
-  env: { ...process.env, ORCA_LOG: APP_LOG },
+  env: {
+    ...process.env,
+    ORCA_LOG: APP_LOG,
+    ...(process.argv.includes('--fullscreen') ? { ORCA_FULLSCREEN: '1' } : {}),
+  },
 })
 proc.onData((data) => {
   conpty.feed(data)
@@ -415,6 +419,66 @@ function assertInputBox(step, expectedEditor = null) {
     }
   }
   if (DUMP) console.log(`--- ${step} (cursor=${screen.cy},${screen.cx}) ---\n${screen.plain()}\n`)
+}
+
+/** Fullscreen contract: the footer hint stays pinned to the LAST row on both
+ *  layers — the regression guard for the "切完模型 UI 又往上走" complaint. */
+function assertFooterPinned(step) {
+  pollAppLog()
+  const appLast = screen.text(ROWS - 1)
+  if (!appLast.includes('Ctrl+C 退出')) {
+    fail(`[${step}] fullscreen 页脚未钉在末行（app 层末行=「${appLast.slice(0, 40)}」）\n${screen.plain()}`)
+  }
+  const conptyLast = conpty.text(ROWS - 1)
+  if (!conptyLast.includes('Ctrl+C 退出')) {
+    fail(`[${step}] fullscreen 页脚未钉在末行（ConPTY 层末行=「${conptyLast.slice(0, 40)}」）\n=== ConPTY 层 ===\n${conpty.plain()}`)
+  }
+}
+
+// ── fullscreen verification (--fullscreen): boots with ORCA_FULLSCREEN=1 ────
+// The whole viewport is ours: the footer must stay pinned to the last row
+// across the /model switch (the user-reported "UI 又往上走" regression) and
+// the input box must keep its bottom border on both layers.
+if (process.argv.includes('--fullscreen')) {
+  const globalTimer = setTimeout(() => fail(`全局超时 ${GLOBAL_TIMEOUT_MS}ms`), GLOBAL_TIMEOUT_MS)
+  try {
+    await waitMarker('fullscreen 连接', /orca 已连接/)
+    await waitMarker('fullscreen session', /session 已连接：session-[0-9a-f-]+/)
+    await settle()
+    assertInputBox('fullscreen 启动', '')
+    assertFooterPinned('fullscreen 启动')
+    proc.write('/model')
+    await waitMarker('菜单出现', /切换模型/)
+    proc.write('\r')
+    await waitMarker('选择 Provider', /选择 Provider/)
+    await settle()
+    proc.write('\r')
+    await waitMarker('选择模型', /选择模型（/)
+    await settle(400)
+    proc.write('\r')
+    await waitMarker('选择思考强度', /选择思考强度（/)
+    await waitMarker('思考档位加载完成', /默认（模型默认行为）/)
+    await settle(120)
+    proc.write('\r')
+    await settle(200)
+    await waitMarker('模型已切换', /模型已切换：/)
+    await settle()
+    assertFooterPinned('fullscreen 切模型后')
+    assertInputBox('fullscreen 切模型后', '')
+    markSettledSafe(globalTimer)
+    try {
+      writeFileSync('C:/Users/Mayn/Desktop/dsh-orca/probe-last-raw.log', raw)
+    } catch {}
+    proc.write('\x03')
+    await sleep(500)
+    try {
+      proc.kill()
+    } catch {}
+    console.log('fullscreen probe 通过 ✔（页脚钉底 + 输入框完好贯穿模型切换）')
+    process.exit(0)
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error))
+  }
 }
 
 // ── live-turn verification (--live): one tiny real prompt, streaming + ──────

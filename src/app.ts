@@ -1086,6 +1086,15 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   let editor = ''
   let lastEscAt = 0
+  /**
+   * Sticky bottom-anchor latch (the "切完模型 UI 上移" fix): while a picker
+   * is open the chrome is pinned to the viewport bottom; when it closes the
+   * anchor must NOT drop back to floating, or the input box visibly jumps
+   * up the screen. Once any picker or conversation has pinned the chrome,
+   * it stays pinned for the mount's lifetime — matching pi's inline rule
+   * (pin once content has taken over the screen, never un-pin mid-session).
+   */
+  let anchorLatched = false
   /** Ctrl+O: full thinking text instead of the short live preview (kimi expand). */
   let thoughtExpanded = false
   const keyboard = new Keyboard(stdin, (key) => {
@@ -1181,6 +1190,11 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   let lastRouteKey = ''
   let conversationStarted = false
   const render = (): void => {
+    const fullscreen = config.fullscreen === true
+    // Latch the sticky anchor the first frame a picker appears — every
+    // picker-open site is covered, including ones added later.
+    if (picker !== null) anchorLatched = true
+    const anchorChrome = fullscreen || conversationStarted || picker !== null || anchorLatched
     const route = selection ?? channel.route
     const cwd = process.cwd()
     const title = channel.title ?? safeTitleGetCached()
@@ -1188,14 +1202,22 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     // One-time welcome card — deferred until the agent connects so the
     // Session/Model rows carry real values instead of `—`/`未设置`.
     // Afterwards only route changes print a slim line — the scrollback
-    // stream never accumulates repeated banners.
+    // stream never accumulates repeated banners. Fullscreen has no native
+    // scrollback, so its notices go through the channel and render inside
+    // the transcript window instead.
     if (!welcomed) {
       if (agent) {
         welcomed = true
         const routeModel = route ? `${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}` : null
-        stream.push(...welcomeCard(process.cwd(), agent.session.id, routeModel, stdout.columns ?? 80))
+        if (fullscreen) {
+          channel.pushSystem(`✦ orca 已连接 · session ${shortSessionLabel(agent.session.id)}`)
+        } else {
+          stream.push(...welcomeCard(process.cwd(), agent.session.id, routeModel, stdout.columns ?? 80))
+        }
         if (route) {
-          stream.push(routeLine(route))
+          const line = routeLine(route)
+          if (fullscreen) channel.pushSystem(line)
+          else stream.push(line)
           lastRouteKey = routeKey(route)
         }
       }
@@ -1203,7 +1225,9 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       const key = routeKey(route)
       if (key !== lastRouteKey) {
         lastRouteKey = key
-        stream.push(routeLine(route))
+        const line = routeLine(route)
+        if (fullscreen) channel.pushSystem(line)
+        else stream.push(line)
       }
     }
     const menu = currentMenu()
@@ -1220,7 +1244,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Historical welcome/route rows are already in scrollback and must not
       // permanently reduce the chat viewport.
       reservedRows: stream.length,
-      anchorChrome: conversationStarted || picker !== null,
+      anchorChrome,
+      fullscreen,
       cwd,
       sessionId: agent?.session.id ?? null,
       route,
@@ -1246,7 +1271,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         width: stdout.columns ?? 80,
         height: stdout.rows ?? 24,
         reservedRows: stream.length + frame.stream.length,
-        anchorChrome: conversationStarted || picker !== null,
+        anchorChrome,
+      fullscreen,
         cwd,
         sessionId: agent?.session.id ?? null,
         route,
