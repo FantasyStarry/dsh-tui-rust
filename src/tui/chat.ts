@@ -298,7 +298,7 @@ function thoughtLines(row: TranscriptRow, ctx: FrameContext, width: number): str
   const elapsed = row.seconds ?? (row.startMs !== undefined ? Math.round((ctx.now - row.startMs) / 100) / 10 : 0)
   // Sealed + collapsed: one summary line (full text stays in the session log).
   if (row.seconds !== undefined && !expanded) {
-    return ['', theme.subtle(STATUS_BULLET) + theme.placeholder(`已思考 ${row.seconds}s`)]
+    return ['', theme.live('✻ ') + theme.subtle(`已思考 ${row.seconds}s`)]
   }
   // Expanded (Ctrl+O): the full thinking text, live or sealed.
   if (expanded) {
@@ -383,7 +383,9 @@ function footerLines(ctx: FrameContext, width: number): string[] {
   const modeText = ctx.yolo ? theme.warn('yolo') : ctx.policy === 'never' ? theme.warn('never') : ''
   const branchText = ctx.branch ? theme.muted(`⑂ ${ctx.branch}`) : ''
   const dir = theme.muted(short(ctx.cwd))
-  const line1 = [badge, routeText, titleText, modeText, dir, branchText].filter((part) => part !== '').join(theme.subtle('  '))
+  const line1 = [badge, routeText, titleText, modeText, dir, branchText]
+    .filter((part) => part !== '')
+    .join(theme.subtle(' │ '))
 
   const context =
     usage.messages > 0

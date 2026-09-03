@@ -15,7 +15,7 @@
  */
 
 import { theme } from './theme.js'
-import { truncateWidth } from './width.js'
+import { stringWidth, truncateWidth } from './width.js'
 
 export interface PickerItem {
   /** Value carried out on selection (id / effort id). */
@@ -83,7 +83,18 @@ export function renderPicker(state: PickerState, width: number, maxItems = 17): 
     const label = selected ? theme.title(item.label) : item.label
     const current = state.current !== undefined && item.value === state.current ? theme.ok('  ← current') : ''
     const hint = item.hint ? theme.subtle('  ' + item.hint) : ''
-    lines.push(truncateWidth(`  ${pointer}${label}${hint}${current}`, Math.max(8, width - 4)))
+    const budget = Math.max(8, width - 4)
+    const content = `  ${pointer}${label}${hint}${current}`
+    // Focus state: the selected row gets a full-row panel background so the
+    // cursor row reads at a glance (the pointer + bold title stay too). The
+    // fill pads by CELLS — string.length would mispad CJK labels.
+    const cut = truncateWidth(content, budget)
+    if (selected) {
+      const fill = ' '.repeat(Math.max(0, budget - stringWidth(cut)))
+      lines.push(theme.panel(cut + fill))
+    } else {
+      lines.push(cut)
+    }
   }
   const remaining = state.items.length - (from + visible.length)
   if (remaining > 0) {

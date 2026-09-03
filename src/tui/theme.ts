@@ -88,49 +88,50 @@ export interface PaletteSpec {
   codeBg: Paint
 }
 
-/** kimi-code dark palette: blue brand, amber user role, gray scale. */
+/** kimi-code dark palette, refined: brighter text tier separation, more
+ *  visible borders, brand blue kept. */
 const truecolorPalette: PaletteSpec = {
   primary: rgb(79, 168, 255), // #4FA8FF
   accent: rgb(91, 192, 190), // #5BC0BE
   title: pair('\x1b[1m\x1b[38;2;79;168;255m', '\x1b[39m\x1b[22m'),
-  text: rgb(224, 224, 224), // #E0E0E0
-  muted: rgb(136, 136, 136), // #888888
-  subtle: rgb(107, 107, 107), // #6B6B6B
+  text: rgb(231, 231, 231), // #E7E7E7
+  muted: rgb(156, 156, 156), // #9C9C9C
+  subtle: rgb(128, 128, 128), // #808080
   strong: pair('\x1b[1m\x1b[38;2;245;245;245m', '\x1b[39m\x1b[22m'), // #F5F5F5
   ok: rgb(78, 200, 126), // #4EC87E
   fail: rgb(232, 84, 84), // #E85454
   warn: rgb(232, 168, 56), // #E8A838
   live: rgb(189, 147, 249), // #BD93F9
-  border: rgb(90, 90, 90), // #5A5A5A
+  border: rgb(111, 111, 111), // #6F6F6F
   code: rgb(79, 168, 255), // #4FA8FF
-  quote: rgb(136, 136, 136), // #888888
-  placeholder: pair('\x1b[2;3m\x1b[38;2;107;107;107m', '\x1b[39m\x1b[23m\x1b[22m'), // dim italic
+  quote: rgb(156, 156, 156), // #9C9C9C
+  placeholder: pair('\x1b[2;3m\x1b[38;2;128;128;128m', '\x1b[39m\x1b[23m\x1b[22m'), // dim italic
   roleUser: pair('\x1b[1m\x1b[38;2;255;203;107m', '\x1b[39m\x1b[22m'), // #FFCB6B bold
   panel: bg(38, 42, 48), // #262A30
-  panelBorder: rgb(90, 90, 90), // #5A5A5A
+  panelBorder: rgb(111, 111, 111), // #6F6F6F
   codeBg: bg(23, 26, 30), // #171A1E
 }
 
-/** xterm-256 approximations of the same semantics. */
+/** xterm-256 approximations of the same semantics (tier-brightened). */
 const palette256: PaletteSpec = {
   primary: c256(75),
   accent: c256(79),
   title: pair('\x1b[1;38;5;75m', '\x1b[39m\x1b[22m'),
-  text: c256(253),
-  muted: c256(243),
-  subtle: c256(241),
+  text: c256(254),
+  muted: c256(244),
+  subtle: c256(242),
   strong: pair('\x1b[1;38;5;255m', '\x1b[39m\x1b[22m'),
   ok: c256(114),
   fail: c256(203),
   warn: c256(215),
   live: c256(177),
-  border: c256(240),
+  border: c256(241),
   code: c256(75),
-  quote: c256(243),
-  placeholder: pair('\x1b[2;3;38;5;241m', '\x1b[39m\x1b[23m\x1b[22m'),
+  quote: c256(244),
+  placeholder: pair('\x1b[2;3;38;5;242m', '\x1b[39m\x1b[23m\x1b[22m'),
   roleUser: pair('\x1b[1;38;5;221m', '\x1b[39m\x1b[22m'),
   panel: bg256(236),
-  panelBorder: c256(240),
+  panelBorder: c256(241),
   codeBg: bg256(234),
 }
 
