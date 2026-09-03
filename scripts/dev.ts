@@ -146,6 +146,11 @@ interface KernelRecord {
   cancelCause: { kind: string } | null
   selectionSaved: { provider: string; model: string; reasoningEffort?: string } | null
   requestListener: ((...args: unknown[]) => unknown) | null
+  approvalListener: ((...args: unknown[]) => unknown) | null
+  policySet: string | null
+  titleRenamed: string | null
+  compactLine: string | null
+  forkCalled: { boundary: number | undefined; childId: string | undefined } | null
   disposed: boolean
 }
 
@@ -161,11 +166,18 @@ class FakeKernel implements KernelContext {
     cancelCause: null,
     selectionSaved: null,
     requestListener: null,
+    approvalListener: null,
+    policySet: null,
+    titleRenamed: null,
+    compactLine: null,
+    forkCalled: null,
     disposed: false,
   }
   private readonly listeners = new Map<string, Set<(...args: unknown[]) => void>>()
   private seq = 0
   private factoryCalls = 0
+  private fakePolicy = 'ask'
+  private fakeTitle: string | null = null
 
   constructor(private readonly mounted: boolean) {}
 
@@ -214,6 +226,61 @@ class FakeKernel implements KernelContext {
         }),
       } as T
     }
+    if (name === 'sessionQuery') {
+      return {
+        listSessions: async () => [
+          { header: { id: 'session-aaa', cwd: '/tmp/proj', createdAt: Date.now() - 1000 }, live: false, persisted: true },
+          { header: { id: 'session-bbb', cwd: '/tmp/proj', createdAt: Date.now() - 2000 }, live: false, persisted: true },
+        ],
+        readTitle: async (sessionId: string) =>
+          sessionId === 'session-aaa' ? { title: '假标题A', updatedAt: Date.now() } : undefined,
+        readTitleSnapshots: async (ids: readonly string[]) =>
+          ids.map((sessionId) => ({
+            sessionId,
+            status: 'fulfilled' as const,
+            value: sessionId === 'session-aaa' ? { title: { title: '假标题A', updatedAt: Date.now() } } : {},
+          })),
+      } as T
+    }
+    if (name === 'sessionTitle') {
+      return {
+        get: () => (this.fakeTitle ? { title: this.fakeTitle, updatedAt: Date.now() } : undefined),
+        rename: (_session: unknown, title: string) => {
+          this.record.titleRenamed = title
+          this.fakeTitle = title
+          return { title, updatedAt: Date.now() }
+        },
+        refresh: async () => undefined,
+      } as T
+    }
+    if (name === 'commands') {
+      return {
+        list: () => [{ name: 'compact', description: '压缩上下文' }],
+        find: (_agent: unknown, cmdName: string) => (cmdName === 'compact' ? { name: 'compact' } : undefined),
+        execute: async (_agent: unknown, line: string) => {
+          this.record.compactLine = line
+          return { commandId: 'cmd-1', result: { kind: 'success' as const, text: '压缩已开始' } }
+        },
+      } as T
+    }
+    if (name === 'approval') {
+      return {
+        setPolicy: (_agent: unknown, policy: string) => {
+          this.record.policySet = policy
+          this.fakePolicy = policy
+        },
+        overrideOf: () => this.fakePolicy,
+        request: async () => 'unavailable' as const,
+      } as T
+    }
+    if (name === 'sessions') {
+      return {
+        fork: (_source: unknown, boundary?: number, childSessionId?: string) => {
+          this.record.forkCalled = { boundary, childId: childSessionId }
+          return { id: childSessionId ?? 'session-fork' }
+        },
+      } as T
+    }
     return undefined
   }
 
@@ -254,6 +321,7 @@ class FakeKernel implements KernelContext {
         ctx: {
           on(name: string, listener: (...args: unknown[]) => unknown): () => void {
             if (name === 'agent/request') kernel.record.requestListener = listener
+            if (name === 'approval/request') kernel.record.approvalListener = listener
             return () => {}
           },
         },
@@ -631,6 +699,128 @@ async function main(): Promise<void> {
   if (footerRow === undefined) problems.push(`phase2：页脚缺失或状态不符：${JSON.stringify(tail)}`)
   // The /model switch happened before q1 — the footer must show the LIVE selection.
   if (footerRow === undefined || !footerRow.includes('fake-a/fake-a-m1(low)')) problems.push(`phase2：页脚未反映切换后路由：${JSON.stringify(footerRow)}`)
+
+  // ── Phase 3: M3 会话命令 + M4 审批/压缩/hook/回退 ──────────────────────────
+  const writes3: string[] = []
+  const stdin3 = new FakeStdin()
+  const kernel3 = new FakeKernel(true)
+  const dispose3 = bootstrapApp(
+    kernel3,
+    { provider: '', model: '', fullscreen: false },
+    { stdout: () => makeStdout(writes3), stdin: () => stdin3 },
+  )
+  await sleep(250)
+  const visible3 = (): string => stripSgr(writes3.join(''))
+  const typeLine = async (line: string): Promise<void> => {
+    for (const ch of line) stdin3.text(ch)
+    stdin3.key('return')
+    await sleep(120)
+  }
+
+  await typeLine('/help')
+  if (!visible3().includes('可用命令') || !visible3().includes('/resume')) problems.push('phase3：/help 未列出会话命令')
+  await typeLine('/usage')
+  if (!visible3().includes('用量')) problems.push('phase3：/usage 未上屏')
+  await typeLine('/title 新标题')
+  if (kernel3.record.titleRenamed !== '新标题') problems.push('phase3：/title 未调用 rename')
+  if (!visible3().includes('标题已更新')) problems.push('phase3：/title 确认缺失')
+  await typeLine('/title')
+  if (!visible3().includes('会话标题')) problems.push('phase3：/title 查看缺失')
+  await typeLine('/yolo on')
+  if (!visible3().includes('yolo 已开启')) problems.push('phase3：/yolo on 未上屏')
+  // Yolo auto-allow: the waterfall resolves without any panel.
+  {
+    const listener = kernel3.record.approvalListener
+    if (!listener) problems.push('phase3：approval waterfall 未注册')
+    else {
+      const outcome = (await listener({ toolName: 'read', reason: '单测' }, async () => 'rejected')) as string
+      if (outcome !== 'allowed-once') problems.push(`phase3：yolo 未自动放行：${outcome}`)
+    }
+  }
+  await typeLine('/yolo off')
+  if (!visible3().includes('yolo 已关闭')) problems.push('phase3：/yolo off 未上屏')
+  // Panel path: the ask pends, the picker shows, `1` allows.
+  {
+    const listener = kernel3.record.approvalListener
+    if (listener) {
+      const pending = listener({ toolName: 'edit', reason: '改文件' }, async () => 'rejected') as Promise<string>
+      await sleep(150)
+      if (!visible3().includes('审批：edit')) problems.push('phase3：审批面板未上屏')
+      stdin3.text('1')
+      await sleep(100)
+      const outcome = await pending
+      if (outcome !== 'allowed-once') problems.push(`phase3：面板按 1 未放行：${outcome}`)
+    }
+  }
+  // Esc on the panel rejects.
+  {
+    const listener = kernel3.record.approvalListener
+    if (listener) {
+      const pending = listener({ toolName: 'bash', reason: '跑命令' }, async () => 'allowed-once') as Promise<string>
+      await sleep(150)
+      stdin3.key('escape')
+      await sleep(100)
+      const outcome = await pending
+      if (outcome !== 'rejected') problems.push(`phase3：面板 Esc 未拒绝：${outcome}`)
+    }
+  }
+  await typeLine('/permission')
+  if (!visible3().includes('审批策略')) problems.push('phase3：/permission 未上屏')
+  await typeLine('/compact 留重点')
+  await sleep(120)
+  if (kernel3.record.compactLine !== '/compact 留重点') problems.push(`phase3：/compact 未经 commands.execute：${kernel3.record.compactLine}`)
+  kernel3.emit('compaction/start', { compactionId: 'c1', turn: null })
+  await sleep(80)
+  kernel3.emit('compaction/summary', {
+    compactionId: 'c1',
+    summary: [{ type: 'text', text: '摘要正文' }],
+    shadowedRange: { start: 0, end: 1 },
+    shadowedSeqs: [0, 1],
+    shadowedTokenCount: 123,
+    provider: 'p',
+    model: 'm',
+  })
+  await sleep(80)
+  kernel3.emit('compaction/end', { compactionId: 'c1', turn: null })
+  await sleep(80)
+  if (!visible3().includes('压缩完成')) problems.push('phase3：compaction 投影缺失')
+  kernel3.emit('session/title', { title: '会话A', messageSeqs: [], source: { kind: 'user' } })
+  await sleep(80)
+  if (!visible3().includes('会话A')) problems.push('phase3：session/title 未上屏（页脚/标题）')
+  kernel3.emit('hook/invoked', { turn: 1, point: 'PreToolUse', dialect: 'claude-code', handlerId: 'h1' })
+  await sleep(60)
+  kernel3.emit('hook/result', { turn: 1, point: 'PreToolUse', handlerId: 'h1', decision: 'allow', durationMs: 5 })
+  await sleep(60)
+  if (!visible3().includes('hook')) problems.push('phase3：hook 投影缺失')
+  kernel3.emit('approval/asked', { id: 'a1', toolName: 'write', reason: '写文件' })
+  await sleep(60)
+  kernel3.emit('approval/decided', { id: 'a1', outcome: 'allowed-once' })
+  await sleep(60)
+  if (!visible3().includes('请求审批') || !visible3().includes('审批结果')) problems.push('phase3：approval 审计投影缺失')
+  // /resume browser lists fake sessions with titles.
+  for (const ch of '/resume') stdin3.text(ch)
+  stdin3.key('return')
+  await sleep(250)
+  if (!visible3().includes('历史会话') || !visible3().includes('假标题A')) problems.push('phase3：/resume 浏览器未列出标题')
+  stdin3.key('escape') // close the browser
+  await sleep(100)
+  // Rewind: two closed turns → double-Esc forks to the previous boundary.
+  kernel3.emit('turn/start', { turn: 1 })
+  await sleep(40)
+  kernel3.emit('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  await sleep(40)
+  kernel3.emit('turn/start', { turn: 2 })
+  await sleep(40)
+  kernel3.emit('turn/end', { turn: 2, reason: { kind: 'completed' } })
+  await sleep(80)
+  stdin3.key('escape')
+  await sleep(40)
+  stdin3.key('escape')
+  await sleep(250)
+  if (!kernel3.record.forkCalled) problems.push('phase3：双击 Esc 未触发回退 fork')
+  if (!visible3().includes('已回退')) problems.push('phase3：回退确认缺失')
+  dispose3()
+  await sleep(20)
 
   if (problems.length > 0) {
     console.error(`smoke 失败：${problems.join('；')}`)

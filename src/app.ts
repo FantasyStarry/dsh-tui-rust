@@ -899,7 +899,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       return
     }
     const childSessionId = typeof child?.id === 'string' ? child.id : childId
-    channel.pushSystem(`已回退到上一轮（fork ${shortSessionLabel(childSessionId)}），正在切换…`)
     const previous = handle
     handle = null
     agent = null
@@ -912,6 +911,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     conversationStarted = true // keep chrome anchored after a rewind
     welcomed = true
     await createAgent(childSessionId)
+    channel.pushSystem(`已回退到上一轮（fork ${shortSessionLabel(childSessionId)}）`)
   }
 
   // M4 status slot: git branch, cached 2s (file read only, no spawn).
