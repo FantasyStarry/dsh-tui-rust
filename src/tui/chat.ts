@@ -27,7 +27,7 @@
 
 import type { AgentRunState, Channel, SessionRoute, SessionUsage, TranscriptRow } from '../adapter/channel.js'
 import { renderMarkdown } from './markdown.js'
-import { renderPicker, type PickerState } from './picker.js'
+import { renderPicker, type PickerItem, type PickerState } from './picker.js'
 import { boxed, boxLine, boxTop, boxBottom, type BoxStyle } from './box.js'
 import { theme } from './theme.js'
 import { stringWidth, truncateWidth, wrapWidth } from './width.js'
@@ -52,6 +52,10 @@ export interface FrameContext {
   readonly now: number
   /** Active `/model` picker overlay lines, rendered above the input box. */
   readonly picker: PickerState | null
+  /** Inline slash-command completion (kimi `/` menu), above the input box. */
+  readonly commandMenu?: { readonly items: readonly PickerItem[]; readonly index: number } | null
+  /** True while the agent is still connecting (footer shows 连接中 badge). */
+  readonly connecting?: boolean
   /** Folded session title for the footer (M3). */
   readonly title?: string | null
   /** Effective approval policy for the footer (M4: ask/never). */
@@ -127,11 +131,26 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     const maxPickerLines = Math.max(1, availableRows - bottom.length - 1)
     pickerLines = pickerLines.slice(0, maxPickerLines)
   }
+  // Inline slash-command menu (non-modal, never coexists with a picker).
+  // Same height discipline: it must fit above the input/footer chrome.
+  let menuLines: string[] = []
+  if (!ctx.picker && ctx.commandMenu && ctx.commandMenu.items.length > 0) {
+    const menuBudget = Math.max(1, Math.min(9, availableRows - bottom.length - 7))
+    const menuState: PickerState = {
+      title: '命令',
+      items: ctx.commandMenu.items,
+      index: Math.max(0, Math.min(ctx.commandMenu.items.length - 1, ctx.commandMenu.index)),
+    }
+    menuLines = renderPicker(menuState, inner, menuBudget).map(gutter)
+    const maxMenuLines = Math.max(1, availableRows - bottom.length - pickerLines.length - 1)
+    menuLines = menuLines.slice(0, maxMenuLines)
+  }
   // The open-row window is capped so the frame never outgrows the terminal —
   // the diff painter can only repaint rows that are on screen. Overflow
   // collapses into a note and resumes into scrollback at the next seal.
   const pickerReserve = pickerLines.length > 0 ? pickerLines.length + 1 : 0
-  const maxOpen = Math.max(0, availableRows - bottom.length - pickerReserve)
+  const menuReserve = menuLines.length > 0 ? menuLines.length + 1 : 0
+  const maxOpen = Math.max(0, availableRows - bottom.length - pickerReserve - menuReserve)
   if (openLines.length > maxOpen) {
     const dropped = openLines.length - maxOpen
     if (maxOpen > 0) {
@@ -148,6 +167,10 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
 
   if (pickerLines.length > 0) {
     live.push(...pickerLines)
+    live.push('')
+  }
+  if (menuLines.length > 0) {
+    live.push(...menuLines)
     live.push('')
   }
   live.push(...bottom)
@@ -282,7 +305,9 @@ function footerLines(ctx: FrameContext, width: number): string[] {
       ? theme.subtle('⠋ 思考中…')
       : state === 'working'
         ? theme.subtle('⏺ 执行工具…')
-        : ''
+        : ctx.connecting
+          ? theme.subtle('○ 连接中…')
+          : ''
   const routeText = route
     ? theme.text(`${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}`)
     : ''

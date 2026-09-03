@@ -106,21 +106,20 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   const channel = new Channel()
   const renderer = new Renderer(stdout, () => stdout.columns ?? 80)
-  const agentFactory = ctx.get<KernelAgentsService>('agents', false)
-  const llm = ctx.get<KernelLlmService>('llm', false)
-  const defaultModel = ctx.get<KernelAgentDefaultModel>('agentDefaultModel', false)
-  // M3/M4 optional seams — all soft-probed, all degrade silently (#183).
-  const sessionQuery = ctx.get<KernelSessionQueryService>('sessionQuery', false)
-  const sessionTitle = ctx.get<KernelSessionTitleService>('sessionTitle', false)
-  const commands = ctx.get<KernelCommandsService>('commands', false)
-  const approval = ctx.get<KernelApprovalService>('approval', false)
-  const sessions = ctx.get<KernelSessionsService>('sessions', false)
-
-  if (!agentFactory) {
-    // #183 discipline: a missing kernel service must never break the boot.
-    // With no factory there is no session to drive; surface one line and go.
-    channel.pushSystem('kernel service `agents` 未挂载：Orca 以只读模式启动')
-  }
+  // Optional seams are soft-probed LAZILY at each use site (#183): loader
+  // entries activate concurrently, so a service captured once at bootstrap
+  // may stay `undefined` forever even though the kernel registers it moments
+  // later (verified: `sessionQuery` read "unmounted" in-profile). Probing
+  // through these getters after `loader.await()` (or on user action) always
+  // sees the live registry.
+  const getAgents = (): KernelAgentsService | undefined => ctx.get<KernelAgentsService>('agents', false)
+  const getLlm = (): KernelLlmService | undefined => ctx.get<KernelLlmService>('llm', false)
+  const getDefaultModel = (): KernelAgentDefaultModel | undefined => ctx.get<KernelAgentDefaultModel>('agentDefaultModel', false)
+  const getSessionQuery = (): KernelSessionQueryService | undefined => ctx.get<KernelSessionQueryService>('sessionQuery', false)
+  const getSessionTitle = (): KernelSessionTitleService | undefined => ctx.get<KernelSessionTitleService>('sessionTitle', false)
+  const getCommands = (): KernelCommandsService | undefined => ctx.get<KernelCommandsService>('commands', false)
+  const getApproval = (): KernelApprovalService | undefined => ctx.get<KernelApprovalService>('approval', false)
+  const getSessions = (): KernelSessionsService | undefined => ctx.get<KernelSessionsService>('sessions', false)
 
   let handle: AgentHandle | null = null
   let agent: Agent | null = null
@@ -229,19 +228,10 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         // truth; the local /yolo switch below only updates the same fold.
         if (event.type === 'approval/policy' && agent) {
           try {
-            const next = approval?.overrideOf(agent.session)
+            const next = getApproval()?.overrideOf(agent.session)
             if (next) approvalPolicy = next
           } catch {
             // Best-effort fold; the footer keeps its last known value.
-          }
-        }
-        // Fold the live title for the footer when the service is absent.
-        if (event.type === 'session/title' && sessionTitle === undefined && agent) {
-          try {
-            const snapshot = undefined
-            void snapshot
-          } catch {
-            // Ignored — channel.title already updated by ingest.
           }
         }
       }
@@ -282,11 +272,12 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Unknown slash: try the kernel-owned registry (e.g. future commands
       // registered by plugins). Admission misses resolve to undefined and
       // fall through to a normal prompt — the kimi behavior.
-      if (agent && commands) {
+      const registry = agent ? getCommands() : undefined
+      if (agent && registry) {
         const line = text.trim()
         void (async (): Promise<void> => {
           try {
-            const execution = await commands.execute(agent, line, [], new AbortController().signal)
+            const execution = await registry.execute(agent, line, [], new AbortController().signal)
             if (execution === undefined) {
               conversationStarted = true
               agent.followup(buildUserMessage(text))
@@ -354,9 +345,10 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       groups.set(cmd.group, list)
     }
     // Kernel-registered commands (e.g. /compact's owner) append after ours.
-    if (agent && commands) {
+    const registry = agent ? getCommands() : undefined
+    if (agent && registry) {
       try {
-        const extra = commands
+        const extra = registry
           .list(agent)
           .filter((descriptor) => findSlash(descriptor.name) === undefined)
           .map((descriptor) => `/${descriptor.name} — ${descriptor.description}`)
@@ -380,6 +372,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   }
 
   const showPermission = (): void => {
+    const approval = getApproval()
     if (agent && approval) {
       try {
         const override = approval.overrideOf(agent.session)
@@ -407,6 +400,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     // Yolo needs asks to reach our answerer: force the session policy back
     // to `ask` when enabling (a `never` policy would auto-reject before we
     // ever see the request). Best-effort; local flag still drives the panel.
+    const approval = getApproval()
     if (next && agent && approval) {
       try {
         approval.setPolicy(agent, 'ask')
@@ -429,6 +423,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       channel.pushSystem(current ? `会话标题：${current}` : '会话暂无标题（首条用户消息后自动生成）')
       return
     }
+    const sessionTitle = getSessionTitle()
     if (!sessionTitle) {
       channel.pushSystem('sessionTitle 服务未挂载：无法设置标题')
       return
@@ -442,6 +437,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   }
 
   const safeTitleGet = (): string | null => {
+    const sessionTitle = getSessionTitle()
     if (!agent || !sessionTitle) return null
     try {
       return sessionTitle.get(agent.session)?.title ?? null
@@ -455,6 +451,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       channel.pushSystem('agent 未就绪，无法压缩')
       return
     }
+    const commands = getCommands()
     if (!commands) {
       channel.pushSystem('commands 服务未挂载：无法执行 /compact（内核需挂载 dsh-command-compact）')
       return
@@ -472,6 +469,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   }
 
   const switchToNew = async (): Promise<void> => {
+    const agentFactory = getAgents()
     if (!agentFactory) {
       channel.pushSystem('agents 服务未挂载：无法新建会话')
       return
@@ -491,7 +489,11 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   }
 
   const createAgent = async (resumeId?: string): Promise<void> => {
-    if (!agentFactory) return
+    const agentFactory = getAgents()
+    if (!agentFactory) {
+      channel.pushSystem('kernel service `agents` 未挂载：Orca 以只读模式启动')
+      return
+    }
     const cwd = process.cwd()
     const agentOptions = currentAgentOptions()
     const createOptions = agentOptions
@@ -518,6 +520,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   }
 
   const currentAgentOptions = (): { provider: string; model: string } | undefined => {
+    const defaultModel = getDefaultModel()
     const selection0 = defaultModel?.currentSelection()
     const selectionOptions =
       selection0 && selection0.provider !== '' && selection0.model !== '' ? { provider: selection0.provider, model: selection0.model } : undefined
@@ -535,7 +538,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       }
     }
     try {
-      const override = approval?.overrideOf(next.session)
+      const override = getApproval()?.overrideOf(next.session)
       if (override) approvalPolicy = override
     } catch {
       // Keep last known policy.
@@ -600,11 +603,44 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     pickerStage = null
   }
 
+  // ── inline slash-command menu (kimi `/` completion) ───────────────────────
+  // Non-modal: derived from the editor text every frame, navigated with ↑↓
+  // (wrap-around), completed with Tab (or Enter on a partial match),
+  // dismissed by Esc (which clears the editor as before).
+
+  let menuIndex = 0
+
+  const menuMatches = (editorText: string): PickerItem[] => {
+    if (!editorText.startsWith('/') || editorText.includes(' ')) return []
+    const prefix = editorText.slice(1).toLowerCase()
+    return SLASH_COMMANDS.filter(
+      (cmd) => cmd.name.startsWith(prefix) || cmd.aliases.some((alias) => alias.startsWith(prefix)),
+    ).map((cmd) => itemOf(`/${cmd.name}`, cmd.name, cmd.description))
+  }
+
+  const currentMenu = (): { readonly items: readonly PickerItem[]; readonly index: number } | null => {
+    if (picker) return null
+    const items = menuMatches(editor)
+    if (items.length === 0) return null
+    return { items, index: Math.max(0, Math.min(items.length - 1, menuIndex)) }
+  }
+
+  const completeMenu = (): boolean => {
+    const menu = currentMenu()
+    if (!menu || menu.items.length === 0) return false
+    const item = menu.items[menu.index]
+    if (!item) return false
+    editor = `/${item.value}`
+    menuIndex = 0
+    return true
+  }
+
   const applySelection = (next: SessionRoute): void => {
     dbg(`applySelection ${next.provider}/${next.model}`)
     selection = next
     const effort = next.reasoningEffort ? `(${next.reasoningEffort})` : ''
     channel.pushSystem(`模型已切换：${next.provider}/${next.model}${effort} · 下一次请求生效`)
+    const defaultModel = getDefaultModel()
     if (defaultModel) {
       // Persist as the composition default, best-effort — the settings write
       // may reject OR throw synchronously (verified in-profile: a sync throw
@@ -624,7 +660,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   const confirmPicker = (): void => {
     if (!picker || !pickerStage) {
-      dbg(`confirmPicker skip: picker=${picker !== null} stage=${pickerStage?.kind ?? 'null'} llm=${llm !== undefined}`)
+      dbg(`confirmPicker skip: picker=${picker !== null} stage=${pickerStage?.kind ?? 'null'}`)
       return
     }
     if (pickerStage.kind === 'sessions') {
@@ -637,6 +673,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       settleApprovalHead(item.value === 'allowed-once' ? 'allowed-once' : 'rejected')
       return
     }
+    const llm = getLlm()
     if (!llm) {
       dbg(`confirmPicker skip: picker=${picker !== null} stage=${pickerStage?.kind ?? 'null'} llm=${llm !== undefined}`)
       return
@@ -743,6 +780,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   }
 
   const openModelPicker = (): void => {
+    const llm = getLlm()
     if (!llm) {
       channel.pushSystem('kernel service `llm` 未挂载：无法枚举模型')
       return
@@ -773,11 +811,12 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   // ── /resume browser (placeholder: full picker lands next) ──────────────────
 
   const openResumePicker = (): void => {
+    const sessionQuery = getSessionQuery()
     if (!sessionQuery) {
       channel.pushSystem('sessionQuery 服务未挂载：无法浏览历史会话（内核需挂载 dsh-session-query）')
       return
     }
-    if (!agentFactory) {
+    if (!getAgents()) {
       channel.pushSystem('agents 服务未挂载：无法恢复会话')
       return
     }
@@ -834,7 +873,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   }
 
   const switchToResume = async (resumeId: string): Promise<void> => {
-    if (!agentFactory) return
+    if (!getAgents()) return
     const previous = handle
     handle = null
     agent = null
@@ -850,7 +889,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     // Best-effort: replay the persisted log so the transcript is not empty
     // before live events arrive. Failures stay silent — live events are truth.
     try {
-      const snapshot = await sessionQuery?.readTitle(resumeId)
+      const snapshot = await getSessionQuery()?.readTitle(resumeId)
       if (snapshot) channel.title = snapshot.title
     } catch {
       // Ignored.
@@ -863,10 +902,12 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   // the parent log on disk. Idle-only; needs ≥2 observed turns.
 
   const doRewind = async (): Promise<void> => {
+    const agentFactory = getAgents()
     if (!agent || !handle || !agentFactory) {
       channel.pushSystem('agent 未就绪，无法回退')
       return
     }
+    const sessions = getSessions()
     if (!sessions) {
       channel.pushSystem('sessions 服务未挂载：无法回退（内核需挂载 dsh-session）')
       return
@@ -947,7 +988,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   // ── agent lifecycle ───────────────────────────────────────────────────────
 
   const start = async (): Promise<void> => {
-    if (!agentFactory) return
     const resumeId = process.env['ORCA_RESUME_SESSION']
     // Loader entries activate concurrently, so the factory and the default
     // model service may not exist yet when apply() runs. Await full plugin
@@ -966,6 +1006,21 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       handlePickerKey(key)
       return
     }
+    // Tab completes the inline slash menu (no-op without one).
+    if (key.name === 'tab' && !picker) {
+      completeMenu()
+      return
+    }
+    // ↑↓ cycle the inline slash menu while it is visible; otherwise they
+    // stay no-ops (never smear CSI sequences into the prompt).
+    if ((key.name === 'up' || key.name === 'down') && !picker) {
+      const menu = currentMenu()
+      if (menu && menu.items.length > 1) {
+        const delta = key.name === 'down' ? 1 : -1
+        menuIndex = (menu.index + delta + menu.items.length) % menu.items.length
+        return
+      }
+    }
     switch (classify(key)) {
       case 'exit': {
         dispose()
@@ -975,6 +1030,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       case 'cancel': {
         if (editor) {
           editor = ''
+          menuIndex = 0
           break
         }
         if (picker) {
@@ -997,16 +1053,27 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       }
       case 'submit': {
         const text = editor.trim()
+        // Partial slash input completes from the menu first (kimi behavior);
+        // a second Enter dispatches the completed command.
+        if (text.startsWith('/') && !text.includes(' ') && !picker) {
+          const slash = parseSlash(text)
+          if (slash && !findSlash(slash.name)) {
+            if (completeMenu()) break
+          }
+        }
         editor = ''
+        menuIndex = 0
         if (text) submit(text)
         break
       }
       case 'backspace': {
         editor = editor.slice(0, editor.length - 1)
+        menuIndex = 0
         break
       }
       case 'text': {
         editor += key.sequence
+        menuIndex = 0
         break
       }
       case 'navigate':
@@ -1024,15 +1091,19 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     const cwd = process.cwd()
     const title = channel.title ?? safeTitleGetCached()
     const stream: string[] = []
-    // One-time welcome card; afterwards only route changes print a slim
-    // line — the scrollback stream never accumulates repeated banners.
+    // One-time welcome card — deferred until the agent connects so the
+    // Session/Model rows carry real values instead of `—`/`未设置`.
+    // Afterwards only route changes print a slim line — the scrollback
+    // stream never accumulates repeated banners.
     if (!welcomed) {
-      welcomed = true
-      const routeModel = route ? `${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}` : null
-      stream.push(...welcomeCard(process.cwd(), agent?.session.id ?? null, routeModel, stdout.columns ?? 80))
-      if (route) {
-        stream.push(routeLine(route))
-        lastRouteKey = routeKey(route)
+      if (agent) {
+        welcomed = true
+        const routeModel = route ? `${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}` : null
+        stream.push(...welcomeCard(process.cwd(), agent.session.id, routeModel, stdout.columns ?? 80))
+        if (route) {
+          stream.push(routeLine(route))
+          lastRouteKey = routeKey(route)
+        }
       }
     } else if (route) {
       const key = routeKey(route)
@@ -1041,6 +1112,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         stream.push(routeLine(route))
       }
     }
+    const menu = currentMenu()
     let frame = buildFrame({
       channel,
       sealedFrom: flushedSealed,
@@ -1061,6 +1133,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       usage: channel.usage,
       now: Date.now(),
       picker,
+      commandMenu: menu,
+      connecting: agent === null,
       title,
       policy: approvalPolicy,
       yolo: yoloMode,
@@ -1084,6 +1158,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         usage: channel.usage,
         now: Date.now(),
         picker,
+        commandMenu: menu,
+        connecting: agent === null,
         title,
         policy: approvalPolicy,
         yolo: yoloMode,

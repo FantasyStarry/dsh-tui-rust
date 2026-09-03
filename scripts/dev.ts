@@ -178,6 +178,8 @@ class FakeKernel implements KernelContext {
   private factoryCalls = 0
   private fakePolicy = 'ask'
   private fakeTitle: string | null = null
+  /** When true, `sessionQuery` reads as unregistered (late-registration probe). */
+  hideSessionQuery = false
 
   constructor(private readonly mounted: boolean) {}
 
@@ -227,6 +229,7 @@ class FakeKernel implements KernelContext {
       } as T
     }
     if (name === 'sessionQuery') {
+      if (this.hideSessionQuery) return undefined
       return {
         listSessions: async () => [
           { header: { id: 'session-aaa', cwd: '/tmp/proj', createdAt: Date.now() - 1000 }, live: false, persisted: true },
@@ -819,7 +822,73 @@ async function main(): Promise<void> {
   await sleep(250)
   if (!kernel3.record.forkCalled) problems.push('phase3：双击 Esc 未触发回退 fork')
   if (!visible3().includes('已回退')) problems.push('phase3：回退确认缺失')
+  // Welcome must wait for the connection: Session/Model rows carry real
+  // values, never the `—`/`未设置` placeholders of a pre-connect render.
+  if (!visible3().includes('✦ orca')) problems.push('phase3：欢迎卡缺失')
+  if (visible3().includes('未设置')) problems.push('phase3：欢迎卡抢跑（连接前渲染）')
   dispose3()
+  await sleep(20)
+
+  // ── Phase 4: 欢迎卡延迟 + 服务懒探测 + / 命令菜单 ──────────────────────────
+  const writes4: string[] = []
+  const stdin4 = new FakeStdin()
+  const kernel4 = new FakeKernel(true)
+  kernel4.hideSessionQuery = true // registered "later" — eager capture would miss it forever
+  const dispose4 = bootstrapApp(
+    kernel4,
+    { provider: '', model: '', fullscreen: false },
+    { stdout: () => makeStdout(writes4), stdin: () => stdin4 },
+  )
+  await sleep(300)
+  const visible4 = (): string => stripSgr(writes4.join(''))
+  // Service registered after boot must still resolve (lazy probe, not
+  // bootstrap-time capture).
+  for (const ch of '/resume') stdin4.text(ch)
+  stdin4.key('return')
+  await sleep(120)
+  if (!visible4().includes('sessionQuery 服务未挂载')) problems.push('phase4：缺失服务应明确提示')
+  stdin4.key('escape') // clear the editor
+  await sleep(80)
+  kernel4.hideSessionQuery = false
+  for (const ch of '/resume') stdin4.text(ch)
+  stdin4.key('return')
+  await sleep(250)
+  if (!visible4().includes('历史会话')) problems.push('phase4：后注册的 sessionQuery 未被懒探测到')
+  stdin4.key('escape')
+  await sleep(100)
+  // Inline menu: `/` lists commands without submitting.
+  stdin4.text('/')
+  await sleep(120)
+  {
+    const snap = paintScreen(writes4)
+    if (!snap.some((row) => row.includes('/resume'))) problems.push('phase4：/ 菜单未列出 /resume')
+    if (!snap.some((row) => row.includes('/help'))) problems.push('phase4：/ 菜单未列出 /help')
+  }
+  // ↓ + Tab completes the highlighted entry into the editor.
+  stdin4.key('down')
+  await sleep(80)
+  stdin4.key('tab')
+  await sleep(80)
+  {
+    const snap = paintScreen(writes4)
+    if (!snap.some((row) => row.includes('> /model'))) problems.push('phase4：Tab 未补全高亮命令')
+  }
+  stdin4.key('escape') // clear editor
+  await sleep(80)
+  // Partial input + Enter completes first, dispatches on the second Enter.
+  for (const ch of '/usa') stdin4.text(ch)
+  await sleep(80)
+  stdin4.key('return')
+  await sleep(100)
+  {
+    const snap = paintScreen(writes4)
+    if (!snap.some((row) => row.includes('> /usage'))) problems.push('phase4：Enter 未补全部分命令')
+    if (visible4().includes('用量：')) problems.push('phase4：补全回车不应直接分发')
+  }
+  stdin4.key('return')
+  await sleep(120)
+  if (!visible4().includes('用量：')) problems.push('phase4：补全后回车未分发 /usage')
+  dispose4()
   await sleep(20)
 
   if (problems.length > 0) {
