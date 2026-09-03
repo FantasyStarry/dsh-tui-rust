@@ -71,6 +71,17 @@ export const Config: StandardSchema = {
   },
 }
 
+/**
+ * Live app in this process, if any. `patchReload: live` profiles re-apply
+ * the plugin on every rebuild while the old render loop may still be
+ * painting: two loops on one stdout tear frames and stack welcomes/sessions
+ * (verified in the scrollback-stacking repro). A terminal has exactly one
+ * owner, so re-mounts single-flight through here — the previous instance is
+ * torn down before the new one paints, even if the host disposes effects
+ * late. Disposers are idempotent, so every ordering is safe.
+ */
+let liveDispose: (() => void) | null = null
+
 export function apply(ctx: KernelContext, config: Partial<OrcaConfig> = {}): void {
   const resolved: OrcaConfig = { ...DEFAULTS, ...config }
 
@@ -83,6 +94,13 @@ export function apply(ctx: KernelContext, config: Partial<OrcaConfig> = {}): voi
     if (!process.stdout.isTTY || !process.stdin.isTTY) {
       return undefined
     }
-    return bootstrapApp(ctx, resolved)
+    liveDispose?.()
+    liveDispose = null
+    const dispose = bootstrapApp(ctx, resolved)
+    liveDispose = dispose
+    return () => {
+      if (liveDispose === dispose) liveDispose = null
+      dispose()
+    }
   })
 }
