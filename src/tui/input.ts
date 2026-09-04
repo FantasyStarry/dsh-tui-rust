@@ -15,11 +15,14 @@
  * - a lone ESC flushes instantly when the next burst is clearly not a
  *   sequence continuation, else after 40ms (double-Esc rewind stays usable);
  * - multibyte UTF-8 survives chunk splits (StringDecoder);
+ * - Kitty CSI-u / xterm modifyOtherKeys printable sequences decode to text
+ *   (`\x1b[97;1u` → `a`; release `:3` events swallowed, see `./keys.js`);
  * - names mirror the old readline surface the app already keys off
  *   ('return' for \r, 'backspace' for \x7f/\x08, ctrl+letter for C0).
  */
 
 import { StringDecoder } from 'node:string_decoder'
+import { decodePrintableKey, isKeyRelease } from './keys.js'
 
 export interface KeyPress {
   /** Printable character for text keys, else the named key. */
@@ -190,6 +193,15 @@ export class Keyboard {
 
   /** CSI → named key; unknown finals (mouse/focus/paste) vanish. */
   private emitCsi(params: string, final: string, sequence: string): void {
+    // Kitty `disambiguate` 模式把裸可打印键发成 CSI-u（`\x1b[97;1u` = `a`）；
+    // 先还原成文本，否则 Kitty/Ghostty/WezTerm 下输入直接丢字。release 事件
+    //（flag 2 的 `:3` 后缀）永远吞掉——按键松开不应再进一次编辑器。
+    if (isKeyRelease(sequence)) return
+    const printable = decodePrintableKey(sequence)
+    if (printable !== undefined) {
+      for (const ch of printable) this.handler(decodeChar(ch))
+      return
+    }
     let name: string | null
     if (final === '~') name = csiTildeKey(params)
     else if (final === 'Z') name = 'tab' // shift-tab: shift flag not needed
