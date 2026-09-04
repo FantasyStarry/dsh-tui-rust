@@ -516,6 +516,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the fresh session.
     }
     channel.clearForSwitch()
+    welcomeLive = null
+    slimLive = []
     welcomed = true // suppress the one-time welcome on switches
     await createAgent()
   }
@@ -964,6 +966,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the resumed session.
     }
     channel.clearForSwitch()
+    welcomeLive = null
+    slimLive = []
     welcomed = true
     await createAgent(resumeId)
     // Best-effort: replay the persisted log so the transcript is not empty
@@ -1029,6 +1033,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the rewound session.
     }
     channel.clearForSwitch()
+    welcomeLive = null
+    slimLive = []
     welcomed = true
     await createAgent(childSessionId)
     channel.pushSystem(`已回退到上一轮（fork ${shortSessionLabel(childSessionId)}）`)
@@ -1175,6 +1181,20 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   let flushedSealed = 0
   let welcomed = false
   let lastRouteKey = ''
+  // Live-first notices (the vanished-welcome fix): one-shot rows render as
+  // LIVE transcript-window rows first — visible from tick one under the
+  // pinned input — caching exact bytes; each cache flips into the scrollback
+  // stream byte-identically the moment it can age correctly. The welcome
+  // card flips at the first new transcript row (it must not squeeze the
+  // working window), route slim lines at the first transcript seal after
+  // they appear (a content trigger would flush a just-built slim unseen).
+  // Invariant: the stream only ever carries rows that were already on
+  // screen — a sealed row that was never live survives a single 33ms tick
+  // before the spacer regrow scroll-ages it off.
+  let welcomeLive: string[] | null = null
+  let welcomeBootRows = 0
+  let slimLive: string[] = []
+  let slimBuiltSeal = 0
   const render = (): void => {
     const fullscreen = config.fullscreen === true
     // 总是钉底：inline/fullscreen 一律 spacer 撑满视口，输入框从首帧起固定在终端底边。
@@ -1183,12 +1203,23 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     const cwd = process.cwd()
     const title = channel.title ?? safeTitleGetCached()
     const stream: string[] = []
-    // One-time welcome card — deferred until the agent connects so the
+    // One-time notices — deferred until the agent connects so the
     // Session/Model rows carry real values instead of `—`/`未设置`.
-    // Afterwards only route changes print a slim line — the scrollback
-    // stream never accumulates repeated banners. Fullscreen has no native
-    // scrollback, so its notices go through the channel and render inside
-    // the transcript window instead.
+    // Inline renders them as LIVE rows first: a scrollback-stream row that
+    // was never live survives a single 33ms tick before the spacer regrow
+    // scrolls it off (the vanished welcome card). The welcome card flips at
+    // the first new transcript row; route slim lines flip at the first
+    // transcript seal after they appear. Afterwards only route changes add
+    // slim lines. Fullscreen has no native scrollback, so its notices go
+    // through the channel and render inside the transcript window instead.
+    if (welcomeLive !== null && channel.rows.length > welcomeBootRows) {
+      stream.push(...welcomeLive)
+      welcomeLive = null
+    }
+    if (slimLive.length > 0 && channel.sealedRowCount > slimBuiltSeal) {
+      stream.push(...slimLive)
+      slimLive = []
+    }
     if (!welcomed) {
       if (agent) {
         welcomed = true
@@ -1196,12 +1227,16 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         if (fullscreen) {
           channel.pushSystem(`✦ orca 已连接 · session ${shortSessionLabel(agent.session.id)}`)
         } else {
-          stream.push(...welcomeCard(process.cwd(), agent.session.id, routeModel, stdout.columns ?? 80))
+          welcomeLive = [...welcomeCard(process.cwd(), agent.session.id, routeModel, stdout.columns ?? 80)]
+          welcomeBootRows = channel.rows.length
         }
         if (route) {
           const line = routeLine(route)
           if (fullscreen) channel.pushSystem(line)
-          else stream.push(line)
+          else {
+            if (slimLive.length === 0) slimBuiltSeal = channel.sealedRowCount
+            slimLive = [...slimLive, line]
+          }
           lastRouteKey = routeKey(route)
         }
       }
@@ -1211,9 +1246,13 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         lastRouteKey = key
         const line = routeLine(route)
         if (fullscreen) channel.pushSystem(line)
-        else stream.push(line)
+        else {
+          if (slimLive.length === 0) slimBuiltSeal = channel.sealedRowCount
+          slimLive = [...slimLive, line]
+        }
       }
     }
+    const notices = fullscreen ? null : [...(welcomeLive ?? []), ...slimLive]
     const menu = currentMenu()
     let frame = buildFrame({
       channel,
@@ -1229,6 +1268,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // permanently reduce the chat viewport.
       reservedRows: stream.length,
       anchorChrome,
+      notices,
       fullscreen,
       cwd,
       sessionId: agent?.session.id ?? null,
@@ -1256,6 +1296,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         height: stdout.rows ?? 24,
         reservedRows: stream.length + frame.stream.length,
         anchorChrome,
+        notices,
       fullscreen,
         cwd,
         sessionId: agent?.session.id ?? null,

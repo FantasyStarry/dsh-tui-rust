@@ -545,6 +545,8 @@ try {
   await waitMarker('session 已连接', /session 已连接：session-[0-9a-f-]+/)
   await settle()
   assertInputBox('启动')
+  // 欢迎卡回归门：字节流 marker 只能证明画过（33ms 闪存也会过），屏状态才证明看得见。
+  if (!screen.plain().includes('✦ orca')) fail(`[启动] 欢迎卡不在屏上\n${screen.plain()}`)
 
   // ── step 1: `/` menu shows and dismisses without breaking the editor ──
   proc.write('/')
