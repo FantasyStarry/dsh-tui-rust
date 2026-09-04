@@ -237,11 +237,13 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
 /** One-time welcome block — kimi-style box with info rows; brand wordmark. */
 export function welcomeCard(cwd: string, sessionId: string | null, model: string | null, width: number): string[] {
   const style: BoxStyle = { bg: (t) => t, border: theme.primary }
-  const logo = ['▝▀▀▀▜', '▐▄▄▄▌'] as const
-  const logoW = 5
+  // README 品牌：🐋（U+1F40B，eastAsianWidth = 2，与终端 emoji 渲染一致，
+  // 不上色——原生彩色 emoji 就是 logo 本体）。
+  const logo = '🐋'
+  const logoW = stringWidth(logo)
   const gap = '  '
-  const row0 = theme.primary(logo[0].padEnd(logoW)) + gap + theme.title('✦ orca')
-  const row1 = theme.primary(logo[1].padEnd(logoW)) + gap + theme.subtle('DeepSeek Harness 终端前端')
+  const row0 = logo + gap + theme.title('✦ orca')
+  const row1 = ' '.repeat(logoW) + gap + theme.subtle('DeepSeek Harness 终端前端')
   const label = (text: string): string => theme.strong(theme.subtle(text))
   const info = [
     label('Directory:') + '  ' + short(cwd),
