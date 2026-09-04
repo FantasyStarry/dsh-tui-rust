@@ -985,9 +985,9 @@ async function main(): Promise<void> {
   dispose5b()
   await sleep(20)
 
-  // ── Phase 6: always-anchor — the chrome is pinned from the first frame
-  // (no floating welcome anymore). Closing the /model picker must keep it
-  // there: a spacer gap stays between the transcript and the editor.
+  // ── Phase 6: pinned chrome + gradual aging — the /model picker flow
+  // must neither move the editor row nor eat the welcome card: the editor
+  // sits on the same viewport row before/after, and `✦ orca` stays in view.
   {
     const rw: string[] = []
     const stdin6 = new FakeStdin()
@@ -998,6 +998,7 @@ async function main(): Promise<void> {
       { stdout: () => makeStdout(rw), stdin: () => stdin6 },
     )
     await sleep(250)
+    const editorBefore = paintScreen(rw, 24).findIndex((row) => row.includes('> 说点什么...'))
     for (const ch of '/model') stdin6.text(ch)
     stdin6.key('return')
     await sleep(150)
@@ -1007,17 +1008,16 @@ async function main(): Promise<void> {
     await sleep(150)
     stdin6.key('return') // effort 默认
     await sleep(250) // selection applies + route line flushes
-    const snap6 = paintScreen(rw)
+    const snap6 = paintScreen(rw, 24)
     const editorRow6 = snap6.findIndex((row) => row.includes('> 说点什么...'))
     if (editorRow6 < 0) {
       problems.push('phase6：picker 关闭后编辑框缺失')
     } else {
-      // Blank spacer rows directly above the editor box top border prove the
-      // chrome stayed bottom-anchored after the picker went away.
-      let blanks6 = 0
-      for (let i = editorRow6 - 2; i >= 0 && snap6[i] === ''; i--) blanks6++
-      if (blanks6 < 5) {
-        problems.push(`phase6：picker 关闭后 chrome 未保持锚底（上方空行 ${blanks6}）`)
+      if (editorRow6 !== editorBefore) {
+        problems.push(`phase6：picker 流程移动了输入框行（${editorBefore}→${editorRow6}）`)
+      }
+      if (!snap6.some((row) => row.includes('✦ orca'))) {
+        problems.push('phase6：picker 流程后欢迎卡不在屏上')
       }
       if (!snap6.some((row) => row.includes('模型已切换：fake-a/fake-a-m1'))) {
         problems.push('phase6：模型切换提示缺失')

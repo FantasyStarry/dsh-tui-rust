@@ -208,11 +208,13 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   const pickerReserve = pickerLines.length > 0 ? pickerLines.length + 1 : 0
   const menuReserve = menuLines.length > 0 ? menuLines.length + 1 : 0
   const maxOpen = Math.max(0, availableRows - bottom.length - pickerReserve - menuReserve)
-  // App-level notices pin to the live top (flipped into scrollback at the
-  // first transcript seal). The transcript yields budget to them and seals
-  // sooner — notices themselves are never capped or dropped here.
+  // App-level notices pin to the live top (welcome card, route lines) with
+  // NO expiry: the transcript keeps its FULL budget, and any overflow
+  // overfill-scrolls exactly the excess — the top ages gradually instead
+  // of vanishing in one jump. Notices are never capped, dropped, or
+  // flipped away.
   const notices = ctx.notices ?? []
-  const transcriptBudget = Math.max(0, maxOpen - notices.length)
+  const transcriptBudget = maxOpen
   if (openLines.length > transcriptBudget) {
     const dropped = openLines.length - transcriptBudget
     if (transcriptBudget > 0) {

@@ -36,6 +36,14 @@ export class Renderer {
   constructor(
     private readonly stdout: NodeJS.WriteStream,
     private readonly getWidth: () => number,
+    /**
+     * Viewport rows; bounds the shrink-clear heuristic below. `last` can
+     * outgrow the viewport after overfill paints (long picker/transcript
+     * frames scroll), and rows already scrolled off must not count as
+     * clearable stale rows — stepping down to clear them scrolls the
+     * screen spuriously (the 1-row chrome lift after picker close).
+     */
+    private readonly getHeight: () => number = () => 24,
   ) {}
 
   /**
@@ -82,7 +90,11 @@ export class Renderer {
       // seal flush often SHRINKS the live region (previous turn's rows left),
       // and uncleared rows kept ghost copies of the chrome on screen.
       const written = stream.length + frame.length
-      const stale = this.last.length - written
+      // Only rows still on screen can be stale: `last` outgrows the
+      // viewport after overfill paints, and that overflow already scrolled
+      // off. A full-height frame therefore never steps down (min() caps
+      // stale at ≤ 0) — stepping down from the bottom row would scroll.
+      const stale = Math.min(this.last.length, this.getHeight()) - written
       const steppedDown = this.clearStale(out, stale, frame.length)
       this.placeCursor(out, frame.length, cursor, steppedDown)
       out.push(SYNC_END)
@@ -114,8 +126,9 @@ export class Renderer {
 
     this.writeFrame(out, frame, firstDiff)
     // Clear stale lines below the new frame (shrink case) and park the
-    // cursor on the final input line.
-    const stale = this.last.length - frame.length
+    // cursor on the final input line. Same viewport bound as above: only
+    // on-screen rows of `last` can need clearing.
+    const stale = Math.min(this.last.length, this.getHeight()) - frame.length
     const steppedDown = this.clearStale(out, stale, frame.length)
     this.placeCursor(out, frame.length, cursor, steppedDown)
     out.push(SYNC_END)

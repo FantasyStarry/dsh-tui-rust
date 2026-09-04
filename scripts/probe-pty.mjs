@@ -578,6 +578,8 @@ try {
   await waitMarker('模型已切换', /模型已切换：/)
   await settle()
   assertInputBox('模型切换完成后', '')
+  // 欢迎卡回归门（本轮报告）：switch 后卡必须还在屏上（常驻置顶 + 自然溢出）。
+  if (!screen.plain().includes('✦ orca')) fail(`[模型切换完成后] 欢迎卡不在屏上\n${screen.plain()}`)
 
   // ── step 3: reopen the / menu mid-conversation, then Esc ──
   proc.write('/')

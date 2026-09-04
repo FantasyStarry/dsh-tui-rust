@@ -65,15 +65,20 @@ export function renderPicker(state: PickerState, width: number, maxItems = 17): 
   lines.push(theme.subtle(' ' + HINT))
   lines.push('')
 
-  // The picker is embedded in the live frame, so callers can reserve a
-  // terminal-height budget. Keep at least the selected item visible even on
-  // very short terminals.
-  const itemLimit = Math.max(1, Math.floor(maxItems))
+  // Fixed item window: the panel ALWAYS occupies 4 chrome + itemWindow + 1
+  // rows on a given terminal, so opening/closing/filtering/switching stages
+  // never moves the surrounding transcript. Short lists blank-pad; long
+  // lists scroll inside the window (▲/▼ markers take item slots). The
+  // window clamps to the caller viewport budget — it only shrinks on very
+  // short terminals.
+  const itemWindow = Math.max(3, Math.min(9, Math.floor(maxItems)))
+  const itemLimit = state.items.length <= itemWindow ? state.items.length : Math.max(1, itemWindow - 2)
   const before = Math.floor((itemLimit - 1) / 2)
   const from = Math.max(0, Math.min(Math.max(0, state.items.length - itemLimit), state.index - before))
   const visible = state.items.slice(from, from + itemLimit)
+  const area: string[] = []
   const above = from
-  if (above > 0) lines.push(theme.subtle(` ▲ ${above} more`))
+  if (above > 0) area.push(theme.subtle(` ▲ ${above} more`))
   for (let i = 0; i < visible.length; i++) {
     const item = visible[i]
     if (!item) continue
@@ -91,15 +96,17 @@ export function renderPicker(state: PickerState, width: number, maxItems = 17): 
     const cut = truncateWidth(content, budget)
     if (selected) {
       const fill = ' '.repeat(Math.max(0, budget - stringWidth(cut)))
-      lines.push(theme.panel(cut + fill))
+      area.push(theme.panel(cut + fill))
     } else {
-      lines.push(cut)
+      area.push(cut)
     }
   }
   const remaining = state.items.length - (from + visible.length)
   if (remaining > 0) {
-    lines.push(theme.subtle(` ▼ ${remaining} more`))
+    area.push(theme.subtle(` ▼ ${remaining} more`))
   }
+  while (area.length < itemWindow) area.push('')
+  lines.push(...area.slice(0, itemWindow))
   lines.push(theme.primary('─'.repeat(width)))
   return lines
 }
