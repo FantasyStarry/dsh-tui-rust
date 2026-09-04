@@ -47,6 +47,7 @@ class Screen {
     this.cols = cols
     this.rows = rows
     this.grid = []
+    this.scrollback = []
     for (let r = 0; r < rows; r++) this.grid.push(new Array(cols).fill(' '))
     this.cx = 0
     this.cy = 0
@@ -62,6 +63,14 @@ class Screen {
 
   plain() {
     return this.grid.map((_, r) => this.text(r)).join('\n')
+  }
+
+  /** Scrollback + viewport — sealed rows live above the fold (M8). */
+  plainAll() {
+    return [
+      ...this.scrollback.map((g) => (g ?? []).join('').replaceAll('\x00', '').replace(/\s+$/, '')),
+      ...this.grid.map((_, r) => this.text(r)),
+    ].join('\n')
   }
 
   feed(data) {
@@ -147,7 +156,7 @@ class Screen {
 
   lineFeed() {
     if (this.cy >= this.rows - 1) {
-      this.grid.shift()
+      this.scrollback.push(this.grid.shift())
       this.grid.push(new Array(this.cols).fill(' '))
     } else {
       this.cy++
@@ -336,7 +345,9 @@ function waitMarker(name, regex, timeoutMs = STEP_TIMEOUT_MS) {
     const started = Date.now()
     const timer = setInterval(() => {
       pollAppLog()
-      if (regex.test(screen.plain())) {
+      // Sealed rows sediment into scrollback within a tick — match against
+      // the scrollback + viewport union, not the viewport alone.
+      if (regex.test(screen.plainAll())) {
         clearInterval(timer)
         resolve()
       } else if (Date.now() - started > timeoutMs) {

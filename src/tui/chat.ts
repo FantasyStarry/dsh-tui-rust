@@ -45,8 +45,6 @@ export interface FrameContext {
   readonly width: number
   /** Terminal rows; used to keep the prompt anchored at the bottom. */
   readonly height?: number
-  /** Rows written above this live frame during the current render. */
-  readonly reservedRows?: number
   readonly anchorChrome?: boolean
   readonly cwd: string
   readonly sessionId: string | null
@@ -61,9 +59,6 @@ export interface FrameContext {
   readonly commandMenu?: { readonly items: readonly PickerItem[]; readonly index: number } | null
   /** Inline `@path` completion (kimi file mention), above the input box. */
   readonly atMenu?: { readonly items: readonly PickerItem[]; readonly index: number } | null
-  /** App-level one-shot notices (welcome card, route lines): pinned to the
-   *  live top until the first transcript seal flips them into scrollback. */
-  readonly notices?: readonly string[] | null
   /** Ctrl+O toggle: show full thinking text instead of the short preview. */
   readonly thoughtExpanded?: boolean
   /** True while the agent is still connecting (footer shows 连接中 badge). */
@@ -107,7 +102,6 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   const height = Math.max(8, ctx.height ?? 24)
   const fullscreen = ctx.fullscreen ?? false
   const anchorChrome = fullscreen || (ctx.anchorChrome ?? ctx.picker !== null)
-  const reservedRows = anchorChrome ? Math.max(0, Math.min(height - 1, ctx.reservedRows ?? 0)) : 0
   const stream: string[] = []
   const live: string[] = []
   // Content area: transcript + panels sit inside a 1-cell chrome gutter
@@ -120,8 +114,14 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   // every row below it and desyncs the painter. Ellipses are the known
   // offender; strip them from tracked rows. Sealed scrollback rows are
   // written once and never tracked, so they keep the verbatim text.
-  const paintRow = (row: TranscriptRow): string[] =>
-    renderRow(row, ctx, inner).map((line) => (line === '' ? '' : gutter(asciiEllipses(line))))
+  // Pre-rendered chrome rows (welcome card, route lines) span the FULL
+  // width already and bypass the content gutter.
+  const paintRow = (row: TranscriptRow): string[] => {
+    if (row.rawLines !== undefined) {
+      return row.rawLines.map((line) => (line === '' ? '' : truncateWidth(asciiEllipses(line), width)))
+    }
+    return renderRow(row, ctx, inner).map((line) => (line === '' ? '' : gutter(asciiEllipses(line))))
+  }
 
   const editorBox = inputBox(ctx.editorText, width, ctx.editorCursor, ctx.attachments)
   const bottom = [...editorBox.lines, ...footerLines(ctx, width)]
@@ -169,10 +169,11 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     return { stream, live, cursor }
   }
 
-  // Newly sealed transcript rows → written once into scrollback.
+  // Newly sealed transcript rows → written once into scrollback. Continuous
+  // sedimentation: rows finalize (and flush) as soon as they stop growing.
   const sealedTo = Math.min(ctx.channel.sealedRowCount, ctx.channel.rows.length)
   for (const row of ctx.channel.rows.slice(ctx.sealedFrom, sealedTo)) {
-    stream.push(...renderRow(row, ctx, inner).map(gutter))
+    stream.push(...paintRow(row))
   }
 
   // Live region: open rows of the current turn + optional picker + bottom
@@ -188,7 +189,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   // budget a long provider/model list makes the terminal scroll mid-frame;
   // the next route stream then repaints against the wrong physical row and
   // leaves a ghost input box at the top of the screen.
-  const availableRows = anchorChrome ? Math.max(bottom.length + 2, height - reservedRows) : height
+  const availableRows = height
   const pickerItemBudget = Math.max(1, availableRows - bottom.length - 7)
   let pickerLines = ctx.picker ? renderPicker(ctx.picker, inner, pickerItemBudget).map(gutter) : []
   if (pickerLines.length > 0) {
@@ -221,26 +222,22 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   const pickerReserve = pickerLines.length > 0 ? pickerLines.length + 1 : 0
   const menuReserve = menuLines.length > 0 ? menuLines.length + 1 : 0
   const maxOpen = Math.max(0, availableRows - bottom.length - pickerReserve - menuReserve)
-  // App-level notices pin to the live top (welcome card, route lines) with
-  // NO expiry: the transcript keeps its FULL budget, and any overflow
-  // overfill-scrolls exactly the excess — the top ages gradually instead
-  // of vanishing in one jump. Notices are never capped, dropped, or
-  // flipped away.
-  const notices = ctx.notices ?? []
-  const transcriptBudget = maxOpen
-  if (openLines.length > transcriptBudget) {
-    const dropped = openLines.length - transcriptBudget
-    if (transcriptBudget > 0) {
-      const tailCount = Math.max(0, transcriptBudget - 1)
-      openLines = [theme.muted(`… 本回合前 ${dropped} 行暂省（回合结束后进历史）`), ...openLines.slice(-tailCount)]
+  // STRICT budget: the live block must never exceed the viewport height.
+  // Overflow of the open (growing) rows collapses behind a head note; the
+  // rows sediment into scrollback when they finalize.
+  if (openLines.length > maxOpen) {
+    const dropped = openLines.length - maxOpen
+    if (maxOpen > 0) {
+      const tailCount = Math.max(0, maxOpen - 1)
+      openLines = [theme.muted(`… 本回合前 ${dropped} 行暂省（完成后进历史）`), ...openLines.slice(-tailCount)]
     } else {
       openLines = []
     }
   }
   // The chrome is bottom-anchored: consume the remaining viewport with blank
   // rows between transcript/picker content and the input box/footer.
-  const spacer = anchorChrome ? Math.max(0, maxOpen - notices.length - openLines.length) : 0
-  live.push(...notices, ...openLines, ...Array.from({ length: spacer }, () => ''))
+  const spacer = anchorChrome ? Math.max(0, maxOpen - openLines.length) : 0
+  live.push(...openLines, ...Array.from({ length: spacer }, () => ''))
 
   if (pickerLines.length > 0) {
     live.push(...pickerLines)
@@ -300,6 +297,8 @@ function renderRow(row: TranscriptRow, ctx: FrameContext, width: number): string
       return ['', ...wrapWidth(row.text || '…', Math.max(8, width - 2)).map((line) => theme.muted(MESSAGE_INDENT + line))]
   }
 }
+
+/** Pre-rendered lines are painted verbatim (full width) — no extra guard. */
 
 /** User prompt: `✨ ` amber bold role bullet; continuation aligns under it. */
 function userLines(text: string, width: number): string[] {

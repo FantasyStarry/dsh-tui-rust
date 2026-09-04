@@ -23,8 +23,8 @@ Cordis profile (orca)
   └─ cordis.patch.yml        # bundle 层：服务行、覆盖、挂载顺序
       └─ src/index.ts        # 插件契约：name / Config / apply（无默认导出）
           └─ src/app.ts      # TTY 检查 → agent 工厂 → 装配 → 统一退出清理
-              ├─ src/adapter/channel.ts   # session/event → 转录行投影（真源）
-              ├─ src/tui/renderer.ts      # 差分渲染 + CSI 2026 同步输出
+              ├─ src/adapter/channel.ts   # session/event → 转录行投影（真源）+ 行级连续封存
+              ├─ src/tui/renderer.ts      # CUP 绝对寻址 + 封存行自然滚入 scrollback（CSI 2026）
               ├─ src/tui/input.ts         # raw 模式键盘
               └─ src/tui/chat.ts          # 纯函数帧构建
 ```
@@ -85,8 +85,9 @@ dsh --profile orca          # 或安装后直接 orca
 ConPTY 启动真实 profile，驱动 `/` 菜单、`/model` 三段选择器、Esc、中文输入与光标停靠，零 API 成本：
 
 ```sh
-node scripts/probe-pty.mjs         # 全流程回归
+node scripts/probe-pty.mjs         # 全流程回归（真内核 ConPTY）
 node scripts/probe-pty.mjs --live  # 追加一次极小真回合：流式上屏 + Ctrl+O 思考展开/折叠
+pnpm run probe:scrollback          # 带滚动缓冲的 ConPTY 断言：历史沉淀完整可回溯、无 ghost、chrome 钉底
 ```
 
 ## 路线图
@@ -99,7 +100,8 @@ node scripts/probe-pty.mjs --live  # 追加一次极小真回合：流式上屏 
 - [x] **M3 会话**（假内核冒烟 ✔，待真终端验收）：`/` 内联命令菜单（kimi 式：过滤/↑↓/Tab/Enter 补全后分发）· `/help`（分组/别名/内核命令追加，未知命令回退普通消息）· `/new`（别名 `/clear`）· `/resume`（别名 `/sessions`，`sessionQuery.listSessions` + 标题快照浏览器，50 条封顶）· `/title`（查看/`sessionTitle.rename`，`session/title` 事件折叠进页脚）· `/compact [hint]`（经 `commands.execute`，`compaction/*` 投影为系统行并封存）· `/usage` 明细 · rewind（空闲双击 Esc，经 `sessions.fork` 到上一 `turn/start` 边界后切换，`OPEN_TURN` 等失败降级提示）；`command/run-done`、`todo/write` 一并投影；欢迎卡延迟到连接后（Session/Model 行带真实值）+ 连接中徽标；可选接缝全部懒探测（启动时序竞态不再误报"未挂载"）
 - [x] **M4 壳层**（假内核冒烟 ✔，待真终端验收）：审批面板（`approval/request` waterfall 应答者，FIFO 模态 picker，Enter/`1` 放行单次、`2`/Esc 拒绝，abort/`dispose` 以 `cancelled` 结算；`/yolo [on|off]` 为本地自动放行，开启时强制 policy 回 `ask` 以便请求到达；`/permission` 查看；`approval/asked-decided` 审计投影）· hooks 投影（`hook/invoked-result` 系统行，非常拦截只展示）· 状态栏插槽（标题 · yolo/never · `⑂` git 分支（`.git/HEAD` 2s 缓存，无子进程）· 压缩中徽标，kimi 两行式）· fullscreen 备用屏（`ORCA_FULLSCREEN=1` 进 `\x1b[?1049h`、退出恢复，不捕获鼠标以便终端原生选区复制）· 同进程热重载静默恢复（复用同一会话 + `sessionQuery.readSession` 日志重放，不再建新会话/刷欢迎卡；`agents.get/list` 与 `readSession` 镜像已对齐 dsh 0.1.2-alpha.5）
 - [x] **M5 体验加固**（真机 PTY 探针 ✔ 全流程 + live 真回合）：自建键盘解析器取代 node:readline keypress——根除孤立 ESC ~500ms `escapeCodeTimeout` 延迟与 Esc+按键被拼成 alt 组合、原始 CSI 灌入输入框的"菜单/picker 关不掉、输入框错乱"类问题（40ms Esc 窗口、序列跨块续传、未知 CSI 吞除、UTF-8 分片安全）；渲染器帧收缩后光标停靠修正（关菜单/关 picker 光标回到输入框行）；宽度换 `get-east-asian-width`，满宽行（盒卡/页脚/输入框）经 `asciiEllipses` 剥离歧义省略号——ConPTY 记 1 格 / CJK 终端记 2 格的 U+2026 会把恰好满宽的行在真终端顶换行、吃掉下一行（输入框底边框消失的根因）；思考过程 `Ctrl+O` 展开/折叠双向（页脚提示与 `/help` 同步）；`scripts/probe-pty.mjs` 以 ORCA_LOG 应用层字节流为断言真源的 ConPTY 回归探针（含 `--live` 流式真回合验证、`--fullscreen` 备用屏验证、app/ConPTY 双层屏断言）
-- [x] **M6 布局稳定 + fullscreen 重做**（冒烟 phase6/7 + 真机探针 ✔）：恒钉底——inline/fullscreen 一律 spacer 撑满视口，输入框从首帧固定在终端底边（"切完模型 UI 上移"类跳变不存在；M6 的 picker 闩锁已退役）；一次性通知常驻 live 置顶——欢迎卡/路由 slim 行只增不减，随内容自然溢出上卷（stream 只收曾上屏的行；flip 整块搬运必闪丢）；/ 菜单与选择器固定 9 行项目窗（不足补空行、溢出 ▲▼ 滚动），开关/过滤/切 stage 不再顶动转录区；fullscreen 重做为 pi-tui 式整屏窗口模式——备用屏无原生回滚区，不再走 scrollback 封存流，转录渲染为 channel 行的滑动窗口（溢出出『上方还有 N 行』头注）、chrome 恒钉底、帧恰好填满终端高度，欢迎/路由线改走 channel 系统行进窗口；活动区行统一过 `asciiEllipses`（差分绘制行不得含歧义宽度字符，否则终端换行导致绘制失步）；布局原则参照 terminal-ui skill（DevEx TUI 42 条规则）与 pi 的 inline/alt-screen 双模式
+- [x] **M6 布局稳定 + fullscreen 重做**（冒烟 phase6/7 + 真机探针 ✔）：恒钉底——inline/fullscreen 一律 spacer 撑满视口，输入框从首帧固定在终端底边（"切完模型 UI 上移"类跳变不存在）；/ 菜单与选择器固定 9 行项目窗（不足补空行、溢出 ▲▼ 滚动），开关/过滤/切 stage 不再顶动转录区；fullscreen 备用屏整屏窗口模式（转录滑动窗口 + 『上方还有 N 行』头注）；活动区行统一过 `asciiEllipses`（歧义宽度字符会致终端换行、绘制失步）；一次性通知常驻 live 置顶机制（M8 起改走 channel pin 行）；布局原则参照 terminal-ui skill 与 pi 的 inline/alt-screen 双模式
+- [x] **M8 流式沉淀渲染重构**（真机 PTY 探针 + `probe:scrollback` ConPTY scrollback 断言 ✔，真回合 ✔）：根治"新消息一来老的整块消失、滚不回去"——旧 painter 的相对光标算术在 live 帧超出视口后失准，封存行被覆盖、活动行被重影（ConPTY scrollback 实测：T1 只剩 3/14 行、同帧内容重复 6 次）。重写为 Ink/pi-tui 式**流式追加模型**：live 块（生长中行 + chrome）物理位置绝对跟踪（CUP），封存行从块顶顺序下写、靠终端自然滚动进入原生 scrollback——**逐行沉淀、零覆盖、零重影**；行级连续封存（user 行/完成的 tool 卡/思考摘要/已完成的 assistant 行定稿即沉淀，不再等下一回合批量）；欢迎卡/路由行改走 channel pin 行（首个 `turn/start` 随内容一起沉淀，日志序不丢）；`clearForSwitch` 后 flush 游标复位修复（回退消息永不上屏的根因）；`scripts/probe-scrollback.mjs` 新增——带 scrollback 的 ConPTY 端到端断言（历史完整可回溯 / 无 ghost / chrome 钉底），这类"渲染器 vs scrollback"的 bug 从此有专门的回归网。M6 的"一次性通知常驻 live 置顶"机制由 M8 的 channel pin 行替代
 - [x] **M7 输入体验 + 思考强度全链路**（冒烟 phase2/7/8/9 + 真机 PTY 探针 ✔）：
   - **思考强度不再丢**：`agentDefaultModel` 持久化的 `reasoningEffort` 全链路进入 `agentOptions` 与 `agent/request` waterfall 种子（对齐 dsh 0.1.2 `installModelSelection` / agent-loop `buildRequest` 镜像）；attach 时 seed 完整 selection（此前 waterfall 每请求把创建时带来的 effort 剥成模型默认——"模型配置正常但思考强度匹配不上"的根因）；插件级 `provider`/`model` 覆盖与 effort 合并而非互斥；选择器里显式选「默认（模型默认行为）」会被记住、不被持久化默认悄悄改回
   - **图片输入**：`/img <路径>` · `Ctrl+V` 剪贴板图片（Windows PowerShell 截图直入）· 括号粘贴/拖入图片路径自动识别；经 `dsh-attachment` 持久引用随下一条消息发送，输入框内渲染附件徽标，`user/message` 投影 `[图片×N]` 后缀

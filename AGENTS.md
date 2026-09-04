@@ -42,8 +42,8 @@ pnpm dev   # 假内核冒烟：TTTY 渲染循环、键盘、降级启动
 | --- | --- |
 | `src/index.ts` | 插件契约（保持轻量，延迟加载 runtime） |
 | `src/app.ts` | 装配：TTY 门 → agent 工厂 → channel/renderer/keyboard → 统一 disposer |
-| `src/adapter/channel.ts` | session/event → 转录行投影；submit/steer/cancel 动作入口 |
-| `src/tui/renderer.ts` | 差分渲染 + CSI 2026；帧输出唯一出口 |
+| `src/adapter/channel.ts` | session/event → 转录行投影 + 行级连续封存；submit/steer/cancel 动作入口 |
+| `src/tui/renderer.ts` | 流式追加渲染 + CUP 绝对寻址 + CSI 2026；封存行自然滚入 scrollback，帧输出唯一出口 |
 | `src/tui/chat.ts` | 纯函数帧构建（channel + editor + width → lines） |
 | `src/tui/input.ts` | raw 模式键盘解析 |
 | `src/tui/width.ts` | 显示宽度（占位实现，生产换 get-east-asian-width） |

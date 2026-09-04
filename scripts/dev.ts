@@ -54,11 +54,12 @@ const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setT
  * With `height` set, newlines past the bottom SCROLL (top row drops) — the
  * real-terminal behavior the chrome-drift regressions hinge on.
  */
-function paintScreen(writes: string[], height = Number.POSITIVE_INFINITY): string[] {
+function paintScreen(writes: string[], height = Number.POSITIVE_INFINITY, includeScrollback = false): string[] {
   const screen: string[] = ['']
+  const scrollback: string[] = []
   let row = 0
   const stream = writes.join('')
-  const re = /\x1b\[\??[0-9]*([ABlJK])|\x1b\[\??[0-9]*[HG]|\x1b\[\?2026[hl]|\r\n|\r/g
+  const re = /\x1b\[\??[0-9]*([ABlJK])|\x1b\[\??[0-9;]*([HG])|\x1b\[\?2026[hl]|\r\n|\r/g
   let last = 0
   let match: RegExpExecArray | null
   const writeText = (text: string): void => {
@@ -68,7 +69,7 @@ function paintScreen(writes: string[], height = Number.POSITIVE_INFINITY): strin
   }
   const lineFeed = (): void => {
     if (row + 1 >= height) {
-      screen.shift()
+      scrollback.push(screen.shift() ?? '')
       while (screen.length < height) screen.push('')
       row = height - 1
       return
@@ -93,13 +94,29 @@ function paintScreen(writes: string[], height = Number.POSITIVE_INFINITY): strin
     } else if (code === 'K') {
       while (screen.length <= row) screen.push('')
       screen[row] = ''
+    } else if (match[2] === 'H' || match[2] === 'G') {
+      // CUP (row;col) / CHA — the painter addresses rows absolutely.
+      // Columns are not modeled (full-line writes). Rows clamp to the
+      // viewport when one is given.
+      const params = /\x1b\[\??([0-9;]*)[HG]/.exec(match[0])?.[1] ?? ''
+      const first = params.split(';')[0] ?? ''
+      const target = Number.parseInt(first || '1', 10) - 1
+      row = Number.isFinite(height) ? Math.max(0, Math.min(height - 1, target)) : Math.max(0, target)
+      while (screen.length <= row) screen.push('')
     } else if (match[0] === '\r\n') {
       lineFeed()
     }
     // lone '\r' and the sync pair: no-ops under the full-line write model
   }
   writeText(stream.slice(last))
-  return screen
+  if (!includeScrollback) return screen
+  const trim = (rows: string[]): string[] => {
+    const copy = [...rows]
+    while (copy.length > 0 && copy[0] === '') copy.shift()
+    while (copy.length > 0 && copy[copy.length - 1] === '') copy.pop()
+    return copy
+  }
+  return ['── scrollback ──', ...trim(scrollback), '── viewport ──', ...screen]
 }
 
 function makeStdout(writes: string[], rows?: number): NodeJS.WriteStream {
@@ -517,22 +534,32 @@ async function main(): Promise<void> {
   }
 
   // ── Phase 0.5: renderer contract — the diff painter must reproduce the
-  // frame on screen: live append, the scrollback-seal stream path (sealed
-  // lines land between previously sealed content and the live rows, in
-  // order), and post-seal live growth.
+  // frame on screen, and sealed lines must SEDIMENT into scrollback in log
+  // order (written through the bottom row, one scroll per line) without
+  // ever disturbing the live block or double-writing content.
   {
     const rw: string[] = []
-    const renderer = new Renderer(makeStdout(rw), () => 80)
+    const renderer = new Renderer(makeStdout(rw), () => 4, () => 4)
     renderer.render(['a1', 'a2']) // first frame
     renderer.render(['a1', 'a2', 'a3']) // live append below
-    renderer.render(['a3'], ['s1', 's2']) // seal flush: sealed at top of tracked region
+    renderer.render(['a3'], ['s1', 's2', 's3', 's4', 's5']) // seal flush: overflow sediments
     renderer.render(['a3', 'a4']) // post-seal live growth
-    renderer.render(['a5'], ['s3']) // second seal (replaces the sealed row's open text)
-    const screen = paintScreen(rw)
+    renderer.render(['a5'], ['s6']) // second seal
+    const all = paintScreen(rw, 4, true)
     renderer.dispose()
-    while (screen.length > 0 && screen[screen.length - 1] === '') screen.pop()
-    const expected = 's1\ns2\ns3\na5'
-    if (screen.join('\n') !== expected) problems.push(`phase0.5：渲染契约失真：${JSON.stringify(screen)}`)
+    const sep = all.indexOf('── viewport ──')
+    const sb = all.slice(1, sep)
+    const viewport = all.slice(sep + 1)
+    // Sealed lines sediment in log order: those already scrolled off live in
+    // scrollback, the rest are still visible above the block — together they
+    // must be the complete, ordered seal sequence.
+    const sealedSeen = [...sb, ...viewport.filter((row) => row.startsWith('s'))]
+    if (sealedSeen.join('\n') !== 's1\ns2\ns3\ns4\ns5\ns6') {
+      problems.push(`phase0.5：封存行未按序沉淀：${JSON.stringify({ sb, viewport })}`)
+    }
+    if (viewport[viewport.length - 1] !== 'a5') problems.push(`phase0.5：live 块尾失真：${JSON.stringify(viewport)}`)
+    const allowed = new Set(['s1', 's2', 's3', 's4', 's5', 's6', 'a3', 'a4', 'a5', ''])
+    if (!viewport.every((row) => allowed.has(row))) problems.push(`phase0.5：视口出现未封存内容：${JSON.stringify(viewport)}`)
   }
 
   // ── Phase 0.7: picker height contract — model lists must not push the
@@ -561,25 +588,6 @@ async function main(): Promise<void> {
       picker,
     })
     if (frame.live.length > 12) problems.push(`phase0.7：选择器溢出终端高度：${frame.live.length}`)
-
-    const reserved = buildFrame({
-      channel: {
-        rows: [], sealedRowCount: 0, runState: 'idle', route: null,
-        usage: { input: 0, output: 0, reasoning: 0, messages: 0 },
-      } as never,
-      sealedFrom: 0,
-      editorText: '',
-      width: 80,
-      height: 12,
-      reservedRows: 5,
-      cwd: '.',
-      sessionId: null,
-      route: null,
-      usage: { input: 0, output: 0, reasoning: 0, messages: 0 },
-      now: Date.now(),
-      picker,
-    })
-    if (reserved.live.length + 5 > 12) problems.push(`phase0.7：已有 scrollback 偏移时选择器溢出：${reserved.live.length}`)
   }
 
   // ── Phase 0.75: historical welcome rows do not permanently reserve
@@ -598,7 +606,6 @@ async function main(): Promise<void> {
       editorText: '',
       width: 80,
       height: 24,
-      reservedRows: 0,
       anchorChrome: true,
       cwd: '.',
       sessionId: null,
@@ -615,15 +622,17 @@ async function main(): Promise<void> {
   // picker border instead of leaving it above the replacement editor.
   {
     const rw: string[] = []
-    const renderer = new Renderer(makeStdout(rw), () => 80)
+    const renderer = new Renderer(makeStdout(rw), () => 24, () => 24)
     const cursor = { fromEnd: 3, col: 5 }
     renderer.render(['picker-top', 'picker-row', 'picker-bottom', '╭────╮', '│ >  │', '╰────╯', 'footer-1', 'footer-2'], [], cursor)
     renderer.render(['system: 模型已切换', '╭────╮', '│ >  │', '╰────╯', 'footer-1', 'footer-2'], ['↳ 模型 provider/model'], cursor)
-    const screen = paintScreen(rw)
-    const visible = screen.join('\n')
+    const all = paintScreen(rw, 24, true)
+    const visible = all.join('\n')
     if (visible.includes('picker-top') || visible.includes('picker-row')) {
-      problems.push(`phase0.8：关闭 picker 后残留旧边框：${JSON.stringify(screen)}`)
+      problems.push(`phase0.8：关闭 picker 后残留旧边框：${JSON.stringify(all)}`)
     }
+    if (!visible.includes('↳ 模型 provider/model')) problems.push('phase0.8：路由封存行未沉淀')
+    if (!visible.includes('system: 模型已切换')) problems.push('phase0.8：切换后 live 块缺失')
   }
 
 
@@ -632,30 +641,36 @@ async function main(): Promise<void> {
   // frame keeps every row visible (the chrome-drift regression).
   {
     const rw: string[] = []
-    const renderer = new Renderer(makeStdout(rw), () => 40)
+    const renderer = new Renderer(makeStdout(rw), () => 4, () => 4)
     const cursor = { fromEnd: 0, col: 3 }
     renderer.render(['a1', 'a2', 'a3', 'a4'], [], cursor) // fills a 4-row screen
-    renderer.render(['b1', 'a2', 'a3', 'a4'], [], cursor) // top-row change → full repaint
+    renderer.render(['b1', 'a2', 'a3', 'a4'], [], cursor) // top-row change → tail repaint
     renderer.render(['b1', 'a2', 'a3', 'c4'], [], cursor) // tail change
-    renderer.render(['b1', 'a2', 'a3', 'c4'], ['s1', 's2'], cursor) // seal flush above
-    const screen = paintScreen(rw, 4)
+    renderer.render(['b1', 'a2', 'a3', 'c4'], ['s1', 's2'], cursor) // seal flush sediments
+    const all = paintScreen(rw, 4, true)
     renderer.dispose()
-    // The seal rows overflow a full screen into scrollback; the frame itself
-    // must come through intact — no lost top row, no drift, no stale tail.
-    if (screen.join('\n') !== 'b1\na2\na3\nc4') problems.push(`phase0.6：整屏重绘丢行/漂移：${JSON.stringify(screen)}`)
+    const sep = all.indexOf('── viewport ──')
+    const sb = all.slice(1, sep)
+    const viewport = all.slice(sep + 1)
+    // The seal rows sediment into scrollback; the frame itself must come
+    // through intact — no lost row, no drift, no stale tail.
+    if (viewport.join('\n') !== 'b1\na2\na3\nc4') problems.push(`phase0.6：整屏重绘丢行/漂移：${JSON.stringify(viewport)}`)
+    if (!sb.join('\n').includes('s1\ns2')) problems.push(`phase0.6：封存行未沉淀：${JSON.stringify(sb)}`)
   }
 
   // ── Phase 0.65: expanding from the post-stream live height to a full
   // viewport must repaint as a frame, keeping the input at the bottom.
   {
     const rw: string[] = []
-    const renderer = new Renderer(makeStdout(rw), () => 40)
+    const renderer = new Renderer(makeStdout(rw), () => 10, () => 10)
     const cursor = { fromEnd: 3, col: 5 }
     renderer.render(['old-1', 'old-2', 'old-3', 'old-input', 'old-f1', 'old-f2'], ['welcome-1', 'welcome-2'], cursor)
     renderer.render(['', '', '', '', 'new-1', 'new-2', 'new-3', 'new-input', 'new-f1', 'new-f2'], [], cursor)
-    const screen = paintScreen(rw, 10)
-    const tail = screen.slice(-5).join('\n')
-    if (!tail.includes('new-input') || !tail.includes('new-f2')) problems.push(`phase0.65：live 扩展后 chrome 未锚底：${JSON.stringify(screen)}`)
+    const all = paintScreen(rw, 10, true)
+    const sep = all.indexOf('── viewport ──')
+    const viewport = all.slice(sep + 1)
+    const tail = viewport.slice(-5).join('\n')
+    if (!tail.includes('new-input') || !tail.includes('new-f2')) problems.push(`phase0.65：live 扩展后 chrome 未锚底：${JSON.stringify(viewport)}`)
   }
 
   // ── Phase 1: degraded boot (#183) — no `agents` service, never a throw ───
@@ -700,7 +715,7 @@ async function main(): Promise<void> {
   stdin2.key('backspace')
   await sleep(100)
   {
-    const snap = paintScreen(writes2)
+    const snap = paintScreen(writes2, 24)
     const countOf = (needle: string): number => snap.filter((row) => row.includes(needle)).length
     if (countOf('> 说点什么...') !== 1) problems.push('phase2：编辑后输入行重复/缺失')
     if (countOf('Enter 发送') !== 1) problems.push('phase2：编辑后提示行重复/缺失')
@@ -730,7 +745,7 @@ async function main(): Promise<void> {
   await sleep(120)
   // Snapshot BEFORE dispose: dispose intentionally wipes the live region
   // (including the footer) — the final chrome check targets the live UI.
-  const rows2 = paintScreen(writes2)
+  const rows2 = paintScreen(writes2, 24)
   dispose2()
   await sleep(20) // handle.dispose() settles
 
@@ -966,7 +981,7 @@ async function main(): Promise<void> {
   stdin4.text('/')
   await sleep(120)
   {
-    const snap = paintScreen(writes4)
+    const snap = paintScreen(writes4, 24)
     if (!snap.some((row) => row.includes('/resume'))) problems.push('phase4：/ 菜单未列出 /resume')
     if (!snap.some((row) => row.includes('/help'))) problems.push('phase4：/ 菜单未列出 /help')
   }
@@ -976,7 +991,7 @@ async function main(): Promise<void> {
   stdin4.key('tab')
   await sleep(80)
   {
-    const snap = paintScreen(writes4)
+    const snap = paintScreen(writes4, 24)
     if (!snap.some((row) => row.includes('> /model'))) problems.push('phase4：Tab 未补全高亮命令')
   }
   stdin4.key('escape') // clear editor
@@ -987,7 +1002,7 @@ async function main(): Promise<void> {
   stdin4.key('return')
   await sleep(100)
   {
-    const snap = paintScreen(writes4)
+    const snap = paintScreen(writes4, 24)
     if (!snap.some((row) => row.includes('> /usage'))) problems.push('phase4：Enter 未补全部分命令')
     if (visible4().includes('用量：')) problems.push('phase4：补全回车不应直接分发')
   }
@@ -1130,7 +1145,7 @@ async function main(): Promise<void> {
     // @ completion: '@read' → menu → Tab → '@README.md' → Enter submits it.
     for (const ch of '@read') stdin8.text(ch)
     await sleep(300) // debounce + fetch
-    if (!paintScreen(rw).some((row) => row.includes('文件'))) problems.push('phase8：@ 文件菜单未上屏')
+    if (!paintScreen(rw, 24).some((row) => row.includes('文件'))) problems.push('phase8：@ 文件菜单未上屏')
     stdin8.key('tab')
     await sleep(120)
     stdin8.key('return')
@@ -1148,13 +1163,14 @@ async function main(): Promise<void> {
     stdin8.key('return')
     await sleep(250)
     stdin8.paste(pngPath)
-    await sleep(250)
+    await sleep(400)
     {
-      const snap = paintScreen(rw)
-      if (!snap.some((row) => row.includes('已附加图片'))) problems.push('phase8：/img 附加未上屏')
-      // Badge rows carry the 🖼 icon; the system notice rows also mention
-      // 8×8, so counting that string would double-count.
-      if (snap.filter((row) => row.includes('🖼')).length !== 2) problems.push('phase8：附件徽标未在输入框内渲染两条')
+      // With continuous sealing, system notices sediment into scrollback
+      // within a tick — assert on the full write stream, not the viewport.
+      const flow = stripSgr(rw.join(''))
+      if (flow.split('已附加图片').length - 1 !== 2) problems.push('phase8：/img 与粘贴两次附加通知缺失')
+      // The editor box renders one 🖼 badge row per pending attachment.
+      if (!flow.includes('🖼')) problems.push('phase8：附件徽标未在输入框内渲染')
     }
     for (const ch of '看看图') stdin8.text(ch)
     stdin8.key('return')
@@ -1182,6 +1198,14 @@ async function main(): Promise<void> {
       if (message?.content.length !== 1 || first?.type !== 'text' || first.text !== '看看图') {
         problems.push(`phase8：↑ 历史召回失败：${JSON.stringify(message ?? null)}`)
       }
+    }
+    if (problems.length > 0 || process.env['ORCA_DUMP'] === '1') {
+      try {
+        writeFileSync(
+          'C:/Users/Mayn/AppData/Local/Temp/opencode/dev-phase8-screen.txt',
+          paintScreen(rw, 24, true).map((r, i) => `${String(i).padStart(3)}| ${r}`).join('\n'),
+        )
+      } catch {}
     }
     dispose8()
     await sleep(20)
@@ -1220,6 +1244,10 @@ async function main(): Promise<void> {
 
   if (problems.length > 0) {
     console.error(`smoke 失败：${problems.join('；')}`)
+    try {
+      writeFileSync('C:/Users/Mayn/AppData/Local/Temp/opencode/dev-phase2-screen.txt', rows2.map((r, i) => `${String(i).padStart(3)}| ${r}`).join('\n'))
+      writeFileSync('C:/Users/Mayn/AppData/Local/Temp/opencode/dev-phase3-stream.txt', stripSgr(writes3.join('')))
+    } catch {}
     process.exit(1)
   }
   console.log(

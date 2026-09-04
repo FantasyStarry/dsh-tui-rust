@@ -32,6 +32,17 @@ export interface TranscriptRow {
   seconds?: number
   /** Tool rows: result diff card (dsh-tool-fs write/edit meta). */
   diff?: ToolDiffView
+  /**
+   * Pre-rendered lines (welcome card, route lines) pushed verbatim — the row
+   * paints them as-is instead of styling `text`.
+   */
+  rawLines?: readonly string[]
+  /**
+   * Pinned rows hold the seal back: they stay in the live region (visible
+   * chrome like the welcome card) until an explicit seal-all — the first
+   * `turn/start` — flushes them together with the content that follows.
+   */
+  pinned?: boolean
   /** Monotonic frame counter bump marker for the renderer. */
   seq: number
 }
@@ -240,9 +251,11 @@ export class Channel {
   version = 0
   /**
    * Rows [0, sealedRowCount) are FINAL: their text will never change again,
-   * so the view may flush them into terminal scrollback. Advanced on
-   * `turn/start` — everything the previous turns produced is history by
-   * then; rows arriving during the current turn stream in the live region.
+   * so the view flushes them into terminal scrollback continuously — the
+   * Claude-Code-style gradual sedimentation. `advanceSeal` raises the cursor
+   * to the leading run of final rows after every mutation; `turn/start` (and
+   * compaction boundaries) seal ALL rows explicitly, which also releases the
+   * pinned welcome/route rows together with the first turn's content.
    */
   sealedRowCount = 0
   /** Latest route recorded by `request/header` — session truth, not UI state. */
@@ -306,6 +319,10 @@ export class Channel {
           }
           this.version++
         }
+        // The message is complete: close the open assistant row so it
+        // sediments into scrollback immediately instead of staying live
+        // until the next tool call or turn boundary.
+        this.openAssistantId = null
         break
       }
       case 'turn/end': {
@@ -521,6 +538,43 @@ export class Channel {
         break
       }
     }
+    this.advanceSeal()
+  }
+
+  /**
+   * A row is final once nothing will append to it again: finished tool cards,
+   * sealed thoughts, and any non-open assistant/user/system row. The open
+   * assistant row (still streaming) and pinned chrome rows hold the seal.
+   */
+  private isRowFinal(row: TranscriptRow): boolean {
+    if (row.pinned === true) return false
+    switch (row.kind) {
+      case 'tool':
+        return row.status === 'ok' || row.status === 'failed'
+      case 'thought':
+        return row.seconds !== undefined
+      default:
+        return row.id !== this.openAssistantId
+    }
+  }
+
+  /**
+   * Raise `sealedRowCount` to the leading run of final rows. Called after
+   * every projection mutation so finished rows sediment into scrollback
+   * continuously instead of waiting for the next turn boundary.
+   */
+  private advanceSeal(): void {
+    let n = this.sealedRowCount
+    const rows = this.rows
+    while (n < rows.length) {
+      const row = rows[n]
+      if (!row || !this.isRowFinal(row)) break
+      n++
+    }
+    if (n > this.sealedRowCount) {
+      this.sealedRowCount = n
+      this.version++
+    }
   }
 
   /** A user prompt submitted from the editor (used by tests and the fake kernel). */
@@ -528,11 +582,26 @@ export class Channel {
     this.sealThought()
     this.openAssistantId = null
     this.rows.push({ id: ++rowId, kind: 'user', text, seq: ++this.version })
+    this.advanceSeal()
   }
 
   /** Local notice (connection loss, resume hint, …) — never model-visible. */
   pushSystem(text: string): void {
     this.rows.push({ id: ++rowId, kind: 'system', text, seq: ++this.version })
+    this.advanceSeal()
+  }
+
+  /**
+   * Pre-rendered chrome lines (welcome card, route lines) pushed verbatim.
+   * Pinned rows stay in the live region — visible chrome — until the first
+   * `turn/start` seal-all flushes them together with the turn's content, so
+   * they age into scrollback in log order instead of vanishing.
+   */
+  pushRaw(lines: readonly string[], pinned = false): void {
+    const row: TranscriptRow = { id: ++rowId, kind: 'system', text: '', rawLines: lines, seq: ++this.version }
+    if (pinned) row.pinned = true
+    this.rows.push(row)
+    if (!pinned) this.advanceSeal()
   }
 
   /**

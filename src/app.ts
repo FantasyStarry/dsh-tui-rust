@@ -553,8 +553,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the fresh session.
     }
     channel.clearForSwitch()
-    welcomeRows = null
-    slimRows = []
     welcomed = true // suppress the one-time welcome on switches
     await createAgent()
   }
@@ -582,6 +580,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
           await sleep(FACTORY_RETRY_DELAY_MS)
           continue
         }
+        dbg(`createAgent 失败：${message}`)
         channel.pushSystem(`agent 启动失败：${message}`)
         return
       }
@@ -1044,8 +1043,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the resumed session.
     }
     channel.clearForSwitch()
-    welcomeRows = null
-    slimRows = []
     welcomed = true
     await createAgent(resumeId)
     // Best-effort: replay the persisted log so the transcript is not empty
@@ -1111,10 +1108,10 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the rewound session.
     }
     channel.clearForSwitch()
-    welcomeRows = null
-    slimRows = []
     welcomed = true
+    dbg('doRewind: start')
     await createAgent(childSessionId)
+    dbg('doRewind: createAgent done')
     channel.pushSystem(`已回退到上一轮（fork ${shortSessionLabel(childSessionId)}）`)
   }
 
@@ -1760,78 +1757,47 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   let welcomed = false
   let lastRouteKey = ''
   // Live-pinned notices (welcome card + route slim lines): built once at
-  // connect, rendered at the live top until overfill-scroll ages them off
-  // gradually. See the render-block comment for why flips are forbidden.
-  let welcomeRows: string[] | null = null
-  let slimRows: string[] = []
+  // One-time notices are CHANNEL rows now (M8 unified pipeline): the
+  // welcome card and the connect-time route line are pushed PINNED — they
+  // stay in the live block until the first turn/start seal-all releases
+  // them together with the turn's content, then age into scrollback in log
+  // order. Mid-session route changes are unpinned and sediment immediately
+  // (the footer always shows the live route). Inline and fullscreen share
+  // the same path; the painter guarantees no loss on either.
   const render = (): void => {
     const fullscreen = config.fullscreen === true
-    // 总是钉底：inline/fullscreen 一律 spacer 撑满视口，输入框从首帧起固定在终端底边。
-    const anchorChrome = true
     const route = selection ?? channel.route
     const cwd = process.cwd()
     const title = channel.title ?? safeTitleGetCached()
-    const stream: string[] = []
-    // One-time notices — deferred until the agent connects so the
-    // Session/Model rows carry real values instead of `—`/`未设置`.
-    // Inline pins them at the live top for the whole session (built once,
-    // cleared only on session switch): the transcript keeps its full
-    // budget, and any overflow overfill-scrolls — the top ages gradually
-    // instead of vanishing in one jump. Flipping a never-live stream row
-    // kills it in a single tick (the vanished-welcome regression), so
-    // notices are never flipped. Afterwards only route changes append slim
-    // lines (capped at 3 — the footer always shows the live route).
-    // Fullscreen has no native scrollback, so its notices go through the
-    // channel and render inside the transcript window instead.
-    if (!welcomed) {
-      if (agent) {
-        welcomed = true
-        const routeModel = route ? `${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}` : null
-        if (fullscreen) {
-          channel.pushSystem(`✦ orca 已连接 · session ${shortSessionLabel(agent.session.id)}`)
-        } else {
-          welcomeRows = [...welcomeCard(process.cwd(), agent.session.id, routeModel, stdout.columns ?? 80)]
-        }
-        if (route) {
-          const line = routeLine(route)
-          if (fullscreen) channel.pushSystem(line)
-          else slimRows = [...slimRows, line].slice(-3)
-          lastRouteKey = routeKey(route)
-        }
+    // A session switch cleared the channel rows out from under the flush
+    // cursor — rows pushed AFTER the clear would fall between the stale
+    // cursor and the fresh seal and never reach the screen.
+    if (flushedSealed > channel.rows.length) flushedSealed = 0
+    if (!welcomed && agent) {
+      welcomed = true
+      const routeModel = route ? `${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}` : null
+      channel.pushRaw(welcomeCard(process.cwd(), agent.session.id, routeModel, stdout.columns ?? 80), true)
+      if (route) {
+        channel.pushRaw([routeLine(route)], true)
+        lastRouteKey = routeKey(route)
       }
-    } else if (route) {
+    } else if (welcomed && route) {
       const key = routeKey(route)
       if (key !== lastRouteKey) {
         lastRouteKey = key
-        const line = routeLine(route)
-        if (fullscreen) channel.pushSystem(line)
-        else slimRows = [...slimRows, line].slice(-3)
+        channel.pushRaw([routeLine(route)])
       }
     }
-    const notices = fullscreen ? null : [...(welcomeRows ?? []), ...slimRows]
-    const menu = currentMenu()
-    const atState = currentAtMenu()
-    const editorCtx = {
-      editorCursor: cursorPos,
-      attachments: attachmentLabels(),
-      atMenu: atState,
-    }
-    let frame = buildFrame({
+    const frame = buildFrame({
       channel,
       sealedFrom: flushedSealed,
       editorText: editor,
-      ...editorCtx,
+      editorCursor: cursorPos,
+      attachments: attachmentLabels(),
+      atMenu: currentAtMenu(),
       width: stdout.columns ?? 80,
       height: stdout.rows ?? 24,
-      // Include rows about to be written into scrollback in this frame's
-      // budget. Otherwise the first welcome frame (or a route-change line)
-      // plus a full-height padded live frame would scroll the terminal.
-      // Only rows written by THIS render occupy space above the live frame.
-      // Historical welcome/route rows are already in scrollback and must not
-      // permanently reduce the chat viewport.
-      reservedRows: stream.length,
-      anchorChrome,
-      notices,
+      anchorChrome: true,
       fullscreen,
       cwd,
       sessionId: agent?.session.id ?? null,
@@ -1839,7 +1805,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       usage: channel.usage,
       now: Date.now(),
       picker,
-      commandMenu: menu,
+      commandMenu: currentMenu(),
       thoughtExpanded,
       connecting: agent === null,
       title,
@@ -1847,44 +1813,19 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       yolo: yoloMode,
       branch: gitBranch(cwd),
     })
-    // Sealed transcript rows are discovered while building the frame; fold
-    // their stream height into a second pass so bottom chrome remains fixed
-    // even when a turn ends while a picker is open.
-    if (frame.stream.length > 0) {
-      frame = buildFrame({
-        channel,
-        sealedFrom: flushedSealed,
-        editorText: editor,
-        ...editorCtx,
-        width: stdout.columns ?? 80,
-        height: stdout.rows ?? 24,
-        reservedRows: stream.length + frame.stream.length,
-        anchorChrome,
-        notices,
-      fullscreen,
-        cwd,
-        sessionId: agent?.session.id ?? null,
-        route,
-        usage: channel.usage,
-        now: Date.now(),
-        picker,
-        commandMenu: menu,
-        thoughtExpanded,
-        connecting: agent === null,
-        title,
-        policy: approvalPolicy,
-        yolo: yoloMode,
-        branch: gitBranch(cwd),
-      })
-    }
-    stream.push(...frame.stream)
-    renderer.render(frame.live, stream, frame.cursor)
+    renderer.render(frame.live, frame.stream, frame.cursor)
     flushedSealed = Math.min(channel.sealedRowCount, channel.rows.length)
   }
 
   // ~30fps render tick; the diff painter collapses no-op frames to zero
   // writes, so a fixed tick is cheap even while idle.
-  const tick = setInterval(render, 33)
+  const tick = setInterval(() => {
+    try {
+      render()
+    } catch (error) {
+      dbg(`render 失败：${error instanceof Error ? (error.stack ?? error.message) : String(error)}`)
+    }
+  }, 33)
   // Own the screen: clear the viewport so orca starts from a clean slate
   // (shell residue stays in scrollback, one scroll away). In fullscreen
   // mode take the alternate buffer instead — the pre-orca screen is
