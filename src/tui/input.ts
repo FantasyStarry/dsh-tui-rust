@@ -17,6 +17,9 @@
  * - multibyte UTF-8 survives chunk splits (StringDecoder);
  * - Kitty CSI-u / xterm modifyOtherKeys printable sequences decode to text
  *   (`\x1b[97;1u` → `a`; release `:3` events swallowed, see `./keys.js`);
+ * - bracketed paste (CSI 200~ … 201~, enabled by the app) arrives as ONE
+ *   burst through the optional `onPaste` callback instead of a keystroke
+ *   replay that would submit on the first embedded newline;
  * - names mirror the old readline surface the app already keys off
  *   ('return' for \r, 'backspace' for \x7f/\x08, ctrl+letter for C0).
  */
@@ -81,17 +84,23 @@ function csiTildeKey(params: string): string | null {
 
 export class Keyboard {
   private readonly handler: KeyHandler
+  private readonly onPaste: ((text: string) => void) | null
   private active = false
   /** Decoded but not yet parsed input (partial sequences wait here). */
   private pending = ''
   private readonly decoder = new StringDecoder('utf8')
   private escTimer: NodeJS.Timeout | null = null
+  /** Inside a bracketed paste (CSI 200~ … 201~): chars buffer as one burst. */
+  private pasting = false
+  private pasteBuf = ''
 
   constructor(
     private readonly stdin: NodeJS.ReadStream,
     handler: KeyHandler,
+    onPaste?: (text: string) => void,
   ) {
     this.handler = handler
+    this.onPaste = onPaste ?? null
   }
 
   start(): void {
@@ -109,6 +118,8 @@ export class Keyboard {
     this.stdin.pause()
     this.clearEscTimer()
     this.pending = ''
+    this.pasting = false
+    this.pasteBuf = ''
     this.active = false
   }
 
@@ -126,6 +137,16 @@ export class Keyboard {
     this.clearEscTimer()
     this.parse()
     this.armEscTimer()
+  }
+
+  /** End a bracketed paste: deliver the whole burst at once. */
+  private endPaste(): void {
+    this.pasting = false
+    const text = this.pasteBuf
+    this.pasteBuf = ''
+    if (text === '') return
+    if (this.onPaste) this.onPaste(text)
+    else for (const ch of text) this.handler(decodeChar(ch))
   }
 
   /**
@@ -150,11 +171,28 @@ export class Keyboard {
   private parse(): void {
     for (;;) {
       if (this.pending === '') return
+      if (this.pending.startsWith(ESC + '[200~')) {
+        // Bracketed paste start — everything until 201~ is one burst.
+        this.pending = this.pending.slice(6)
+        this.pasting = true
+        this.pasteBuf = ''
+        continue
+      }
+      if (this.pending.startsWith(ESC + '[201~')) {
+        this.pending = this.pending.slice(6)
+        if (this.pasting) this.endPaste()
+        continue
+      }
       if (!this.pending.startsWith(ESC)) {
-        // Plain run: everything up to the next ESC (or the end).
+        // Plain run: everything up to the next ESC (or the end). Inside a
+        // bracketed paste the run joins the burst instead of the editor.
         const next = this.pending.indexOf(ESC, 1)
         const run = next === -1 ? this.pending : this.pending.slice(0, next)
         this.pending = next === -1 ? '' : this.pending.slice(next)
+        if (this.pasting) {
+          this.pasteBuf += run
+          continue
+        }
         for (const ch of run) this.handler(decodeChar(ch))
         continue
       }
@@ -204,7 +242,7 @@ export class Keyboard {
     }
     let name: string | null
     if (final === '~') name = csiTildeKey(params)
-    else if (final === 'Z') name = 'tab' // shift-tab: shift flag not needed
+    else if (final === 'Z') name = 'tab' // `\x1b[Z` is always shift-tab
     else name = CSI_KEYS[final] ?? null
     if (!name) return
     // `1;5A` style modifiers: second param = bitmask+1 (1 shift, 2 alt, 4 ctrl).
@@ -215,7 +253,7 @@ export class Keyboard {
       name,
       ctrl: (bits & 4) !== 0,
       alt: (bits & 2) !== 0,
-      shift: (bits & 1) !== 0,
+      shift: final === 'Z' ? true : (bits & 1) !== 0,
       sequence,
     })
   }

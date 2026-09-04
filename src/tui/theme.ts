@@ -81,6 +81,8 @@ export interface PaletteSpec {
   placeholder: Paint
   /** User-message role color: amber bold bullet + text. */
   roleUser: Paint
+  /** Editor cursor: the char under the logical cursor (reverse video). */
+  cursor: Paint
   /** Tool-card background fill + frame. */
   panel: Paint
   panelBorder: Paint
@@ -107,6 +109,7 @@ const truecolorPalette: PaletteSpec = {
   quote: rgb(156, 156, 156), // #9C9C9C
   placeholder: pair('\x1b[2;3m\x1b[38;2;128;128;128m', '\x1b[39m\x1b[23m\x1b[22m'), // dim italic
   roleUser: pair('\x1b[1m\x1b[38;2;255;203;107m', '\x1b[39m\x1b[22m'), // #FFCB6B bold
+  cursor: pair('\x1b[7m', '\x1b[27m'), // reverse video
   panel: bg(38, 42, 48), // #262A30
   panelBorder: rgb(111, 111, 111), // #6F6F6F
   codeBg: bg(23, 26, 30), // #171A1E
@@ -130,6 +133,7 @@ const palette256: PaletteSpec = {
   quote: c256(244),
   placeholder: pair('\x1b[2;3;38;5;242m', '\x1b[39m\x1b[23m\x1b[22m'),
   roleUser: pair('\x1b[1;38;5;221m', '\x1b[39m\x1b[22m'),
+  cursor: pair('\x1b[7m', '\x1b[27m'), // reverse video
   panel: bg256(236),
   panelBorder: c256(241),
   codeBg: bg256(234),
@@ -153,6 +157,7 @@ const plainPalette: PaletteSpec = {
   quote: (t) => t,
   placeholder: (t) => t,
   roleUser: (t) => t,
+  cursor: (t) => t,
   panel: (t) => t,
   panelBorder: (t) => t,
   codeBg: (t) => t,

@@ -17,20 +17,28 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { spawn } from 'node:child_process'
+import { existsSync, readFileSync, readdirSync, unlinkSync, appendFileSync, writeFileSync } from 'node:fs'
+import { basename, isAbsolute, join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 import { Channel } from './adapter/channel.js'
 import type { SessionRoute } from './adapter/channel.js'
 import type { OrcaConfig } from './index.js'
 import type {
   Agent,
   AgentHandle,
+  ContentBlock,
+  FileReferenceCandidate,
+  ImageAttachmentRef,
+  ImageMediaType,
   KernelAgentDefaultModel,
   KernelAgentsService,
   KernelApprovalPolicy,
   KernelApprovalService,
+  KernelAttachmentStore,
   KernelCommandsService,
   KernelContext,
+  KernelFileReferenceService,
   KernelLlmService,
   KernelLoader,
   KernelSessionQueryService,
@@ -82,6 +90,7 @@ interface SlashCommand {
 const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'help', aliases: ['h', '?'], group: '信息', description: '显示命令帮助' },
   { name: 'model', aliases: [], group: '账号/配置', description: '切换模型（provider → 模型 → 思考强度）' },
+  { name: 'img', aliases: ['image'], group: '输入', description: '附加本地图片（/img <路径>，可多条，随下条消息发送）' },
   { name: 'new', aliases: ['clear'], group: '会话', description: '丢弃当前上下文，开新会话' },
   { name: 'resume', aliases: ['sessions'], group: '会话', description: '浏览并恢复历史会话' },
   { name: 'title', aliases: ['rename'], group: '会话', description: '查看或设置会话标题' },
@@ -159,6 +168,9 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   const getCommands = (): KernelCommandsService | undefined => ctx.get<KernelCommandsService>('commands', false)
   const getApproval = (): KernelApprovalService | undefined => ctx.get<KernelApprovalService>('approval', false)
   const getSessions = (): KernelSessionsService | undefined => ctx.get<KernelSessionsService>('sessions', false)
+  const getAttachments = (): KernelAttachmentStore | undefined => ctx.get<KernelAttachmentStore>('attachments', false)
+  const getFileReferences = (): KernelFileReferenceService | undefined =>
+    ctx.get<KernelFileReferenceService>('fileReferences', false)
 
   let handle: AgentHandle | null = null
   let agent: Agent | null = null
@@ -175,6 +187,9 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   /** Live model selection — overrides the request route via the waterfall. */
   let selection: SessionRoute | null = null
+  /** The user explicitly chose 模型默认行为 in the effort picker — a real
+   * "no effort" choice that persisted defaults must not silently undo. */
+  let effortCleared = false
   let picker: PickerState | null = null
   let pickerStage: PickerStage | null = null
   const listenerDisposers: Array<() => void> = []
@@ -294,7 +309,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }),
   )
 
-  const submit = (text: string): void => {
+  const submit = (text: string, images: readonly ImageAttachmentRef[] = []): void => {
     const slash = parseSlash(text.trim())
     if (slash) {
       const cmd = findSlash(slash.name)
@@ -332,9 +347,15 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       channel.pushSystem('agent 未就绪，输入被丢弃')
       return
     }
+    // A lone image path (drag-drop fallback for terminals without bracketed
+    // paste) attaches instead of sending the path as a prompt.
+    if (images.length === 0 && looksLikeImagePath(text.trim()) && existsSync(resolvePath(text.trim()))) {
+      void attachImageFile(text.trim())
+      return
+    }
     // No optimistic echo: the user row is projected from the kernel's
     // `user/message` event, so the transcript stays a pure log projection.
-    agent.followup(buildUserMessage(text))
+    agent.followup(buildUserMessage(text, images))
   }
 
   const dispatchSlash = (name: string, args: string): void => {
@@ -344,6 +365,9 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         break
       case 'model':
         openModelPicker()
+        break
+      case 'img':
+        void doImage(args)
         break
       case 'usage':
         showUsage()
@@ -398,7 +422,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     for (const [group, lines] of groups) {
       channel.pushSystem(`【${group}】${lines.join(' · ')}`)
     }
-    channel.pushSystem('快捷键：Ctrl+O 展开思考过程 · 双击 Esc 回退上一轮 · 未知 /命令将作为普通消息发给模型')
+    channel.pushSystem('快捷键：@ 文件补全（Tab/Enter 确认）· Ctrl+V 附加剪贴板图片 · ↑ 召回上一条 · Shift+Tab 切换 yolo · Ctrl+O 展开思考 · Ctrl+C 打断/双击退出 · 双击 Esc 回退上一轮 · 未知 /命令将作为普通消息发给模型')
   }
 
   const showUsage = (): void => {
@@ -447,6 +471,15 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       }
     }
     channel.pushSystem(next ? 'yolo 已开启：工具审批自动放行（单次授权）' : 'yolo 已关闭：恢复逐次确认')
+  }
+
+  const doImage = async (args: string): Promise<void> => {
+    const path = args.trim()
+    if (path === '') {
+      channel.pushSystem('用法：/img <图片路径>（png/jpg/webp/gif；可多次附加，随下一条消息发送）')
+      return
+    }
+    await attachImageFile(path)
   }
 
   const doTitle = (args: string): void => {
@@ -606,13 +639,39 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     return true
   }
 
-  const currentAgentOptions = (): { provider: string; model: string } | undefined => {
+  const currentAgentOptions = (): { provider: string; model: string; reasoningEffort?: string } | undefined => {
+    // Effort precedence: the live picker selection wins, then the persisted
+    // composition default — in BOTH branches. The provider/model override
+    // (config or default service) must never silently reset the effort, and
+    // an explicit 模型默认 pick (effortCleared) must never be undone.
     const defaultModel = getDefaultModel()
     const selection0 = defaultModel?.currentSelection()
-    const selectionOptions =
-      selection0 && selection0.provider !== '' && selection0.model !== '' ? { provider: selection0.provider, model: selection0.model } : undefined
-    if (config.provider !== '' && config.model !== '') return { provider: config.provider, model: config.model }
-    return selectionOptions
+    const fallbackEffort =
+      !effortCleared && selection0 !== undefined && selection0.reasoningEffort !== undefined && selection0.reasoningEffort !== ''
+        ? selection0.reasoningEffort
+        : undefined
+    if (config.provider !== '' && config.model !== '') {
+      const effort = selection?.reasoningEffort ?? fallbackEffort
+      return { provider: config.provider, model: config.model, ...(effort !== undefined ? { reasoningEffort: effort } : {}) }
+    }
+    // The live picker selection outranks the persisted default (survives a
+    // failed settings write and applies to the NEXT session on /new).
+    if (selection) {
+      return {
+        provider: selection.provider,
+        model: selection.model,
+        ...(selection.reasoningEffort !== undefined && selection.reasoningEffort !== ''
+          ? { reasoningEffort: selection.reasoningEffort }
+          : {}),
+      }
+    }
+    return selection0 && selection0.provider !== '' && selection0.model !== ''
+      ? {
+          provider: selection0.provider,
+          model: selection0.model,
+          ...(fallbackEffort !== undefined ? { reasoningEffort: fallbackEffort } : {}),
+        }
+      : undefined
   }
 
   const attachAgent = (next: Agent): void => {
@@ -620,8 +679,17 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     if (!selection) {
       const createdProvider = next.options.provider
       const createdModel = next.options.model
+      const createdEffort = next.options.reasoningEffort
       if (createdProvider !== undefined && createdProvider !== '' && createdModel !== undefined && createdModel !== '') {
-        selection = { provider: createdProvider, model: createdModel }
+        // The effort MUST ride along: the request waterfall below strips any
+        // inherited `reasoningEffort` before applying `selection` — dropping
+        // it here would silently reset every request to the model default
+        // even though the agent was created with an explicit effort.
+        selection = {
+          provider: createdProvider,
+          model: createdModel,
+          ...(createdEffort !== undefined && createdEffort !== '' ? { reasoningEffort: createdEffort } : {}),
+        }
       }
     }
     try {
@@ -725,6 +793,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   const applySelection = (next: SessionRoute): void => {
     dbg(`applySelection ${next.provider}/${next.model}`)
     selection = next
+    effortCleared = next.reasoningEffort === undefined
     const effort = next.reasoningEffort ? `(${next.reasoningEffort})` : ''
     channel.pushSystem(`模型已切换：${next.provider}/${next.model}${effort} · 下一次请求生效`)
     const defaultModel = getDefaultModel()
@@ -806,7 +875,12 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       void (async (): Promise<void> => {
         const items: PickerItem[] = [itemOf('默认（模型默认行为）', '')]
         try {
-          const resolved = await llm.resolveModel(provider, model)
+          // dsh 0.1.2 renamed the exact-route resolution to `resolveModelInfo`;
+          // stale preview kernels still carry `resolveModel` — try both.
+          const llmAny = llm as unknown as { resolveModelInfo?: KernelLlmService['resolveModelInfo']; resolveModel?: KernelLlmService['resolveModelInfo'] }
+          const resolve = llmAny.resolveModelInfo?.bind(llm) ?? llmAny.resolveModel?.bind(llm)
+          if (!resolve) throw new Error('llm 服务未提供 resolveModelInfo')
+          const resolved = await resolve(provider, model)
           for (const effort of resolved?.reasoning?.efforts ?? []) {
             items.push(itemOf(effort.name || effort.id, effort.id, effort.description))
           }
@@ -1089,98 +1163,598 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   }
 
   let editor = ''
+  /** Logical editor cursor — a code-point offset into `editor` (left/right/
+   *  Home/End/editing chords; the render highlights the char under it). */
+  let cursorPos = 0
   let lastEscAt = 0
+  /** Double-Ctrl+C exit window (mainstream shell behavior): the first press
+   *  interrupts the running turn or clears the editor, the second exits. */
+  let lastExitAt = 0
   // Chrome 恒钉底——render 内 `anchorChrome` 恒为 true（M6 的 picker 闩锁已退役，
   // 不再有"浮动→钉底"跳变需要闩）。
   /** Ctrl+O: full thinking text instead of the short live preview (kimi expand). */
   let thoughtExpanded = false
-  const keyboard = new Keyboard(stdin, (key) => {
-    // Thinking expand/collapse is a pure view toggle — works everywhere,
-    // including while a picker or the approval panel is on screen.
-    if (key.ctrl && key.name === 'o') {
-      thoughtExpanded = !thoughtExpanded
+  /** Submitted prompts (slash commands excluded) — ↑ recalls, ↓ returns. */
+  const promptHistory: string[] = []
+  let historyIndex: number | null = null
+  /** Pending image attachments — durable refs attached to the NEXT message. */
+  const pendingImages: { readonly ref: ImageAttachmentRef; readonly label: string }[] = []
+  /** Active `@path` completion menu (kernel `fileReferences` or local fallback). */
+  let atMenu: PickerState | null = null
+  const atCandidates: FileReferenceCandidate[] = []
+  let atIndex = 0
+  let atQueryKey = ''
+  let atFetchSeq = 0
+  let atTimer: NodeJS.Timeout | null = null
+  /**
+   * Token query that was just completed with a FILE candidate (directories
+   * stay exempt — their trailing `/` means "keep enumerating inside").
+   * Until the query changes, the menu must stay closed, otherwise the fetch
+   * re-opens it and Enter completes instead of submitting — forever.
+   */
+  let atDoneQuery: string | null = null
+
+  // ── editor helpers (code-point based; the cursor is an index into them) ───
+
+  const codeLen = (text: string): number => Array.from(text).length
+
+  /** Insert text at the cursor; folded pasted newlines stay single-line. */
+  const insertText = (seq: string): void => {
+    const clean = seq.replace(/\r\n?/g, ' ')
+    if (clean === '') return
+    const chars = Array.from(editor)
+    const ins = Array.from(clean)
+    chars.splice(cursorPos, 0, ...ins)
+    editor = chars.join('')
+    cursorPos += ins.length
+    menuIndex = 0
+    scheduleAtFetch()
+  }
+
+  const deleteBefore = (word = false): void => {
+    const chars = Array.from(editor)
+    if (cursorPos === 0) return
+    let from = cursorPos - 1
+    if (word) {
+      while (from > 0 && (chars[from] ?? '') === ' ') from--
+      while (from > 0 && (chars[from - 1] ?? '') !== ' ') from--
+    }
+    editor = [...chars.slice(0, from), ...chars.slice(cursorPos)].join('')
+    cursorPos = from
+    scheduleAtFetch()
+  }
+
+  const deleteAt = (): void => {
+    const chars = Array.from(editor)
+    if (cursorPos >= chars.length) return
+    editor = [...chars.slice(0, cursorPos), ...chars.slice(cursorPos + 1)].join('')
+    scheduleAtFetch()
+  }
+
+  const moveCursor = (delta: number): void => {
+    cursorPos = Math.max(0, Math.min(codeLen(editor), cursorPos + delta))
+    scheduleAtFetch()
+  }
+
+  const moveTo = (pos: number): void => {
+    cursorPos = Math.max(0, Math.min(codeLen(editor), pos))
+    scheduleAtFetch()
+  }
+
+  /** Move one word to the left (readline backward-word). */
+  const wordLeft = (): void => {
+    const chars = Array.from(editor)
+    let i = cursorPos
+    while (i > 0 && (chars[i - 1] ?? '') === ' ') i--
+    while (i > 0 && (chars[i - 1] ?? '') !== ' ') i--
+    moveTo(i)
+  }
+
+  /** Move one word to the right (readline forward-word). */
+  const wordRight = (): void => {
+    const chars = Array.from(editor)
+    let i = cursorPos
+    while (i < chars.length && (chars[i] ?? '') === ' ') i++
+    while (i < chars.length && (chars[i] ?? '') !== ' ') i++
+    moveTo(i)
+  }
+
+  // ── @path completion (kernel `fileReferences` seam, local fallback) ───────
+
+  interface AtToken {
+    readonly start: number
+    readonly query: string
+    readonly quoted: boolean
+  }
+
+  /**
+   * The active `@path` / `@"path with spaces` token at the cursor — the
+   * simplified editor-side twin of dsh-file-reference's `activeAtToken`
+   * grammar. An `@` glued into another word (email) never triggers.
+   */
+  const activeAtToken = (text: string, cursor: number): AtToken | undefined => {
+    const chars = Array.from(text)
+    // Quoted: the last `@"` whose run to the cursor carries no closing quote.
+    for (let i = cursor - 1; i >= 0; i--) {
+      const ch = chars[i] ?? ''
+      if (ch === '"') break
+      if (ch === '@' && (chars[i + 1] ?? '') === '"') {
+        return { start: i, query: chars.slice(i + 2, cursor).join(''), quoted: true }
+      }
+    }
+    // Unquoted: a run of non-space chars back to an `@` at a token boundary.
+    let begin = cursor
+    while (begin > 0 && (chars[begin - 1] ?? '') !== ' ') begin--
+    if (begin < cursor && chars[begin] === '@' && (begin === 0 || (chars[begin - 1] ?? ' ') === ' ')) {
+      return { start: begin, query: chars.slice(begin + 1, cursor).join(''), quoted: false }
+    }
+    return undefined
+  }
+
+  /** The insertion value for a completed candidate (kernel grammar twin). */
+  const formatFileMention = (candidate: FileReferenceCandidate): string => {
+    const quoted = /\s/.test(candidate.path)
+    if (candidate.kind === 'directory') {
+      const body = candidate.path.endsWith('/') ? candidate.path : candidate.path + '/'
+      return quoted ? `@"${body}` : '@' + body
+    }
+    return quoted ? `@"${candidate.path}"` : '@' + candidate.path
+  }
+
+  const currentAtMenu = (): { readonly items: readonly PickerItem[]; readonly index: number } | null => {
+    if (picker || !atMenu || atMenu.items.length === 0) return null
+    return { items: atMenu.items, index: Math.max(0, Math.min(atMenu.items.length - 1, atIndex)) }
+  }
+
+  /** Shallow local scan fallback when `fileReferences` is not mounted. */
+  const localFileCandidates = (query: string): FileReferenceCandidate[] => {
+    const lowered = query.toLowerCase().replaceAll('\\', '/')
+    const slash = lowered.lastIndexOf('/')
+    const dir = slash === -1 ? process.cwd() : resolve(process.cwd(), query.slice(0, slash + 1))
+    const base = slash === -1 ? lowered : lowered.slice(slash + 1)
+    let entries: import('node:fs').Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return []
+    }
+    const out: FileReferenceCandidate[] = []
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue
+      const name = entry.name.toLowerCase()
+      if (base !== '' && !name.startsWith(base)) continue
+      out.push({ path: (slash === -1 ? '' : query.slice(0, slash + 1)) + entry.name, kind: entry.isDirectory() ? 'directory' : 'file' })
+      if (out.length >= 50) break
+    }
+    return out
+  }
+
+  const fetchAt = async (query: string, seq: number): Promise<void> => {
+    let candidates: FileReferenceCandidate[] = []
+    const service = agent ? getFileReferences() : undefined
+    if (service && agent) {
+      try {
+        candidates = await service.list(agent, query, new AbortController().signal)
+      } catch {
+        candidates = []
+      }
+    } else {
+      candidates = localFileCandidates(query)
+    }
+    if (seq !== atFetchSeq) return
+    atCandidates.length = 0
+    atCandidates.push(...candidates)
+    if (!activeAtToken(editor, cursorPos) || candidates.length === 0) {
+      atMenu = null
       return
     }
-    // The picker captures every key except the exit chord.
-    if (picker && classify(key) !== 'exit') {
-      handlePickerKey(key)
+    atMenu = openPicker(
+      '文件',
+      candidates.slice(0, 8).map((candidate) =>
+        itemOf(candidate.path + (candidate.kind === 'directory' ? '/' : ''), candidate.path, candidate.kind === 'directory' ? '目录' : undefined),
+      ),
+    )
+    atIndex = 0
+  }
+
+  /** Debounced re-fetch of candidates for the live `@` token. */
+  const scheduleAtFetch = (): void => {
+    const token = activeAtToken(editor, cursorPos)
+    if (!token) {
+      atMenu = null
+      atDoneQuery = null
       return
     }
-    // Tab completes the inline slash menu (no-op without one).
-    if (key.name === 'tab' && !picker) {
-      completeMenu()
+    if (token.query === atDoneQuery) {
+      // Just completed with a file candidate — keep the menu closed until
+      // the query changes (typing/deleting reopens it naturally).
+      atMenu = null
       return
     }
-    // ↑↓ cycle the inline slash menu while it is visible; otherwise they
-    // stay no-ops (never smear CSI sequences into the prompt).
-    if ((key.name === 'up' || key.name === 'down') && !picker) {
-      const menu = currentMenu()
-      if (menu && menu.items.length > 1) {
-        const delta = key.name === 'down' ? 1 : -1
-        menuIndex = (menu.index + delta + menu.items.length) % menu.items.length
+    atDoneQuery = null
+    if (token.query === atQueryKey && atMenu !== null) return
+    atQueryKey = token.query
+    const seq = ++atFetchSeq
+    if (atTimer !== null) clearTimeout(atTimer)
+    atTimer = setTimeout(() => {
+      atTimer = null
+      void fetchAt(token.query, seq)
+    }, 120)
+  }
+
+  /** Replace the live `@` token with the highlighted candidate. */
+  const completeAt = (): boolean => {
+    const menu = currentAtMenu()
+    if (!menu) return false
+    const token = activeAtToken(editor, cursorPos)
+    const item = menu.items[menu.index]
+    const candidate = atCandidates[menu.index]
+    if (!token || !item || !candidate) {
+      atMenu = null
+      return true
+    }
+    const mention = Array.from(formatFileMention(candidate))
+    const chars = Array.from(editor)
+    editor = [...chars.slice(0, token.start), ...mention, ...chars.slice(cursorPos)].join('')
+    cursorPos = token.start + mention.length
+    atMenu = null
+    atQueryKey = '\u0000reset'
+    // Files finish the mention; suppress the immediate re-fetch so Enter
+    // submits instead of re-completing the same token (directories keep
+    // enumerating inside).
+    atDoneQuery = candidate.kind === 'directory' ? null : candidate.path
+    scheduleAtFetch()
+    return true
+  }
+
+  /** Clear the editor state (Esc): text, cursor, menus, pending images. */
+  const resetEditor = (): void => {
+    editor = ''
+    cursorPos = 0
+    menuIndex = 0
+    atMenu = null
+    historyIndex = null
+    pendingImages.length = 0
+  }
+
+  /** Visible labels of the pending attachments (rendered inside the editor box). */
+  const attachmentLabels = (): string[] =>
+    pendingImages.map((image) => `${image.label} ${image.ref.width}×${image.ref.height}`)
+
+  // ── prompt history recall (↑ on an empty editor) ──────────────────────────
+
+  const historyRecall = (delta: -1 | 1): void => {
+    if (promptHistory.length === 0) return
+    if (historyIndex === null) {
+      if (editor !== '' || delta === 1) return
+      historyIndex = promptHistory.length - 1
+    } else {
+      const next = historyIndex + delta
+      if (next < 0) return
+      if (next >= promptHistory.length) {
+        historyIndex = null
+        editor = ''
+        cursorPos = 0
         return
       }
+      historyIndex = next
     }
-    switch (classify(key)) {
-      case 'exit': {
-        dispose()
-        process.exit(0)
-        break
-      }
-      case 'cancel': {
-        if (editor) {
-          editor = ''
-          menuIndex = 0
-          break
-        }
-        if (picker) {
-          // Approval Esc is handled inside handlePickerKey (explicit
-          // reject); other pickers just close here.
-          handlePickerKey(key)
-          break
-        }
-        // Double-Esc on an empty idle editor = rewind to the previous turn
-        // (pi /tree + kimi /undo spirit). Single Esc still cancels the turn.
-        const now = Date.now()
-        const doubleEsc = now - lastEscAt < 600
-        lastEscAt = now
-        if (doubleEsc && channel.runState === 'idle') {
-          void doRewind()
-        } else {
-          agent?.cancel({ kind: 'user' })
-        }
-        break
-      }
-      case 'submit': {
-        const text = editor.trim()
-        // Partial slash input completes from the menu first (kimi behavior);
-        // a second Enter dispatches the completed command.
-        if (text.startsWith('/') && !text.includes(' ') && !picker) {
-          const slash = parseSlash(text)
-          if (slash && !findSlash(slash.name)) {
-            if (completeMenu()) break
+    const entry = historyIndex !== null ? promptHistory[historyIndex] : undefined
+    editor = entry ?? ''
+    cursorPos = codeLen(editor)
+    menuIndex = 0
+  }
+  // ── image attachments (kernel `attachments` seam, dsh-attachment) ─────────
+
+  const IMAGE_MEDIA_TYPES: Readonly<Record<string, ImageMediaType>> = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+  }
+
+  const imageMediaTypeOf = (path: string): ImageMediaType | undefined => {
+    const dot = path.toLowerCase().lastIndexOf('.')
+    return dot === -1 ? undefined : IMAGE_MEDIA_TYPES[path.slice(dot)]
+  }
+
+  function looksLikeImagePath(text: string): boolean {
+    const lower = text.toLowerCase()
+    return (
+      (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp') || lower.endsWith('.gif')) &&
+      !/\s/.test(text)
+    )
+  }
+
+  /** Expand `~` and make relative paths cwd-absolute. */
+  function resolvePath(raw: string): string {
+    const home = process.env['USERPROFILE'] ?? process.env['HOME'] ?? ''
+    const expanded = home !== '' && (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) ? join(home, raw.slice(1)) : raw
+    return isAbsolute(expanded) ? expanded : resolve(process.cwd(), expanded)
+  }
+
+  /** Read, admit, and durably store one image; it rides the NEXT message. */
+  const attachImageFile = async (rawPath: string): Promise<void> => {
+    const attachments = getAttachments()
+    if (!attachments) {
+      channel.pushSystem('attachments 服务未挂载：无法附加图片（内核需挂载 dsh-attachment-local）')
+      return
+    }
+    const abs = resolvePath(rawPath.replace(/^"|"$/g, '').trim())
+    const mediaType = imageMediaTypeOf(abs)
+    if (!mediaType) {
+      channel.pushSystem(`不支持的图片格式：${basename(abs)}（支持 png/jpg/webp/gif）`)
+      return
+    }
+    let data: Buffer
+    try {
+      data = readFileSync(abs)
+    } catch (error) {
+      channel.pushSystem(`读取图片失败：${basename(abs)}（${error instanceof Error ? error.message : String(error)}）`)
+      return
+    }
+    const limits = attachments.imageLimits
+    if (data.length > limits.maxImageBytes) {
+      channel.pushSystem(`图片过大：${basename(abs)} 超出单图上限（${Math.round(limits.maxImageBytes / 1048576)} MiB）`)
+      return
+    }
+    if (pendingImages.length >= limits.maxImagesPerMessage) {
+      channel.pushSystem(`图片数量已达上限（${limits.maxImagesPerMessage}）`)
+      return
+    }
+    try {
+      const ref = await attachments.saveImage({ data: new Uint8Array(data), mediaType, name: basename(abs) })
+      pendingImages.push({ ref, label: ref.name ?? basename(abs) })
+      channel.pushSystem(`已附加图片：${ref.name ?? basename(abs)}（${ref.width}×${ref.height}，随下一条消息发送，Esc 取消）`)
+    } catch (error) {
+      channel.pushSystem(`图片附加失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /**
+   * Ctrl+V: read the clipboard via PowerShell (Windows only) — an image goes
+   * through the attachment path, an image-file path in the text clipboard
+   * attaches directly. Failures degrade to a notice; never break the TUI.
+   */
+  const pasteClipboardImage = (): void => {
+    if (process.platform !== 'win32') {
+      channel.pushSystem('剪贴板图片仅支持 Windows（其他平台请用 /img <路径>）')
+      return
+    }
+    const out = join(tmpdir(), `orca-clip-${process.pid}-${Date.now()}.png`)
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms',
+      'Add-Type -AssemblyName System.Drawing',
+      '$img = [System.Windows.Forms.Clipboard]::GetImage()',
+      `if ($img) { $img.Save('${out.replaceAll(/\\/g, '\\\\')}', [System.Drawing.Imaging.ImageFormat]::Png); 'image' }`,
+      "else { $t = [System.Windows.Forms.Clipboard]::GetText(); if ($t) { 'text:' + $t } else { 'none' } }",
+    ].join('; ')
+    let collected = ''
+    const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-NonInteractive', '-Command', script], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    const timer = setTimeout(() => child.kill(), 8000)
+    child.stdout.on('data', (chunk: Buffer) => {
+      collected += chunk.toString('utf8')
+    })
+    child.on('error', () => {
+      clearTimeout(timer)
+      channel.pushSystem('剪贴板读取失败（powershell 不可用）；可用 /img <路径> 附加图片')
+    })
+    child.on('close', () => {
+      clearTimeout(timer)
+      const text = collected.trim()
+      if (text === 'image') {
+        void attachImageFile(out).finally(() => {
+          try {
+            unlinkSync(out) // temp bytes only — the durable ref stays valid
+          } catch {
+            // Already gone or never written — nothing to clean.
           }
+        })
+        return
+      }
+      if (text.startsWith('text:')) {
+        const clipboardText = text.slice(5).trim()
+        const single = clipboardText.split(/\r?\n/)[0]?.trim() ?? ''
+        if (looksLikeImagePath(single)) {
+          void attachImageFile(single)
+          return
         }
-        editor = ''
-        menuIndex = 0
-        if (text) submit(text)
-        break
       }
-      case 'backspace': {
-        editor = editor.slice(0, editor.length - 1)
-        menuIndex = 0
-        break
-      }
-      case 'text': {
-        editor += key.sequence
-        menuIndex = 0
-        break
-      }
-      case 'navigate':
-      case 'ignore':
-        break
+      channel.pushSystem('剪贴板里没有图片（复制文件或截图后再按 Ctrl+V；文本请用终端粘贴）')
+    })
+  }
+
+  /**
+   * Bracketed paste (200~ … 201~): one burst, newlines folded — a pasted
+   * image path attaches instead of landing in the prompt; terminals without
+   * the mode fall back to the submit-path detection below.
+   */
+  function handlePaste(text: string): void {
+    const cleaned = text.replace(/\r\n?/g, ' ')
+    const trimmed = cleaned.trim()
+    if (looksLikeImagePath(trimmed)) {
+      void attachImageFile(trimmed)
+      return
     }
-  })
+    insertText(cleaned)
+  }
+
+  const keyboard = new Keyboard(
+    stdin,
+    (key) => {
+      // Thinking expand/collapse is a pure view toggle — works everywhere,
+      // including while a picker or the approval panel is on screen.
+      if (key.ctrl && key.name === 'o') {
+        thoughtExpanded = !thoughtExpanded
+        return
+      }
+      // The picker captures every key except the exit chord.
+      if (picker && classify(key) !== 'exit') {
+        handlePickerKey(key)
+        return
+      }
+      // Ctrl+V: attach the clipboard image (terminals that deliver the raw
+      // chord — Windows Terminal pastes bracketed text itself and never
+      // reaches here).
+      if (key.ctrl && key.name === 'v') {
+        void pasteClipboardImage()
+        return
+      }
+      // Tab completes the inline menus (slash first, then @path; no-op
+      // without either). Shift+Tab toggles yolo (mainstream mode cycling).
+      if (key.name === 'tab' && !picker) {
+        if (key.shift) {
+          doYolo(yoloMode ? 'off' : 'on')
+          return
+        }
+        if (!completeAt()) completeMenu()
+        return
+      }
+      switch (classify(key)) {
+        case 'exit': {
+          // Double-Ctrl+C exits; the first press interrupts a running turn
+          // or clears editor state, and never kills the session by accident.
+          const now = Date.now()
+          const idleAndClean = editor === '' && cursorPos === 0 && pendingImages.length === 0 && channel.runState === 'idle'
+          if (now - lastExitAt < 1200 || idleAndClean) {
+            dispose()
+            process.exit(0)
+            break
+          }
+          lastExitAt = now
+          if (channel.runState !== 'idle') agent?.cancel({ kind: 'user' })
+          else resetEditor()
+          channel.pushSystem('再按一次 Ctrl+C 退出（Ctrl+C 已打断/清空）')
+          break
+        }
+        case 'cancel': {
+          if (editor || cursorPos !== 0 || pendingImages.length > 0) {
+            resetEditor()
+            break
+          }
+          if (picker) {
+            // Approval Esc is handled inside handlePickerKey (explicit
+            // reject); other pickers just close here.
+            handlePickerKey(key)
+            break
+          }
+          // Double-Esc on an empty idle editor = rewind to the previous turn
+          // (pi /tree + kimi /undo spirit). Single Esc still cancels the turn.
+          const now = Date.now()
+          const doubleEsc = now - lastEscAt < 600
+          lastEscAt = now
+          if (doubleEsc && channel.runState === 'idle') {
+            void doRewind()
+          } else {
+            agent?.cancel({ kind: 'user' })
+          }
+          break
+        }
+        case 'submit': {
+          // A visible @ menu completes first; Enter never submits through it.
+          if (completeAt()) break
+          const text = editor.trim()
+          // Partial slash input completes from the menu first (kimi behavior);
+          // a second Enter dispatches the completed command.
+          if (text.startsWith('/') && !text.includes(' ') && !picker) {
+            const slash = parseSlash(text)
+            if (slash && !findSlash(slash.name)) {
+              if (completeMenu()) break
+            }
+          }
+          const submitted = editor.trim()
+          // Detach the pending images BEFORE resetEditor wipes them — the
+          // refs must ride THIS message, and Esc-cancel still clears the
+          // rest of the editor state.
+          const images = pendingImages.map((image) => image.ref)
+          resetEditor()
+          historyIndex = null
+          if (submitted || images.length > 0) {
+            if (submitted && !submitted.startsWith('/')) {
+              promptHistory.push(submitted)
+              if (promptHistory.length > 100) promptHistory.shift()
+            }
+            submit(submitted, images)
+          }
+          break
+        }
+        case 'backspace': {
+          if (key.ctrl) deleteBefore(true)
+          else deleteBefore()
+          break
+        }
+        case 'text': {
+          insertText(key.sequence)
+          break
+        }
+        case 'navigate': {
+          if (key.name === 'up' || key.name === 'down') {
+            const atState = currentAtMenu()
+            const menu = currentMenu()
+            if (atState && atState.items.length > 1) {
+              const delta = key.name === 'down' ? 1 : -1
+              atIndex = (atState.index + delta + atState.items.length) % atState.items.length
+            } else if (menu && menu.items.length > 1) {
+              const delta = key.name === 'down' ? 1 : -1
+              menuIndex = (menu.index + delta + menu.items.length) % menu.items.length
+            } else if (key.name === 'up') {
+              historyRecall(-1)
+            } else if (historyIndex !== null) {
+              historyRecall(1)
+            }
+            break
+          }
+          if (key.name === 'left') {
+            if (key.ctrl) wordLeft()
+            else moveCursor(-1)
+          } else if (key.name === 'right') {
+            if (key.ctrl) wordRight()
+            else moveCursor(1)
+          } else if (key.name === 'home') {
+            moveTo(0)
+          } else if (key.name === 'end') {
+            moveTo(codeLen(editor))
+          } else if (key.name === 'delete') {
+            deleteAt()
+          }
+          break
+        }
+        case 'ignore': {
+          if (!key.ctrl || key.alt) break
+          switch (key.name) {
+            case 'a':
+              moveTo(0)
+              break
+            case 'e':
+              moveTo(codeLen(editor))
+              break
+            case 'k': {
+              // Kill to end of line.
+              editor = Array.from(editor).slice(0, cursorPos).join('')
+              scheduleAtFetch()
+              break
+            }
+            case 'u': {
+              // Kill to start of line.
+              editor = Array.from(editor).slice(cursorPos).join('')
+              cursorPos = 0
+              scheduleAtFetch()
+              break
+            }
+            case 'w':
+              deleteBefore(true)
+              break
+          }
+          break
+        }
+      }
+    },
+    handlePaste,
+  )
 
   let flushedSealed = 0
   let welcomed = false
@@ -1236,10 +1810,17 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
     const notices = fullscreen ? null : [...(welcomeRows ?? []), ...slimRows]
     const menu = currentMenu()
+    const atState = currentAtMenu()
+    const editorCtx = {
+      editorCursor: cursorPos,
+      attachments: attachmentLabels(),
+      atMenu: atState,
+    }
     let frame = buildFrame({
       channel,
       sealedFrom: flushedSealed,
       editorText: editor,
+      ...editorCtx,
       width: stdout.columns ?? 80,
       height: stdout.rows ?? 24,
       // Include rows about to be written into scrollback in this frame's
@@ -1274,6 +1855,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         channel,
         sealedFrom: flushedSealed,
         editorText: editor,
+        ...editorCtx,
         width: stdout.columns ?? 80,
         height: stdout.rows ?? 24,
         reservedRows: stream.length + frame.stream.length,
@@ -1306,8 +1888,9 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   // Own the screen: clear the viewport so orca starts from a clean slate
   // (shell residue stays in scrollback, one scroll away). In fullscreen
   // mode take the alternate buffer instead — the pre-orca screen is
-  // restored verbatim on exit.
-  stdout.write(config.fullscreen ? '\x1b[?1049h\x1b[2J\x1b[H' : '\x1b[2J\x1b[H')
+  // restored verbatim on exit. Bracketed paste (2004) is enabled so pastes
+  // arrive as one 200~/201~ burst instead of a keystroke replay.
+  stdout.write(config.fullscreen ? '\x1b[?1049h\x1b[2J\x1b[H' : '\x1b[2J\x1b[H\x1b[?2004h')
   keyboard.start()
   void start()
 
@@ -1318,6 +1901,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     keyboard.stop()
     renderer.dispose()
     if (config.fullscreen) stdout.write('\x1b[?1049l')
+    stdout.write('\x1b[?2004l')
     // Unblock any pending approval asks — late answers are discarded by the
     // service once the signal fires, but our promise must still settle.
     while (approvalQueue.length > 0) settleApprovalHead('cancelled')
@@ -1347,13 +1931,17 @@ function mintSessionId(): string {
  * Build the `UserMessage` the kernel's `followup`/`steer` expect: identified
  * content blocks plus the supplying source. Plain structural object — the
  * kernel validates lossless JSON at the append boundary, brands are
- * compile-time only.
+ * compile-time only. Pending images ride as durable `image` blocks after the
+ * text block (dsh-llm `ImageBlock`).
  */
-function buildUserMessage(text: string): UserMessage {
+function buildUserMessage(text: string, images: readonly ImageAttachmentRef[] = []): UserMessage {
+  const content: ContentBlock[] = []
+  if (text !== '' || images.length === 0) content.push({ type: 'text', text })
+  for (const attachment of images) content.push({ type: 'image', attachment })
   return {
     id: `msg-${randomUUID()}`,
     role: 'user',
-    content: [{ type: 'text', text }],
+    content,
     source: { kind: 'user' },
   }
 }

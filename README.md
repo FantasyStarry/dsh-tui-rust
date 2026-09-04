@@ -61,9 +61,28 @@ dsh plugin --profile orca add <本包路径或 npm 包名>
 dsh --profile orca          # 或安装后直接 orca
 ```
 
-`ORCA_RESUME_SESSION=<id>` 恢复会话；`ORCA_PROVIDER`/`ORCA_MODEL` 成对覆盖模型路由（默认空 = 组合默认 `agentDefaultModel`，内核自身不会兜底缺省模型）；`ORCA_FULLSCREEN=1` 切备用屏（骨架期默认 inline 主屏）。
+`ORCA_RESUME_SESSION=<id>` 恢复会话；`ORCA_PROVIDER`/`ORCA_MODEL` 成对覆盖模型路由（默认空 = 组合默认 `agentDefaultModel`，内核自身不会兜底缺省模型）；`ORCA_FULLSCREEN=1` 切备用屏（骨架期默认 inline 主屏）。思考强度经 `/model` 第三段选择（或 dsh settings 的 `agent-default-model` 命名空间）设定，选择会经 `agentDefaultModel.saveSelection` 尽力持久化。
 
-真机回归探针（ConPTY 启动真实 profile，驱动 `/` 菜单、`/model` 三段选择器、Esc、中文输入与光标停靠，零 API 成本）：
+## 功能与快捷键
+
+| 入口 | 作用 |
+| --- | --- |
+| `/model` | provider → 模型 → 思考强度 三段选择器，waterfall 热切换、持久化默认 |
+| `/img <路径>` · `Ctrl+V` · 粘贴/输入图片路径 | 附加图片（png/jpg/webp/gif），随下一条消息发送，`Esc` 取消 |
+| `@路径` · `@"含空格路径"` | 文件补全（内核 `fileReferences`，缺席时本地扫描），↑↓/Tab/Enter |
+| `/` | 命令菜单（过滤/↑↓/Tab/Enter），未知命令回退为普通消息 |
+| `↑` / `↓` | 召回/返回上一条输入（≤100 条） |
+| `Shift+Tab` | 循环切换 yolo（工具审批自动放行） |
+| `Esc` | 打断当前回合；双击 `Esc`（空闲时）回退上一轮 |
+| `Ctrl+O` | 展开/折叠思考过程 |
+| `Ctrl+C` | 打断回合/清空输入；1.2s 内再按退出 |
+| `Ctrl+A/E/K/U/W`、`Ctrl+←/→` | readline 风编辑（行首/行尾/删至行尾/行首/删词） |
+
+命令全集见 `/help`（信息 `/usage` · 会话 `/new` `/resume` `/title` `/compact` · 模式 `/yolo` `/permission`）。
+
+## 真机回归探针
+
+ConPTY 启动真实 profile，驱动 `/` 菜单、`/model` 三段选择器、Esc、中文输入与光标停靠，零 API 成本：
 
 ```sh
 node scripts/probe-pty.mjs         # 全流程回归
@@ -81,6 +100,12 @@ node scripts/probe-pty.mjs --live  # 追加一次极小真回合：流式上屏 
 - [x] **M4 壳层**（假内核冒烟 ✔，待真终端验收）：审批面板（`approval/request` waterfall 应答者，FIFO 模态 picker，Enter/`1` 放行单次、`2`/Esc 拒绝，abort/`dispose` 以 `cancelled` 结算；`/yolo [on|off]` 为本地自动放行，开启时强制 policy 回 `ask` 以便请求到达；`/permission` 查看；`approval/asked-decided` 审计投影）· hooks 投影（`hook/invoked-result` 系统行，非常拦截只展示）· 状态栏插槽（标题 · yolo/never · `⑂` git 分支（`.git/HEAD` 2s 缓存，无子进程）· 压缩中徽标，kimi 两行式）· fullscreen 备用屏（`ORCA_FULLSCREEN=1` 进 `\x1b[?1049h`、退出恢复，不捕获鼠标以便终端原生选区复制）· 同进程热重载静默恢复（复用同一会话 + `sessionQuery.readSession` 日志重放，不再建新会话/刷欢迎卡；`agents.get/list` 与 `readSession` 镜像已对齐 dsh 0.1.2-alpha.5）
 - [x] **M5 体验加固**（真机 PTY 探针 ✔ 全流程 + live 真回合）：自建键盘解析器取代 node:readline keypress——根除孤立 ESC ~500ms `escapeCodeTimeout` 延迟与 Esc+按键被拼成 alt 组合、原始 CSI 灌入输入框的"菜单/picker 关不掉、输入框错乱"类问题（40ms Esc 窗口、序列跨块续传、未知 CSI 吞除、UTF-8 分片安全）；渲染器帧收缩后光标停靠修正（关菜单/关 picker 光标回到输入框行）；宽度换 `get-east-asian-width`，满宽行（盒卡/页脚/输入框）经 `asciiEllipses` 剥离歧义省略号——ConPTY 记 1 格 / CJK 终端记 2 格的 U+2026 会把恰好满宽的行在真终端顶换行、吃掉下一行（输入框底边框消失的根因）；思考过程 `Ctrl+O` 展开/折叠双向（页脚提示与 `/help` 同步）；`scripts/probe-pty.mjs` 以 ORCA_LOG 应用层字节流为断言真源的 ConPTY 回归探针（含 `--live` 流式真回合验证、`--fullscreen` 备用屏验证、app/ConPTY 双层屏断言）
 - [x] **M6 布局稳定 + fullscreen 重做**（冒烟 phase6/7 + 真机探针 ✔）：恒钉底——inline/fullscreen 一律 spacer 撑满视口，输入框从首帧固定在终端底边（"切完模型 UI 上移"类跳变不存在；M6 的 picker 闩锁已退役）；一次性通知常驻 live 置顶——欢迎卡/路由 slim 行只增不减，随内容自然溢出上卷（stream 只收曾上屏的行；flip 整块搬运必闪丢）；/ 菜单与选择器固定 9 行项目窗（不足补空行、溢出 ▲▼ 滚动），开关/过滤/切 stage 不再顶动转录区；fullscreen 重做为 pi-tui 式整屏窗口模式——备用屏无原生回滚区，不再走 scrollback 封存流，转录渲染为 channel 行的滑动窗口（溢出出『上方还有 N 行』头注）、chrome 恒钉底、帧恰好填满终端高度，欢迎/路由线改走 channel 系统行进窗口；活动区行统一过 `asciiEllipses`（差分绘制行不得含歧义宽度字符，否则终端换行导致绘制失步）；布局原则参照 terminal-ui skill（DevEx TUI 42 条规则）与 pi 的 inline/alt-screen 双模式
+- [x] **M7 输入体验 + 思考强度全链路**（冒烟 phase2/7/8/9 + 真机 PTY 探针 ✔）：
+  - **思考强度不再丢**：`agentDefaultModel` 持久化的 `reasoningEffort` 全链路进入 `agentOptions` 与 `agent/request` waterfall 种子（对齐 dsh 0.1.2 `installModelSelection` / agent-loop `buildRequest` 镜像）；attach 时 seed 完整 selection（此前 waterfall 每请求把创建时带来的 effort 剥成模型默认——"模型配置正常但思考强度匹配不上"的根因）；插件级 `provider`/`model` 覆盖与 effort 合并而非互斥；选择器里显式选「默认（模型默认行为）」会被记住、不被持久化默认悄悄改回
+  - **图片输入**：`/img <路径>` · `Ctrl+V` 剪贴板图片（Windows PowerShell 截图直入）· 括号粘贴/拖入图片路径自动识别；经 `dsh-attachment` 持久引用随下一条消息发送，输入框内渲染附件徽标，`user/message` 投影 `[图片×N]` 后缀
+  - **@ 文件补全**：内核 `fileReferences` 接缝（缺席时本地浅扫描降级）；`@路径` 与 `@"含空格路径"` 语法；↑↓ 选择、Tab/Enter 完成；文件候选完成后菜单保持关闭（Enter 提交而非重新补全的死循环）；目录候选保持枚举
+  - **编辑器与快捷键**：逻辑光标（反显字符）+ readline 编辑键（Ctrl+A/E/K/U/W、Ctrl+←/→ 词移动）；↑ 历史召回/↓ 返回；括号粘贴（200~/201~）单突发不逐键重放；`Shift+Tab` 循环 yolo；`Ctrl+C` 双击退出（首按打断回合/清空输入，误触不杀会话）；`Esc` 打断、双击 `Esc` 回退上一轮、`Ctrl+O` 思考展开
+  - **页脚**：提示行 + 右对齐紧凑 token 用量（↑输入 ↓输出 ✻推理），100 列内不再截断互叠
 
 ## License
 

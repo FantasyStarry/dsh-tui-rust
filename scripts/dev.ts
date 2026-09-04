@@ -17,7 +17,7 @@
  */
 
 import { EventEmitter } from 'node:events'
-import { rmSync } from 'node:fs'
+import { rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootstrapApp } from '../src/app.js'
@@ -156,6 +156,11 @@ class FakeStdin extends EventEmitter {
   text(sequence: string): void {
     this.write(sequence)
   }
+
+  /** A bracketed paste burst (CSI 200~ … 201~), as a real terminal sends. */
+  paste(sequence: string): void {
+    this.write(`\x1b[200~${sequence}\x1b[201~`)
+  }
 }
 
 interface KernelRecord {
@@ -200,6 +205,7 @@ class FakeKernel implements KernelContext {
   private factoryCalls = 0
   private fakePolicy = 'ask'
   private fakeTitle: string | null = null
+  private attachmentSeq = 0
   /** When true, `sessionQuery` reads as unregistered (late-registration probe). */
   hideSessionQuery = false
   /** Live agents by session id (removed on dispose, like the real store). */
@@ -224,7 +230,10 @@ class FakeKernel implements KernelContext {
     if (name === 'loader') return { await: async (): Promise<void> => {} } as T
     if (name === 'agentDefaultModel') {
       return {
-        currentSelection: () => ({ provider: 'default-provider', model: 'default-model' }),
+        // The composition default carries an effort (as a real profile does
+        // when the user pinned one): it must survive into agentOptions and
+        // the waterfall seed, never silently reset to the model default.
+        currentSelection: () => ({ provider: 'default-provider', model: 'default-model', reasoningEffort: 'medium' }),
         saveSelection: async (next: { provider: string; model: string; reasoningEffort?: string }): Promise<void> => {
           this.record.selectionSaved = next
         },
@@ -240,7 +249,7 @@ class FakeKernel implements KernelContext {
           { provider, id: `${provider}-m1`, name: `${provider} 模型一` },
           { provider, id: `${provider}-m2`, name: `${provider} 模型二` },
         ],
-        resolveModel: async (provider: string, model: string) => ({
+        resolveModelInfo: async (provider: string, model: string) => ({
           provider,
           id: model,
           name: model,
@@ -320,6 +329,39 @@ class FakeKernel implements KernelContext {
           this.record.forkCalled = { boundary, childId: childSessionId }
           return { id: childSessionId ?? 'session-fork' }
         },
+      } as T
+    }
+    if (name === 'attachments') {
+      return {
+        imageLimits: {
+          maxImageBytes: 20 * 1048576,
+          maxImagesPerMessage: 20,
+          maxMessageImageBytes: 200 * 1048576,
+          maxImageDimension: 8192,
+          mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+        },
+        saveImage: async (input: { data: Uint8Array; mediaType: string; name?: string }) => {
+          this.attachmentSeq++
+          return {
+            attachmentId: `att-${this.attachmentSeq}`,
+            mediaType: input.mediaType,
+            bytes: input.data.length,
+            width: 8,
+            height: 8,
+            name: input.name,
+          }
+        },
+      } as T
+    }
+    if (name === 'fileReferences') {
+      return {
+        list: async (_agent: unknown, query: string) =>
+          (
+            [
+              { path: 'docs', kind: 'directory' as const },
+              { path: 'README.md', kind: 'file' as const },
+            ] as const
+          ).filter((candidate) => query === '' || candidate.path.toLowerCase().startsWith(query.toLowerCase())),
       } as T
     }
     return undefined
@@ -663,7 +705,7 @@ async function main(): Promise<void> {
     if (countOf('> 说点什么...') !== 1) problems.push('phase2：编辑后输入行重复/缺失')
     if (countOf('Enter 发送') !== 1) problems.push('phase2：编辑后提示行重复/缺失')
     if (snap.some((row) => row.includes('思考中...'))) problems.push('phase2：idle 页脚不应显示思考中徽标')
-    if (!snap.some((row) => row.includes('context: ↑120'))) problems.push('phase2：turn/end 后用量未上屏')
+    if (!snap.some((row) => row.includes('↑120'))) problems.push('phase2：turn/end 后用量未上屏')
     if (snap.some((row) => row.includes('试说'))) problems.push('phase2：退格后占位符残留输入字符')
   }
 
@@ -735,6 +777,10 @@ async function main(): Promise<void> {
   if (record.createOptions?.meta?.cwd !== process.cwd()) problems.push('phase2：create 未携带 cwd')
   if (record.createOptions?.agentOptions?.provider !== 'default-provider') problems.push('phase2：agentOptions.provider 未取组合默认路由')
   if (record.createOptions?.agentOptions?.model !== 'default-model') problems.push('phase2：agentOptions.model 未取组合默认模型')
+  if (record.createOptions?.agentOptions?.reasoningEffort !== 'medium') problems.push('phase2：agentOptions.reasoningEffort 丢失组合默认思考强度')
+  if (!visible2.includes('default-provider/default-model(medium)')) {
+    problems.push('phase2：思考强度未在路由线/页脚显示（attach 时被丢弃）')
+  }
   // The LAST followup is the arrow-guard submit; its text proves the editor
   // stayed clean ('帮我看看' projection is asserted via the painted frames).
   const lastFollowup = record.followupMessage
@@ -750,7 +796,7 @@ async function main(): Promise<void> {
   // (top → prompt → bottom) + footer L1 → L2, each exactly once.
   while (rows2.length > 0 && rows2[rows2.length - 1] === '') rows2.pop()
   const tail = rows2.slice(-5)
-  const hint = 'Enter 发送  ·  /model 模型  ·  Ctrl+O 思考  ·  Esc 取消  ·  Ctrl+C 退出'
+  const hint = 'Enter 发送 · /model · @ 文件 · Ctrl+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
   if (tail.length !== 5) problems.push(`phase2：最终画面尾部不足 5 行：${JSON.stringify(rows2.slice(-7))}`)
   const promptRow = rows2.find((row) => row.includes('> 说点什么...'))
   if (promptRow === undefined) {
@@ -1053,6 +1099,122 @@ async function main(): Promise<void> {
     if (!snap7.some((row) => row.includes('上方还有'))) problems.push('phase7：窗口溢出后缺头注')
     if (!snap7.some((row) => row.includes('你好，Orca。'))) problems.push('phase7：转录窗口缺首轮内容')
     dispose7()
+    await sleep(20)
+  }
+
+  // ── Phase 8: 编辑器光标编辑 + @ 补全 + 图片附加 + 历史召回 ─────────────────
+  {
+    const rw: string[] = []
+    const stdin8 = new FakeStdin()
+    const kernel8 = new FakeKernel(true)
+    const dispose8 = bootstrapApp(
+      kernel8,
+      { provider: '', model: '', fullscreen: false },
+      { stdout: () => makeStdout(rw), stdin: () => stdin8 },
+    )
+    await sleep(250)
+    // Cursor editing: 'abcd' → left,left → insert 'X' → 'abXcd'.
+    for (const ch of 'abcd') stdin8.text(ch)
+    stdin8.key('left')
+    stdin8.key('left')
+    stdin8.text('X')
+    await sleep(80)
+    stdin8.key('return')
+    await sleep(120)
+    {
+      const block = kernel8.record.followupMessage?.content[0]
+      if (block?.type !== 'text' || block.text !== 'abXcd') {
+        problems.push(`phase8：光标插入位置错误：${JSON.stringify(kernel8.record.followupMessage ?? null)}`)
+      }
+    }
+    // @ completion: '@read' → menu → Tab → '@README.md' → Enter submits it.
+    for (const ch of '@read') stdin8.text(ch)
+    await sleep(300) // debounce + fetch
+    if (!paintScreen(rw).some((row) => row.includes('文件'))) problems.push('phase8：@ 文件菜单未上屏')
+    stdin8.key('tab')
+    await sleep(120)
+    stdin8.key('return')
+    await sleep(120)
+    {
+      const block = kernel8.record.followupMessage?.content[0]
+      if (block?.type !== 'text' || block.text !== '@README.md') {
+        problems.push(`phase8：@ 补全未按候选完成：${JSON.stringify(kernel8.record.followupMessage ?? null)}`)
+      }
+    }
+    // /img attaches a durable image; bracketed paste of an image path does too.
+    const pngPath = join(tmpdir(), `orca-smoke-${process.pid}.png`)
+    writeFileSync(pngPath, Buffer.from([0x89, 0x50, 0x4e, 0x47])) // header-only; the fake store skips decode
+    for (const ch of `/img ${pngPath}`) stdin8.text(ch)
+    stdin8.key('return')
+    await sleep(250)
+    stdin8.paste(pngPath)
+    await sleep(250)
+    {
+      const snap = paintScreen(rw)
+      if (!snap.some((row) => row.includes('已附加图片'))) problems.push('phase8：/img 附加未上屏')
+      // Badge rows carry the 🖼 icon; the system notice rows also mention
+      // 8×8, so counting that string would double-count.
+      if (snap.filter((row) => row.includes('🖼')).length !== 2) problems.push('phase8：附件徽标未在输入框内渲染两条')
+    }
+    for (const ch of '看看图') stdin8.text(ch)
+    stdin8.key('return')
+    await sleep(700)
+    {
+      const message = kernel8.record.followupMessage
+      const blocks = message?.content ?? []
+      const first = blocks[0]
+      const image = blocks[1]
+      if (first?.type !== 'text' || first.text !== '看看图') problems.push('phase8：带附件提交的文本块缺失')
+      if (image?.type !== 'image' || image.attachment.attachmentId !== 'att-1') {
+        problems.push(`phase8：图片块未随消息发送：${JSON.stringify(image ?? null)}`)
+      }
+      if (blocks[2]?.type !== 'image') problems.push('phase8：第二张图片块缺失')
+      if (!stripSgr(rw.join('')).includes('[图片×2]')) problems.push('phase8：user/message 图片投影缺失')
+    }
+    // ↑ on an empty editor recalls the last prompt; submitting again is image-free.
+    stdin8.key('up')
+    await sleep(80)
+    stdin8.key('return')
+    await sleep(200)
+    {
+      const message = kernel8.record.followupMessage
+      const first = message?.content[0]
+      if (message?.content.length !== 1 || first?.type !== 'text' || first.text !== '看看图') {
+        problems.push(`phase8：↑ 历史召回失败：${JSON.stringify(message ?? null)}`)
+      }
+    }
+    dispose8()
+    await sleep(20)
+    try {
+      rmSync(pngPath)
+    } catch {
+      // Best-effort cleanup.
+    }
+  }
+
+  // ── Phase 9: 思考强度保持——插件级 provider/model 覆盖不吞掉 effort ──────────
+  // A profile pins orca.provider/model AND the composition default carries an
+  // effort: agentOptions must merge BOTH (the override route + the effort),
+  // not reset the effort to the model default.
+  {
+    const rw: string[] = []
+    const kernel9 = new FakeKernel(true)
+    const dispose9 = bootstrapApp(
+      kernel9,
+      { provider: 'cfg-p', model: 'cfg-m', fullscreen: false },
+      { stdout: () => makeStdout(rw), stdin: () => new FakeStdin() },
+    )
+    await sleep(250)
+    if (
+      kernel9.record.createOptions?.agentOptions?.provider !== 'cfg-p' ||
+      kernel9.record.createOptions?.agentOptions?.model !== 'cfg-m' ||
+      kernel9.record.createOptions?.agentOptions?.reasoningEffort !== 'medium'
+    ) {
+      problems.push(
+        `phase9：配置覆盖丢失思考强度：${JSON.stringify(kernel9.record.createOptions?.agentOptions ?? null)}`,
+      )
+    }
+    dispose9()
     await sleep(20)
   }
 

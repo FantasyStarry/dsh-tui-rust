@@ -125,6 +125,17 @@ function blockText(content: unknown): string {
   return parts.join('')
 }
 
+/** Count durable image references in a content array (defensive). */
+function countImageBlocks(content: unknown): number {
+  if (!Array.isArray(content)) return 0
+  let count = 0
+  for (const item of content) {
+    const block = recordOf(item)
+    if (block && block['type'] === 'image') count++
+  }
+  return count
+}
+
 /** Pull the model-facing text out of a `tool/result` event's message. */
 function toolResultText(data: Record<string, unknown>): string {
   const message = recordOf(data['message'])
@@ -318,7 +329,10 @@ export class Channel {
         const source = recordOf(data['source'])
         if (source && str(source, 'kind') !== 'user') break
         const text = blockText(data['content']) || str(data, 'text')
-        if (text) this.pushUser(text)
+        const images = countImageBlocks(data['content'])
+        const label = text || (images > 0 ? '' : '…')
+        const suffix = images > 0 ? (text ? ` [图片×${images}]` : `[图片×${images}]`) : ''
+        if (label || suffix) this.pushUser(label + suffix)
         break
       }
       case 'assistant/chunk': {

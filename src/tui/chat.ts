@@ -38,6 +38,10 @@ export interface FrameContext {
   /** First row index not yet flushed to scrollback (the app's cursor). */
   readonly sealedFrom: number
   readonly editorText: string
+  /** Logical editor cursor as a code-point offset into `editorText`. */
+  readonly editorCursor?: number
+  /** Pending image attachments — one pre-painted label row each, inside the editor box. */
+  readonly attachments?: readonly string[]
   readonly width: number
   /** Terminal rows; used to keep the prompt anchored at the bottom. */
   readonly height?: number
@@ -55,6 +59,8 @@ export interface FrameContext {
   readonly picker: PickerState | null
   /** Inline slash-command completion (kimi `/` menu), above the input box. */
   readonly commandMenu?: { readonly items: readonly PickerItem[]; readonly index: number } | null
+  /** Inline `@path` completion (kimi file mention), above the input box. */
+  readonly atMenu?: { readonly items: readonly PickerItem[]; readonly index: number } | null
   /** App-level one-shot notices (welcome card, route lines): pinned to the
    *  live top until the first transcript seal flips them into scrollback. */
   readonly notices?: readonly string[] | null
@@ -83,7 +89,7 @@ export interface ChatFrame {
   readonly cursor: { readonly fromEnd: number; readonly col: number }
 }
 
-const HINT = 'Enter 发送  ·  /model 模型  ·  Ctrl+O 思考  ·  Esc 取消  ·  Ctrl+C 退出'
+const HINT = 'Enter 发送 · /model · @ 文件 · Ctrl+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
 
 /** kimi symbols.ts: role bullets, status marks; `✨` carries VS16 so both our
  *  cell math (1+1) and real emoji rendering (2 cells) agree on 3. */
@@ -117,7 +123,8 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   const paintRow = (row: TranscriptRow): string[] =>
     renderRow(row, ctx, inner).map((line) => (line === '' ? '' : gutter(asciiEllipses(line))))
 
-  const bottom = [...inputBox(ctx.editorText, width), ...footerLines(ctx, width)]
+  const editorBox = inputBox(ctx.editorText, width, ctx.editorCursor, ctx.attachments)
+  const bottom = [...editorBox.lines, ...footerLines(ctx, width)]
 
   // ── fullscreen (alternate screen): pi-tui style whole-viewport mode ────────
   // No native scrollback exists there, so nothing is ever sealed to a
@@ -131,15 +138,18 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
       pickerLines = pickerLines.slice(0, Math.max(1, height - bottom.length - 1))
     }
     let menuLines: string[] = []
-    if (!ctx.picker && ctx.commandMenu && ctx.commandMenu.items.length > 0) {
-      const menuBudget = Math.max(1, Math.min(9, height - bottom.length - 7))
-      const menuState: PickerState = {
-        title: '命令',
-        items: ctx.commandMenu.items,
-        index: Math.max(0, Math.min(ctx.commandMenu.items.length - 1, ctx.commandMenu.index)),
+    if (!ctx.picker && (ctx.commandMenu || ctx.atMenu)) {
+      const menu = ctx.commandMenu ?? ctx.atMenu
+      if (menu && menu.items.length > 0) {
+        const menuBudget = Math.max(1, Math.min(9, height - bottom.length - 7))
+        const menuState: PickerState = {
+          title: ctx.atMenu && !ctx.commandMenu ? '文件' : '命令',
+          items: menu.items,
+          index: Math.max(0, Math.min(menu.items.length - 1, menu.index)),
+        }
+        menuLines = renderPicker(menuState, inner, menuBudget).map(gutter)
+        menuLines = menuLines.slice(0, Math.max(1, height - bottom.length - pickerLines.length - 1))
       }
-      menuLines = renderPicker(menuState, inner, menuBudget).map(gutter)
-      menuLines = menuLines.slice(0, Math.max(1, height - bottom.length - pickerLines.length - 1))
     }
     const pickerReserve = pickerLines.length > 0 ? pickerLines.length + 1 : 0
     const menuReserve = menuLines.length > 0 ? menuLines.length + 1 : 0
@@ -155,7 +165,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     if (pickerLines.length > 0) live.push(...pickerLines, '')
     if (menuLines.length > 0) live.push(...menuLines, '')
     live.push(...bottom)
-    const cursor = { fromEnd: bottom.length - 2, col: 5 + stringWidth(ctx.editorText) }
+    const cursor = { fromEnd: bottom.length - 2, col: editorCursorCol(ctx) }
     return { stream, live, cursor }
   }
 
@@ -191,16 +201,19 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   // Inline slash-command menu (non-modal, never coexists with a picker).
   // Same height discipline: it must fit above the input/footer chrome.
   let menuLines: string[] = []
-  if (!ctx.picker && ctx.commandMenu && ctx.commandMenu.items.length > 0) {
-    const menuBudget = Math.max(1, Math.min(9, availableRows - bottom.length - 7))
-    const menuState: PickerState = {
-      title: '命令',
-      items: ctx.commandMenu.items,
-      index: Math.max(0, Math.min(ctx.commandMenu.items.length - 1, ctx.commandMenu.index)),
+  if (!ctx.picker && (ctx.commandMenu || ctx.atMenu)) {
+    const menu = ctx.commandMenu ?? ctx.atMenu
+    if (menu && menu.items.length > 0) {
+      const menuBudget = Math.max(1, Math.min(9, availableRows - bottom.length - 7))
+      const menuState: PickerState = {
+        title: ctx.atMenu && !ctx.commandMenu ? '文件' : '命令',
+        items: menu.items,
+        index: Math.max(0, Math.min(menu.items.length - 1, menu.index)),
+      }
+      menuLines = renderPicker(menuState, inner, menuBudget).map(gutter)
+      const maxMenuLines = Math.max(1, availableRows - bottom.length - pickerLines.length - 1)
+      menuLines = menuLines.slice(0, maxMenuLines)
     }
-    menuLines = renderPicker(menuState, inner, menuBudget).map(gutter)
-    const maxMenuLines = Math.max(1, availableRows - bottom.length - pickerLines.length - 1)
-    menuLines = menuLines.slice(0, maxMenuLines)
   }
   // The open-row window is capped so the frame never outgrows the terminal —
   // the diff painter can only repaint rows that are on screen. Overflow
@@ -240,7 +253,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   live.push(...bottom)
   // Cursor home: the editor content row is 3 above the frame bottom (box
   // bottom + footer L1 + L2); `│ > ` puts the text at column 5.
-  const cursor = { fromEnd: bottom.length - 2, col: 5 + stringWidth(ctx.editorText) }
+  const cursor = { fromEnd: bottom.length - 2, col: editorCursorCol(ctx) }
   return { stream, live, cursor }
 }
 
@@ -363,12 +376,41 @@ function wrappedLines(text: string, width: number): string[] {
   return wrapWidth(text, width)
 }
 
-/** Boxed editor, kimi-style: primary rounded frame, `> ` prompt at column 2. */
-function inputBox(text: string, width: number): string[] {
+/**
+ * Terminal cursor column inside the editor box. When the logical cursor sits
+ * mid-text, the char under it is painted in reverse video (see `inputBox`)
+ * and the terminal cursor parks at the end of the text — diff-painted rows
+ * cannot trust mid-line cursor placement, but the visible highlight carries
+ * the position.
+ */
+function editorCursorCol(ctx: FrameContext): number {
+  return ctx.editorText === '' ? 5 : 5 + stringWidth(ctx.editorText)
+}
+
+/**
+ * Boxed editor, kimi-style: primary rounded frame, `> ` prompt at column 2.
+ * Pending image attachments render as rows inside the box above the prompt;
+ * a mid-text logical cursor highlights the char under it (reverse video).
+ */
+function inputBox(text: string, width: number, cursor?: number, attachments?: readonly string[]): { lines: string[] } {
   const w = Math.max(20, width)
   const style: BoxStyle = { bg: (t) => t, border: theme.primary }
-  const body = text !== '' ? text : theme.placeholder('说点什么...')
-  return [boxTop(w, style), boxLine('> ' + body, w, style), boxBottom(w, style)]
+  const rows: string[] = [boxTop(w, style)]
+  for (const label of attachments ?? []) rows.push(boxLine('🖼 ' + label, w, style))
+  const chars = Array.from(text)
+  const index = cursor ?? chars.length
+  const at = index >= 0 && index < chars.length ? (chars[index] ?? '') : null
+  let body: string
+  if (at !== null) {
+    const before = chars.slice(0, index).join('')
+    const after = chars.slice(index + 1).join('')
+    body = before + theme.cursor(at) + after
+  } else {
+    body = text !== '' ? text : theme.placeholder('说点什么...')
+  }
+  rows.push(boxLine('> ' + body, w, style))
+  rows.push(boxBottom(w, style))
+  return { lines: rows }
 }
 
 /** Two-line plain status footer (kimi footer.ts): state/route/cwd + hints/context. */
@@ -401,7 +443,7 @@ function footerLines(ctx: FrameContext, width: number): string[] {
 
   const context =
     usage.messages > 0
-      ? `context: ↑${fmtTokens(usage.input)} ↓${fmtTokens(usage.output)}${usage.reasoning > 0 ? ` ✻${fmtTokens(usage.reasoning)}` : ''}`
+      ? `↑${fmtTokens(usage.input)} ↓${fmtTokens(usage.output)}${usage.reasoning > 0 ? ` ✻${fmtTokens(usage.reasoning)}` : ''}`
       : ''
   const hintText = theme.muted(HINT)
   let line2: string

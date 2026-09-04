@@ -8,16 +8,24 @@
  * source seam it mirrors; when a mirror drifts from the real surface, fix the
  * mirror and note the kernel version it was checked against.
  *
- * **Checked against `@deepseek-ai/dsh` v0.1.1-rc.2 (2026-08).** Shapes were
+ * **Checked against `@deepseek-ai/dsh` v0.1.2-rc.1 (2026-09).** Shapes were
  * read from the declaration files the installed kernel ships with itself
  * (`dsh/node_modules/@deepseek-ai/…/lib/types/*.d.ts`):
  *
  * - `dsh-agent`  → `AgentRegistry` (`ctx.agents`), `AgentHandle`, `Agent`,
- *   `AgentOptions`, `CreateAgentOptions`, `ResumeAgentOptions`,
- *   `AgentCancelCause`, and the `agent/*` cordis events.
+ *   `AgentOptions` (carries `reasoningEffort` since 0.1.2), `CreateAgentOptions`,
+ *   `ResumeAgentOptions`, `AgentCancelCause`, and the `agent/*` cordis events.
  * - `dsh-session` → `Session`, `SessionEvent`, `SessionEventMap`, and the
  *   `session/*` cordis events.
- * - `dsh-llm` → `StreamChunk`, `ContentBlock`, `UserMessage` / message roles.
+ * - `dsh-llm` → `StreamChunk`, `ContentBlock` (incl. `ImageBlock`), `UserMessage`
+ *   / message roles, and the `LlmRuntime` selector surface — exact-route
+ *   resolution is `resolveModelInfo(provider, model)` as of 0.1.2 (the old
+ *   `resolveModel` name is gone from the runtime; Orca keeps a legacy-name
+ *   fallback at the call site for older preview kernels).
+ * - `dsh-attachment` → `AttachmentStore` (`ctx.attachments`): durable image
+ *   admission (`saveImage`) + limits. Optional seam, soft-probed.
+ * - `dsh-file-reference` → `FileReferenceService` (`ctx.fileReferences`):
+ *   cancellable `@path` completion candidates. Optional seam, soft-probed.
  *
  * Deliberate simplifications (kept honest by runtime-defensive parsing):
  * - `SessionId` / `CallId` / `MessageId` are branded strings in the kernel;
@@ -63,13 +71,6 @@ export interface ToolResultBlock {
 }
 
 /**
- * Provider-neutral content block (dsh-llm `ContentBlock`). The `image` block
- * is omitted from the mirror — Orca does not render attachments yet; unknown
- * plugin-merged blocks simply never match a `type` check and are ignored.
- */
-export type ContentBlock = TextBlock | ReasoningBlock | ToolCallBlock | ToolResultBlock
-
-/**
  * Where a message came from (dsh-llm `MessageSource`, merge-extensible).
  * Orca only branches on `kind === 'user'`; everything else is opaque.
  */
@@ -98,6 +99,40 @@ export interface ToolResultMessage extends Message {
   readonly role: 'user'
   readonly content: readonly [ToolResultBlock]
 }
+
+/** Raster image formats accepted by the attachment admission path (dsh-attachment). */
+export type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+
+/**
+ * A durable raster image reference (dsh-attachment `ImageAttachmentRef`,
+ * checked against dsh 0.1.2-rc.1). Opaque storage id + verified facts; never
+ * a filesystem path or URL.
+ */
+export interface ImageAttachmentRef {
+  readonly attachmentId: string
+  readonly mediaType: ImageMediaType
+  readonly bytes: number
+  readonly width: number
+  readonly height: number
+  readonly name?: string
+  readonly originalDimensions?: { readonly width: number; readonly height: number }
+}
+
+/**
+ * A durable raster image reference, valid in user content (dsh-llm
+ * `ImageBlock`). The block is role-neutral; only user messages carry images
+ * today.
+ */
+export interface ImageBlock {
+  readonly type: 'image'
+  readonly attachment: ImageAttachmentRef
+}
+
+/**
+ * Provider-neutral content block (dsh-llm `ContentBlock`). Unknown
+ * plugin-merged blocks never match a `type` check and are ignored.
+ */
+export type ContentBlock = TextBlock | ReasoningBlock | ImageBlock | ToolCallBlock | ToolResultBlock
 
 /**
  * Raw streaming protocol carried by `assistant/chunk` (dsh-llm `StreamChunk`).
@@ -205,11 +240,14 @@ export interface LlmResolvedModelInfo extends LlmModelInfo {
 /**
  * The LLM runtime (`ctx.llm`, dsh-llm `LlmRuntime` — the selector subset):
  * route/model enumeration plus exact-route resolution for reasoning efforts.
+ * As of dsh 0.1.2 the resolution method is `resolveModelInfo` (the older
+ * preview name was `resolveModel`); the app calls `resolveModelInfo` first
+ * and falls back for stale kernels.
  */
 export interface KernelLlmService {
-  listProviders(): readonly LlmProviderInfo[]
+  listProviders(): readonly LlmProviderInfo[] | Promise<readonly LlmProviderInfo[]>
   listModels(provider: string): Promise<readonly LlmModelInfo[]>
-  resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>
+  resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>
 }
 
 /**
@@ -257,12 +295,14 @@ export type AgentCancelCause =
   | { readonly kind: 'hook'; readonly reason: string }
   | { readonly kind: 'disposed' }
 
-/** Per-agent options (dsh-agent `AgentOptions`). */
+/** Per-agent options (dsh-agent `AgentOptions`, checked against dsh 0.1.2-rc.1). */
 export interface AgentOptions {
   /** Provider route (must have a registered adapter at call time). */
   readonly provider?: string
   /** Model id interpreted by the selected provider adapter. */
   readonly model?: string
+  /** Adapter-owned reasoning effort for the selected provider/model route. */
+  readonly reasoningEffort?: string
   /** Maximum output tokens for each conversation-model request. */
   readonly maxTokens?: number
 }
@@ -478,6 +518,50 @@ export interface KernelApprovalService {
   setPolicy(agent: Agent, policy: KernelApprovalPolicy): void
   overrideOf(session: Session): KernelApprovalPolicy | undefined
   request(req: KernelApprovalRequest): Promise<KernelApprovalOutcome>
+}
+
+/**
+ * Durable image attachment store (`ctx.attachments`, dsh-attachment
+ * `AttachmentStore` — the admission subset Orca needs). A submitted image is
+ * validated/normalized and committed durably BEFORE the owning user message
+ * is appended; the returned reference rides the message's `image` block.
+ * Checked against dsh 0.1.2-rc.1. Optional seam — soft-probed.
+ */
+export interface KernelAttachmentLimits {
+  readonly maxImageBytes: number
+  readonly maxImagesPerMessage: number
+  readonly maxMessageImageBytes: number
+  readonly maxImageDimension: number
+  readonly mediaTypes: readonly ImageMediaType[]
+}
+
+export interface SaveImageAttachment {
+  readonly data: Uint8Array
+  /** Caller-declared media type, checked against the decoded bytes. */
+  readonly mediaType: ImageMediaType
+  /** Optional display name; never interpreted as a path. */
+  readonly name?: string
+}
+
+export interface KernelAttachmentStore {
+  readonly imageLimits: KernelAttachmentLimits
+  saveImage(input: SaveImageAttachment): Promise<ImageAttachmentRef>
+}
+
+/**
+ * `@path` completion candidates for one agent's working directory
+ * (`ctx.fileReferences`, dsh-file-reference `FileReferenceService`).
+ * Paths are workspace-relative; directories keep completion open (trailing
+ * `/`), files finish the mention. Checked against dsh 0.1.2-rc.1. Optional
+ * seam — soft-probed; Orca falls back to a shallow local scan when absent.
+ */
+export interface FileReferenceCandidate {
+  readonly path: string
+  readonly kind: 'file' | 'directory'
+}
+
+export interface KernelFileReferenceService {
+  list(agent: Agent, query: string, signal: AbortSignal): Promise<FileReferenceCandidate[]>
 }
 
 /**
