@@ -985,10 +985,9 @@ async function main(): Promise<void> {
   dispose5b()
   await sleep(20)
 
-  // ── Phase 6: sticky bottom-anchor — closing the /model picker must NOT
-  // drop the chrome back to floating (the "切完模型 UI 上移" jump). Fresh
-  // boot (no conversation): the picker latches the anchor; after it closes
-  // there must still be a spacer gap between the transcript and the editor.
+  // ── Phase 6: always-anchor — the chrome is pinned from the first frame
+  // (no floating welcome anymore). Closing the /model picker must keep it
+  // there: a spacer gap stays between the transcript and the editor.
   {
     const rw: string[] = []
     const stdin6 = new FakeStdin()

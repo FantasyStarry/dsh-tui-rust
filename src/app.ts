@@ -314,7 +314,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
           try {
             const execution = await registry.execute(agent, line, [], new AbortController().signal)
             if (execution === undefined) {
-              conversationStarted = true
               agent.followup(buildUserMessage(text))
             }
           } catch (error) {
@@ -331,7 +330,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
     // No optimistic echo: the user row is projected from the kernel's
     // `user/message` event, so the transcript stays a pure log projection.
-    conversationStarted = true
     agent.followup(buildUserMessage(text))
   }
 
@@ -518,7 +516,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the fresh session.
     }
     channel.clearForSwitch()
-    conversationStarted = false
     welcomed = true // suppress the one-time welcome on switches
     await createAgent()
   }
@@ -595,7 +592,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       if (events && events.length > 0) {
         channel.replay(events)
         channel.sealedRowCount = channel.rows.length
-        conversationStarted = true
       }
     } catch {
       // Empty transcript — live events are the truth from here on.
@@ -968,7 +964,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the resumed session.
     }
     channel.clearForSwitch()
-    conversationStarted = false
     welcomed = true
     await createAgent(resumeId)
     // Best-effort: replay the persisted log so the transcript is not empty
@@ -1034,7 +1029,6 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the rewound session.
     }
     channel.clearForSwitch()
-    conversationStarted = true // keep chrome anchored after a rewind
     welcomed = true
     await createAgent(childSessionId)
     channel.pushSystem(`已回退到上一轮（fork ${shortSessionLabel(childSessionId)}）`)
@@ -1086,15 +1080,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   let editor = ''
   let lastEscAt = 0
-  /**
-   * Sticky bottom-anchor latch (the "切完模型 UI 上移" fix): while a picker
-   * is open the chrome is pinned to the viewport bottom; when it closes the
-   * anchor must NOT drop back to floating, or the input box visibly jumps
-   * up the screen. Once any picker or conversation has pinned the chrome,
-   * it stays pinned for the mount's lifetime — matching pi's inline rule
-   * (pin once content has taken over the screen, never un-pin mid-session).
-   */
-  let anchorLatched = false
+  // Chrome 恒钉底——render 内 `anchorChrome` 恒为 true（M6 的 picker 闩锁已退役，
+  // 不再有"浮动→钉底"跳变需要闩）。
   /** Ctrl+O: full thinking text instead of the short live preview (kimi expand). */
   let thoughtExpanded = false
   const keyboard = new Keyboard(stdin, (key) => {
@@ -1188,13 +1175,10 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   let flushedSealed = 0
   let welcomed = false
   let lastRouteKey = ''
-  let conversationStarted = false
   const render = (): void => {
     const fullscreen = config.fullscreen === true
-    // Latch the sticky anchor the first frame a picker appears — every
-    // picker-open site is covered, including ones added later.
-    if (picker !== null) anchorLatched = true
-    const anchorChrome = fullscreen || conversationStarted || picker !== null || anchorLatched
+    // 总是钉底：inline/fullscreen 一律 spacer 撑满视口，输入框从首帧起固定在终端底边。
+    const anchorChrome = true
     const route = selection ?? channel.route
     const cwd = process.cwd()
     const title = channel.title ?? safeTitleGetCached()
