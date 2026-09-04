@@ -37,6 +37,12 @@ export interface FrameContext {
   readonly channel: Channel
   /** First row index not yet flushed to scrollback (the app's cursor). */
   readonly sealedFrom: number
+  /**
+   * Line offset within `sealedFrom` already streamed (line-level incremental
+   * sedimentation). Defaults to 0; reset to a row boundary on width change
+   * (rewrap invalidates line offsets — rare, brief duplication acceptable).
+   */
+  readonly sealedFromLine?: number
   readonly editorText: string
   /** Logical editor cursor as a code-point offset into `editorText`. */
   readonly editorCursor?: number
@@ -78,10 +84,25 @@ export interface FrameContext {
 export interface ChatFrame {
   /** Newly sealed lines + one-time cards — written once, never repainted. */
   readonly stream: readonly string[]
-  /** Open rows + editor box + footer — diff-painted in place. */
+  /** Recent transcript window + editor box + footer — diff-painted in place. */
   readonly live: readonly string[]
   /** Where the terminal cursor belongs (inside the editor box). */
   readonly cursor: { readonly fromEnd: number; readonly col: number }
+  /**
+   * Next `sealedFrom` cursor for the app: rows `[prevSealedFrom, nextSealedFrom)`
+   * just streamed to scrollback. Unflushed sealed rows stay in `live` (visible
+   * window) until they age out — this is what keeps the viewport populated
+   * instead of blank after each turn.
+   */
+  readonly nextSealedFrom: number
+  /** Line offset within `nextSealedFrom` already streamed (see `sealedFromLine`). */
+  readonly nextSealedFromLine: number
+  /**
+   * Visible transcript rows at the head of `live` (excludes spacer/picker/
+   * chrome). The disposer keeps exactly these on exit so recent history is
+   * not lost when the live block is cleared.
+   */
+  readonly transcriptLen: number
 }
 
 const HINT = 'Enter 发送 · /model · @ 文件 · Ctrl+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
@@ -166,22 +187,27 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     if (menuLines.length > 0) live.push(...menuLines, '')
     live.push(...bottom)
     const cursor = { fromEnd: bottom.length - 2, col: editorCursorCol(ctx) }
-    return { stream, live, cursor }
+    return { stream, live, cursor, nextSealedFrom: ctx.sealedFrom, nextSealedFromLine: ctx.sealedFromLine ?? 0, transcriptLen: windowLines.length }
   }
 
-  // Newly sealed transcript rows → written once into scrollback. Continuous
-  // sedimentation: rows finalize (and flush) as soon as they stop growing.
+  // ── inline: sliding window over recent rows + scrollback sedimentation ─────
+  // The viewport always shows the recent transcript tail (sealed tail + open)
+  // with the chrome pinned to the bottom; only rows that aged out of the
+  // viewport window stream to native scrollback. Unflushed sealed rows stay in
+  // `live` until they age out — previously every newly sealed row streamed
+  // immediately, so after each `turn/start` the live block went blank and the
+  // whole history jumped into scrollback (user-visible "all content弹上去").
   const sealedTo = Math.min(ctx.channel.sealedRowCount, ctx.channel.rows.length)
-  for (const row of ctx.channel.rows.slice(ctx.sealedFrom, sealedTo)) {
-    stream.push(...paintRow(row))
-  }
-
-  // Live region: open rows of the current turn + optional picker + bottom
-  // chrome. The chrome is bottom-anchored; spacer rows absorb free height.
-  const openRows = ctx.channel.rows.slice(sealedTo)
-  let openLines: string[] = []
-  for (const row of openRows) {
-    openLines.push(...paintRow(row))
+  const rows = ctx.channel.rows
+  // Line-level flush cursor: (baseRow, baseLine) is the first unstreamed line.
+  // Sealed rows are final (immutable) so a row may split across scrollback /
+  // viewport safely; open (growing) rows are never streamed, only collapsed
+  // behind a note when a single block outgrows the viewport.
+  let baseRow = Math.max(0, Math.min(ctx.sealedFrom, rows.length))
+  let baseLine = Math.max(0, ctx.sealedFromLine ?? 0)
+  if (baseRow > sealedTo) {
+    baseRow = sealedTo
+    baseLine = 0
   }
 
   // A picker is part of the live frame (unlike sealed transcript stream), so
@@ -221,23 +247,142 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   // collapses into a note and resumes into scrollback at the next seal.
   const pickerReserve = pickerLines.length > 0 ? pickerLines.length + 1 : 0
   const menuReserve = menuLines.length > 0 ? menuLines.length + 1 : 0
-  const maxOpen = Math.max(0, availableRows - bottom.length - pickerReserve - menuReserve)
-  // STRICT budget: the live block must never exceed the viewport height.
-  // Overflow of the open (growing) rows collapses behind a head note; the
-  // rows sediment into scrollback when they finalize.
-  if (openLines.length > maxOpen) {
-    const dropped = openLines.length - maxOpen
-    if (maxOpen > 0) {
-      const tailCount = Math.max(0, maxOpen - 1)
-      openLines = [theme.muted(`… 本回合前 ${dropped} 行暂省（完成后进历史）`), ...openLines.slice(-tailCount)]
-    } else {
-      openLines = []
+  // Stable window for aging (ignores transient picker/menu so opening /model
+  // never permanently flushes history); display window shrinks while the
+  // picker is open but those rows stay unflushed and reappear on close.
+  const baseCap = Math.max(1, availableRows - bottom.length)
+  const displayCap = Math.max(0, availableRows - bottom.length - pickerReserve - menuReserve)
+
+  // Paint sealed remainder (first row sliced by baseLine) + open raw once.
+  const sealedEffFlat: string[] = []
+  const sealedRemLens: number[] = []
+  for (let i = baseRow; i < sealedTo; i++) {
+    const row = rows[i]
+    if (!row) {
+      sealedRemLens.push(0)
+      continue
     }
+    const painted = paintRow(row)
+    const sliceFrom = i === baseRow ? Math.min(baseLine, painted.length) : 0
+    // Snap a stale line offset (width rewrap) to the row start / next row.
+    if (i === baseRow && sliceFrom >= painted.length) {
+      sealedRemLens.push(0)
+      continue
+    }
+    const rest = painted.slice(sliceFrom)
+    sealedRemLens.push(rest.length)
+    sealedEffFlat.push(...rest)
+  }
+  // Advance base past fully-skipped rows (stale offset ≥ row length).
+  let snappedRow = baseRow
+  let snappedLine = baseLine
+  while (snappedRow < sealedTo) {
+    const row = rows[snappedRow]
+    const len = row ? paintRow(row).length : 0
+    if (snappedLine < len) break
+    snappedRow++
+    snappedLine = 0
+  }
+  baseRow = snappedRow
+  baseLine = snappedLine
+  // Rebuild sealedEffFlat if snapping moved base (rare rewrap path).
+  if (baseRow !== Math.max(0, Math.min(ctx.sealedFrom, rows.length)) || baseLine !== Math.max(0, ctx.sealedFromLine ?? 0)) {
+    sealedEffFlat.length = 0
+    sealedRemLens.length = 0
+    for (let i = baseRow; i < sealedTo; i++) {
+      const row = rows[i]
+      if (!row) {
+        sealedRemLens.push(0)
+        continue
+      }
+      const painted = paintRow(row)
+      const rest = i === baseRow ? painted.slice(Math.min(baseLine, painted.length)) : painted
+      sealedRemLens.push(rest.length)
+      sealedEffFlat.push(...rest)
+    }
+  }
+  const openRawLines: string[] = []
+  for (let i = sealedTo; i < rows.length; i++) {
+    const row = rows[i]
+    if (row) openRawLines.push(...paintRow(row))
+  }
+  const sealedEffLen = sealedEffFlat.length
+  const openRawLen = openRawLines.length
+  const totalEff = sealedEffLen + openRawLen
+  const overflowStable = Math.max(0, totalEff - baseCap)
+  // Per-frame sediment budget: steady streaming (1–2 lines/tick) sediments
+  // immediately (1:1 squeeze); bursts spread over frames (smooth settle);
+  // huge catch-ups (remount/replay) settle instantly instead of scrolling
+  // for a second.
+  const STREAM_BUDGET = 3
+  const INSTANT_THRESHOLD = 30
+  const maxStream = Math.min(overflowStable, sealedEffLen)
+  let toStream = 0
+  if (maxStream > 0) {
+    toStream = overflowStable > INSTANT_THRESHOLD ? maxStream : Math.min(maxStream, STREAM_BUDGET)
+  }
+  stream.push(...sealedEffFlat.slice(0, toStream))
+  // Advance the line cursor through sealed rows by toStream lines.
+  let newBaseRow = baseRow
+  let newBaseLine = baseLine
+  {
+    let left = toStream
+    // Re-paint lengths for advance (first row offset aware).
+    for (let i = baseRow; i < sealedTo && left > 0; i++) {
+      const row = rows[i]
+      const paintedLen = row ? paintRow(row).length : 0
+      const start = i === baseRow ? Math.min(baseLine, paintedLen) : 0
+      const remaining = Math.max(0, paintedLen - start)
+      if (left >= remaining) {
+        left -= remaining
+        newBaseRow = i + 1
+        newBaseLine = 0
+      } else {
+        newBaseRow = i
+        newBaseLine = start + left
+        left = 0
+      }
+    }
+  }
+  // Remaining sealed after this frame's sediment (gap between cursor and live
+  // window stays unflushed: picker clips reappear on close, stable overflow
+  // keeps sedimenting on later ticks).
+  const sealedRemFlat: string[] = []
+  {
+    let skip = 0
+    // skip = lines already accounted: streamed head (toStream) — sealedEffFlat
+    // starts at old base, so remaining starts at toStream.
+    for (let k = toStream; k < sealedEffFlat.length; k++) {
+      const line = sealedEffFlat[k]
+      if (line !== undefined) sealedRemFlat.push(line)
+    }
+    void skip
+  }
+  const sealedRemLen = sealedRemFlat.length
+  const remainingTotal = sealedRemLen + openRawLen
+  let transcriptVisible: string[] = []
+  if (remainingTotal <= displayCap) {
+    transcriptVisible = [...sealedRemFlat, ...openRawLines]
+  } else if (openRawLen > displayCap) {
+    // Single growing block outgrows the viewport on its own: collapse its head
+    // behind a note (existing contract); sealed remainder keeps sedimenting.
+    if (displayCap <= 0) {
+      transcriptVisible = []
+    } else {
+      const dropped = openRawLen - (displayCap - 1)
+      transcriptVisible = [theme.muted(`… 本回合前 ${dropped} 行暂省（完成后进历史）`), ...openRawLines.slice(-(displayCap - 1))]
+    }
+  } else {
+    // Sealed + open exceed: show the tail (all open + recent sealed tail);
+    // the sealed head stays as queued gap and sediments on later ticks — the
+    // per-tick 1:1 squeeze instead of a whole-row jump.
+    const combined = [...sealedRemFlat, ...openRawLines]
+    transcriptVisible = displayCap > 0 ? combined.slice(-displayCap) : []
   }
   // The chrome is bottom-anchored: consume the remaining viewport with blank
   // rows between transcript/picker content and the input box/footer.
-  const spacer = anchorChrome ? Math.max(0, maxOpen - openLines.length) : 0
-  live.push(...openLines, ...Array.from({ length: spacer }, () => ''))
+  const spacer = anchorChrome ? Math.max(0, displayCap - transcriptVisible.length) : 0
+  live.push(...transcriptVisible, ...Array.from({ length: spacer }, () => ''))
 
   if (pickerLines.length > 0) {
     live.push(...pickerLines)
@@ -251,7 +396,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   // Cursor home: the editor content row is 3 above the frame bottom (box
   // bottom + footer L1 + L2); `│ > ` puts the text at column 5.
   const cursor = { fromEnd: bottom.length - 2, col: editorCursorCol(ctx) }
-  return { stream, live, cursor }
+  return { stream, live, cursor, nextSealedFrom: newBaseRow, nextSealedFromLine: newBaseLine, transcriptLen: transcriptVisible.length }
 }
 
 /** One-time welcome block — kimi-style box with info rows; brand wordmark. */

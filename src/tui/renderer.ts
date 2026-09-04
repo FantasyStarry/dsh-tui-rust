@@ -135,9 +135,21 @@ export class Renderer {
 
   /** Erase the live block on teardown; static history stays in scrollback. */
   dispose(): void {
+    this.disposeKeeping(0)
+  }
+
+  /**
+   * Erase everything below the first `keepRows` live rows, leaving the visible
+   * transcript tail in the viewport (it becomes scrollback as the shell
+   * continues). `keepRows` counts from the live block top — the inline frame
+   * lays transcript first, so keeping `transcriptLen` drops exactly the
+   * spacer/picker/chrome while recent history survives the exit.
+   */
+  disposeKeeping(keepRows: number): void {
     const height = Math.max(1, this.getHeight())
     const top = Math.max(0, Math.min(this.blockTop, height - 1))
-    this.stdout.write(cup(top + 1, 1) + '\x1b[0J')
+    const keep = Math.max(0, Math.min(Math.floor(keepRows), this.last.length))
+    this.stdout.write(cup(top + keep + 1, 1) + '\x1b[0J')
     this.last = []
   }
 }

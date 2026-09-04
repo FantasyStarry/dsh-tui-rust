@@ -1754,16 +1754,21 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   )
 
   let flushedSealed = 0
+  let flushedLine = 0
+  let lastFlushWidth = 0
   let welcomed = false
   let lastRouteKey = ''
+  // Visible transcript rows at the head of the last live frame — kept on exit
+  // so recent history survives instead of being cleared with the chrome.
+  let lastTranscriptKeep = 0
   // Live-pinned notices (welcome card + route slim lines): built once at
   // One-time notices are CHANNEL rows now (M8 unified pipeline): the
   // welcome card and the connect-time route line are pushed PINNED — they
-  // stay in the live block until the first turn/start seal-all releases
-  // them together with the turn's content, then age into scrollback in log
-  // order. Mid-session route changes are unpinned and sediment immediately
-  // (the footer always shows the live route). Inline and fullscreen share
-  // the same path; the painter guarantees no loss on either.
+  // hold the channel seal until the first turn/start, then stay in the live
+  // sliding window (visible) until they age out into scrollback in log order.
+  // Mid-session route changes are unpinned and age out the same way once the
+  // viewport overflows (the footer always shows the live route). Inline and
+  // fullscreen share the same path; the painter guarantees no loss on either.
   const render = (): void => {
     const fullscreen = config.fullscreen === true
     const route = selection ?? channel.route
@@ -1772,7 +1777,15 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     // A session switch cleared the channel rows out from under the flush
     // cursor — rows pushed AFTER the clear would fall between the stale
     // cursor and the fresh seal and never reach the screen.
-    if (flushedSealed > channel.rows.length) flushedSealed = 0
+    if (flushedSealed > channel.rows.length) {
+      flushedSealed = 0
+      flushedLine = 0
+    }
+    const frameWidth = stdout.columns ?? 80
+    // Rewrap invalidates line offsets: snap to the row start (rare, brief
+    // duplication of a partial row across the resize is acceptable).
+    if (lastFlushWidth !== 0 && frameWidth !== lastFlushWidth) flushedLine = 0
+    lastFlushWidth = frameWidth
     if (!welcomed && agent) {
       welcomed = true
       const routeModel = route ? `${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}` : null
@@ -1791,11 +1804,12 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     const frame = buildFrame({
       channel,
       sealedFrom: flushedSealed,
+      sealedFromLine: flushedLine,
       editorText: editor,
       editorCursor: cursorPos,
       attachments: attachmentLabels(),
       atMenu: currentAtMenu(),
-      width: stdout.columns ?? 80,
+      width: frameWidth,
       height: stdout.rows ?? 24,
       anchorChrome: true,
       fullscreen,
@@ -1814,7 +1828,13 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       branch: gitBranch(cwd),
     })
     renderer.render(frame.live, frame.stream, frame.cursor)
-    flushedSealed = Math.min(channel.sealedRowCount, channel.rows.length)
+    // Advance only past lines the frame actually sedimented. Unflushed sealed
+    // lines stay in the live window (visible) and age out a few lines per
+    // tick — the 1:1 squeeze instead of a whole-row jump.
+    flushedSealed = Math.max(0, Math.min(frame.nextSealedFrom, channel.rows.length))
+    flushedLine = flushedSealed !== frame.nextSealedFrom ? 0 : Math.max(0, frame.nextSealedFromLine)
+    if (flushedSealed >= channel.rows.length) flushedLine = 0
+    lastTranscriptKeep = config.fullscreen === true ? 0 : Math.max(0, frame.transcriptLen)
   }
 
   // ~30fps render tick; the diff painter collapses no-op frames to zero
@@ -1840,7 +1860,10 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     disposed = true
     clearInterval(tick)
     keyboard.stop()
-    renderer.dispose()
+    // Inline keeps the visible transcript tail; only the spacer/chrome below
+    // it is cleared. Fullscreen restores the main screen (alt content is
+    // discarded by the terminal itself).
+    renderer.disposeKeeping(lastTranscriptKeep)
     if (config.fullscreen) stdout.write('\x1b[?1049l')
     stdout.write('\x1b[?2004l')
     // Unblock any pending approval asks — late answers are discarded by the

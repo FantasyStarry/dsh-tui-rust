@@ -1165,10 +1165,11 @@ async function main(): Promise<void> {
     stdin8.paste(pngPath)
     await sleep(400)
     {
-      // With continuous sealing, system notices sediment into scrollback
-      // within a tick — assert on the full write stream, not the viewport.
+      // Notices stay in the live window until they age out (viewport shows
+      // recent history); live rewrites may repeat them in the byte flow, so
+      // assert at-least (visible screen holds both) rather than exactly twice.
       const flow = stripSgr(rw.join(''))
-      if (flow.split('已附加图片').length - 1 !== 2) problems.push('phase8：/img 与粘贴两次附加通知缺失')
+      if (flow.split('已附加图片').length - 1 < 2) problems.push('phase8：/img 与粘贴两次附加通知缺失')
       // The editor box renders one 🖼 badge row per pending attachment.
       if (!flow.includes('🖼')) problems.push('phase8：附件徽标未在输入框内渲染')
     }
