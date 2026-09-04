@@ -77,6 +77,10 @@ export interface SessionUsage {
   input: number
   output: number
   reasoning: number
+  /** Prompt-cache hits reported by the provider (DeepSeek context caching). */
+  cacheRead: number
+  /** Prompt-cache writes reported by the provider. */
+  cacheWrite: number
   messages: number
 }
 
@@ -167,6 +171,30 @@ function preview(text: string, max = ARGS_PREVIEW_MAX): string {
 function numOf(record: Record<string, unknown>, key: string): number {
   const value = record[key]
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+/**
+ * Turn duration for the summary row: `0.6s` under a minute, `7m 58s` beyond.
+ */
+function fmtDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const rest = Math.round(seconds - minutes * 60)
+  return `${minutes}m ${rest}s`
+}
+
+/**
+ * Wall-clock ms for an event. Prefers the durable `event.time` (ms epoch in
+ * real and fake kernels, so replayed logs keep their real durations);
+ * falls back to local now when the stamp is missing or implausible.
+ */
+function eventMs(event: { readonly time?: number }): number {
+  const time = event.time
+  const now = Date.now()
+  if (typeof time === 'number' && Number.isFinite(time) && time > 1e12 && time <= now + 60000) {
+    return time
+  }
+  return now
 }
 
 /** One hunk's line diff: context / removed / added, via prefix-suffix trim. */
@@ -261,7 +289,18 @@ export class Channel {
   /** Latest route recorded by `request/header` — session truth, not UI state. */
   route: SessionRoute | null = null
   /** Cumulative token usage accumulated from `assistant/message` events. */
-  usage: SessionUsage = { input: 0, output: 0, reasoning: 0, messages: 0 }
+  usage: SessionUsage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, messages: 0 }
+  /**
+   * Open turn's token window: usage deltas observed since `turn/start`.
+   * Settled into one transcript summary row on `turn/end` (OpenCode-style
+   * `模型 · 用时 · tok/s`), then reset. Token-free turns settle nothing.
+   */
+  private turnStartMs: number | null = null
+  private turnInputTokens = 0
+  private turnOutputTokens = 0
+  private turnReasoningTokens = 0
+  private turnCacheRead = 0
+  private turnCacheWrite = 0
   /** Latest folded `session/title` text — session truth for footer/browser. */
   title: string | null = null
   /** True while a `compaction/start` … `compaction/end` cycle is open. */
@@ -290,6 +329,14 @@ export class Channel {
           this.version++
         }
         this.runState = 'thinking'
+        // Open the token window for the new turn; the previous turn's summary
+        // (if any) already landed on its `turn/end`.
+        this.turnStartMs = eventMs(event)
+        this.turnInputTokens = 0
+        this.turnOutputTokens = 0
+        this.turnReasoningTokens = 0
+        this.turnCacheRead = 0
+        this.turnCacheWrite = 0
         break
       }
       case 'request/header': {
@@ -311,12 +358,26 @@ export class Channel {
         const data = dataOf(event)
         const usage = recordOf(data['usage'])
         if (usage) {
+          const input = numOf(usage, 'inputTokens')
+          const out = numOf(usage, 'outputTokens')
+          const reasoning = numOf(usage, 'reasoningTokens')
+          // Counts are DISJOINT per the kernel docs: `inputTokens` is uncached
+          // input only, cache hits arrive separately (billed input = sum).
+          const cacheRead = numOf(usage, 'cacheReadTokens')
+          const cacheWrite = numOf(usage, 'cacheWriteTokens')
           this.usage = {
-            input: this.usage.input + numOf(usage, 'inputTokens'),
-            output: this.usage.output + numOf(usage, 'outputTokens'),
-            reasoning: this.usage.reasoning + numOf(usage, 'reasoningTokens'),
+            input: this.usage.input + input,
+            output: this.usage.output + out,
+            reasoning: this.usage.reasoning + reasoning,
+            cacheRead: this.usage.cacheRead + cacheRead,
+            cacheWrite: this.usage.cacheWrite + cacheWrite,
             messages: this.usage.messages + 1,
           }
+          this.turnInputTokens += input
+          this.turnOutputTokens += out
+          this.turnReasoningTokens += reasoning
+          this.turnCacheRead += cacheRead
+          this.turnCacheWrite += cacheWrite
           this.version++
         }
         // The message is complete: close the open assistant row so it
@@ -329,6 +390,30 @@ export class Channel {
         this.runState = 'idle'
         this.sealThought()
         this.openAssistantId = null
+        // Settle the token window into one transcript row (OpenCode-style turn
+        // summary). Token-free turns (cancelled before the first step) report
+        // nothing and leave no row behind.
+        if (this.turnStartMs !== null && this.turnOutputTokens > 0) {
+          const ms = Math.max(0, eventMs(event) - this.turnStartMs)
+          const seconds = Math.max(0.1, Math.round(ms / 100) / 10)
+          const tokPerSec = Math.round((this.turnOutputTokens / seconds) * 10) / 10
+          const route = this.route ? `${this.route.provider}/${this.route.model}` : ''
+          const tokens =
+            `↑${this.turnInputTokens} ↓${this.turnOutputTokens}` +
+            (this.turnReasoningTokens > 0 ? ` ✻${this.turnReasoningTokens}` : '')
+          const cache = this.turnCacheRead + this.turnCacheWrite
+          this.pushSystem(
+            `✓ 本轮${route ? ` · ${route}` : ''} · ${tokens}` +
+              (cache > 0 ? ` · ⇄${cache} 缓存` : '') +
+              ` · 用时${fmtDuration(seconds)} · ${tokPerSec.toFixed(1)} tok/s`,
+          )
+        }
+        this.turnStartMs = null
+        this.turnInputTokens = 0
+        this.turnOutputTokens = 0
+        this.turnReasoningTokens = 0
+        this.turnCacheRead = 0
+        this.turnCacheWrite = 0
         const data = dataOf(event)
         const reason = recordOf(data['reason'])
         if (reason && str(reason, 'kind') === 'error') {
@@ -357,13 +442,24 @@ export class Channel {
         const chunk = data['chunk']
         if (isStreamChunk(chunk)) {
           if (chunk.type === 'text-delta' && chunk.text) {
+            // Visible text means the model stopped reasoning: collapse the
+            // thought row now instead of leaving the spinner running under
+            // the streaming answer. This is also the only end-of-reasoning
+            // signal on delta-only protocols that never emit `block-end`.
+            this.sealThought()
             this.appendChunk('assistant', 'assistant', chunk.text)
           } else if (chunk.type === 'reasoning-delta' && chunk.text) {
             this.appendChunk('thought', 'thought', chunk.text)
+          } else if (chunk.type === 'block-end') {
+            // `block-end` carries the assembled block: a reasoning block
+            // closing collapses the thought row to its `已思考 Ns` summary.
+            // Other block kinds change nothing visible on their own.
+            const block = recordOf(chunk.block)
+            if (block && block['type'] === 'reasoning') this.sealThought()
           }
-          // block-start / block-end / usage / finish / tool-call-delta carry
-          // no transcript text here; tool activity projects from tool/call
-          // and tool/result events.
+          // block-start / usage / finish / tool-call-delta carry no
+          // transcript text here; tool activity projects from tool/call and
+          // tool/result events.
           break
         }
         // Legacy flat shape: a bare text field on the event payload.
@@ -617,7 +713,13 @@ export class Channel {
     this.openThoughtId = null
     this.runState = 'idle'
     this.route = null
-    this.usage = { input: 0, output: 0, reasoning: 0, messages: 0 }
+    this.usage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, messages: 0 }
+    this.turnStartMs = null
+    this.turnInputTokens = 0
+    this.turnOutputTokens = 0
+    this.turnReasoningTokens = 0
+    this.turnCacheRead = 0
+    this.turnCacheWrite = 0
     this.title = null
     this.compacting = false
     this.lastSeq = null

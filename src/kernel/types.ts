@@ -137,7 +137,10 @@ export type ContentBlock = TextBlock | ReasoningBlock | ImageBlock | ToolCallBlo
 /**
  * Raw streaming protocol carried by `assistant/chunk` (dsh-llm `StreamChunk`).
  * Visible text arrives as `text-delta` / `reasoning-delta`; the other
- * variants carry no transcript text for Orca's purposes.
+ * variants carry no transcript text for Orca's purposes — but a `block-end`
+ * assembling a reasoning block is the end-of-thinking signal that collapses
+ * the thought row (delta-only protocols without block framing fall back to
+ * sealing on the first `text-delta`).
  */
 export type StreamChunk =
   | { readonly type: 'block-start'; readonly index: number; readonly blockType: string }

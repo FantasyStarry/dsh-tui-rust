@@ -427,8 +427,9 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   const showUsage = (): void => {
     const usage = channel.usage
+    const cache = usage.cacheRead + usage.cacheWrite
     channel.pushSystem(
-      `用量：↑${usage.input} 输入 · ↓${usage.output} 输出${usage.reasoning > 0 ? ` · ✻${usage.reasoning} 推理` : ''} · ${usage.messages} 条 assistant 消息`,
+      `用量：↑${usage.input} 输入 · ↓${usage.output} 输出${usage.reasoning > 0 ? ` · ✻${usage.reasoning} 推理` : ''}${cache > 0 ? ` · ⇄${cache} 缓存` : ''} · ${usage.messages} 条 assistant 消息`,
     )
   }
 

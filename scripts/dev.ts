@@ -21,6 +21,7 @@ import { rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootstrapApp } from '../src/app.js'
+import { Channel } from '../src/adapter/channel.js'
 import { Config } from '../src/index.js'
 import type { OrcaConfig } from '../src/index.js'
 import { Renderer } from '../src/tui/renderer.js'
@@ -502,7 +503,7 @@ class FakeKernel implements KernelContext {
         content: [{ type: 'text', text: '**你好**，Orca。\n\n- 列表一\n- 列表二\n\n```ts\nconst n = 1 // 注释\n```\n\n流式增量上屏测试。' }],
         source: { kind: 'model', provider: 'default-provider', model: 'default-model' },
       },
-      usage: { inputTokens: 120, outputTokens: 45, reasoningTokens: 30 },
+      usage: { inputTokens: 120, outputTokens: 45, reasoningTokens: 30, cacheReadTokens: 60, cacheWriteTokens: 15 },
     })
     at(600, 'turn/end', { turn, reason: { kind: 'completed' } })
   }
@@ -671,6 +672,51 @@ async function main(): Promise<void> {
     const viewport = all.slice(sep + 1)
     const tail = viewport.slice(-5).join('\n')
     if (!tail.includes('new-input') || !tail.includes('new-f2')) problems.push(`phase0.65：live 扩展后 chrome 未锚底：${JSON.stringify(viewport)}`)
+  }
+
+  // ── Phase 0.85: turn settlement lands one summary row on exact durable
+  // timestamps (45 output tokens over 0.6s ⇒ 75.0 tok/s); token-free turns
+  // settle nothing ─────────────────────────────────────────────────────────
+  {
+    const ch = new Channel()
+    const t0 = Date.now()
+    ch.ingest({ type: 'request/header', seq: 0, time: t0, data: { header: { config: { provider: 'p', model: 'm' } } } } as never)
+    ch.ingest({ type: 'turn/start', seq: 1, time: t0, data: { turn: 1 } } as never)
+    ch.ingest({ type: 'assistant/message', seq: 2, time: t0 + 600, data: { usage: { inputTokens: 120, outputTokens: 45, reasoningTokens: 30, cacheReadTokens: 60, cacheWriteTokens: 15 } } } as never)
+    ch.ingest({ type: 'turn/end', seq: 3, time: t0 + 600, data: { turn: 1, reason: { kind: 'completed' } } } as never)
+    const transcript = ch.rows.map((row) => row.text).join('\n')
+    for (const expect of ['✓ 本轮', 'p/m', '↑120 ↓45', '✻30', '⇄75 缓存', '用时0.6s', '75.0 tok/s']) {
+      if (!transcript.includes(expect)) problems.push(`phase0.85：回合结算行缺「${expect}」`)
+    }
+    if (ch.usage.cacheRead !== 60 || ch.usage.cacheWrite !== 15) {
+      problems.push(`phase0.85：缓存 token 未累加：${JSON.stringify(ch.usage)}`)
+    }
+    const before = ch.rows.length
+    ch.ingest({ type: 'turn/start', seq: 4, time: t0 + 700, data: { turn: 2 } } as never)
+    ch.ingest({ type: 'turn/end', seq: 5, time: t0 + 800, data: { turn: 2, reason: { kind: 'cancelled' } } } as never)
+    if (ch.rows.length !== before) problems.push('phase0.85：空回合不应落结算行')
+  }
+
+  // ── Phase 0.86: the thought row collapses the moment visible text starts
+  // (and on reasoning `block-end`) — the spinner must not run under the
+  // streaming answer ───────────────────────────────────────────────────────
+  {
+    // Delta-only protocol: no block-end, first text-delta seals the thought.
+    const ch = new Channel()
+    ch.ingest({ type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } } as never)
+    ch.ingest({ type: 'assistant/chunk', seq: 1, time: Date.now(), data: { chunk: { type: 'reasoning-delta', index: 0, text: '想一下' } } } as never)
+    const open = ch.rows.find((row) => row.kind === 'thought')
+    if (!open || open.seconds !== undefined) problems.push('phase0.86：思考行应该先保持展开流式')
+    ch.ingest({ type: 'assistant/chunk', seq: 2, time: Date.now(), data: { chunk: { type: 'text-delta', index: 0, text: '正文开始' } } } as never)
+    const sealed = ch.rows.find((row) => row.kind === 'thought')
+    if (!sealed || sealed.seconds === undefined) problems.push('phase0.86：正文开始后思考行未折叠为已思考')
+    // Block-framed protocol: reasoning block-end seals even before any text.
+    const ch2 = new Channel()
+    ch2.ingest({ type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } } as never)
+    ch2.ingest({ type: 'assistant/chunk', seq: 1, time: Date.now(), data: { chunk: { type: 'reasoning-delta', index: 0, text: '想一下' } } } as never)
+    ch2.ingest({ type: 'assistant/chunk', seq: 2, time: Date.now(), data: { chunk: { type: 'block-end', index: 0, block: { type: 'reasoning', text: '想一下' } } } } as never)
+    const sealed2 = ch2.rows.find((row) => row.kind === 'thought')
+    if (!sealed2 || sealed2.seconds === undefined) problems.push('phase0.86：reasoning block-end 未折叠思考行')
   }
 
   // ── Phase 1: degraded boot (#183) — no `agents` service, never a throw ───
@@ -845,6 +891,13 @@ async function main(): Promise<void> {
   if (!visible3().includes('可用命令') || !visible3().includes('/resume')) problems.push('phase3：/help 未列出会话命令')
   await typeLine('/usage')
   if (!visible3().includes('用量')) problems.push('phase3：/usage 未上屏')
+  // Turn summary: one scripted turn settles a `✓ 本轮 · 用时 · tok/s` row.
+  await typeLine('压测速度')
+  await sleep(900)
+  if (!visible3().includes('✓ 本轮') || !visible3().includes('tok/s')) {
+    problems.push('phase3：回合结束缺结算行（✓ 本轮 · 用时 · tok/s）')
+  }
+  if (!visible3().includes('⇄75 缓存')) problems.push('phase3：结算行缺缓存命中段')
   await typeLine('/title 新标题')
   if (kernel3.record.titleRenamed !== '新标题') problems.push('phase3：/title 未调用 rename')
   if (!visible3().includes('标题已更新')) problems.push('phase3：/title 确认缺失')
@@ -1112,7 +1165,7 @@ async function main(): Promise<void> {
     if (!snap7[23].includes('Ctrl+C 退出')) problems.push('phase7：fullscreen 页脚未钉在末行')
     if (!snap7.some((row) => row.includes('> 说点什么...'))) problems.push('phase7：fullscreen 编辑框缺失')
     if (!snap7.some((row) => row.includes('上方还有'))) problems.push('phase7：窗口溢出后缺头注')
-    if (!snap7.some((row) => row.includes('你好，Orca。'))) problems.push('phase7：转录窗口缺首轮内容')
+    if (!snap7.some((row) => row.includes('✓ 本轮'))) problems.push('phase7：转录窗口缺回合结算行')
     dispose7()
     await sleep(20)
   }
