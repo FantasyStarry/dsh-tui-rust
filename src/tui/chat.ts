@@ -782,7 +782,7 @@ function footerLines(ctx: FrameContext, width: number): string[] {
   // all truncated by the gutter guard. Empty slots vanish, never blank gaps.
   const titleText = ctx.title ? theme.text(`「${cleanLine(ctx.title)}」`) : ''
   const modeText = ctx.yolo ? theme.warn('yolo') : ctx.policy === 'never' ? theme.warn('never') : ''
-  const branchText = ctx.branch ? theme.muted(`⑂ ${cleanLine(ctx.branch)}`) : ''
+  const branchText = ctx.branch ? theme.muted(cleanLine(ctx.branch)) : ''
   const dir = theme.muted(short(ctx.cwd))
   const line1 = [badge, routeText, presetText, titleText, modeText, dir, branchText]
     .filter((part) => part !== '')
