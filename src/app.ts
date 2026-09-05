@@ -41,7 +41,6 @@ import type {
   KernelAskUserQuestionAnswer,
   KernelAskUserQuestionAnswerItem,
   KernelAskUserQuestionRequest,
-  KernelUserQuestionService,
   KernelAttachmentStore,
   KernelCommandsService,
   KernelContext,
@@ -211,7 +210,6 @@ export function bootstrapApp(
   const getApproval = (): KernelApprovalService | undefined => ctx.get<KernelApprovalService>('approval', false)
   const getSessions = (): KernelSessionsService | undefined => ctx.get<KernelSessionsService>('sessions', false)
   const getAttachments = (): KernelAttachmentStore | undefined => ctx.get<KernelAttachmentStore>('attachments', false)
-  const getUserQuestions = (): KernelUserQuestionService | undefined => ctx.get<KernelUserQuestionService>('userQuestions', false)
   const getFileReferences = (): KernelFileReferenceService | undefined =>
     ctx.get<KernelFileReferenceService>('fileReferences', false)
 
@@ -885,11 +883,6 @@ export function bootstrapApp(
       showCurrentQuestion()
     })
 
-  const userQuestionsService = getUserQuestions()
-  if (userQuestionsService) {
-    listenerDisposers.push(userQuestionsService.registerProvider({ ask: askUserQuestions }))
-  }
-
   const doTitle = (args: string): void => {
     if (!agent) {
       channel.pushSystem('agent 未就绪，标题不可用')
@@ -1239,6 +1232,20 @@ export function bootstrapApp(
       })()
     })
     agentListenerDisposers.push(disposeApproval)
+
+    // Interactive answerer for `user-questions/request` (dsh-user-questions
+    // waterfall, scoped to this agent). The model calls `ask_user_question`
+    // through `@deepseek-ai/dsh-tool-ask-user`; we render the question and
+    // return the structured answer, or delegate when another answerer claims it.
+    const disposeUserQuestions = next.ctx.on('user-questions/request', (...args: unknown[]) => {
+      const req = recordOf(args[0])
+      const waterfallNext = typeof args[1] === 'function' ? (args[1] as () => Promise<KernelAskUserQuestionAnswer>) : undefined
+      if (!req) return waterfallNext ? waterfallNext() : { answers: [] }
+      const questions = Array.isArray(req['questions']) ? (req['questions'] as KernelAskUserQuestionRequest['questions']) : []
+      const signal = req['signal'] instanceof AbortSignal ? req['signal'] : undefined
+      return askUserQuestions({ questions, agent: req['agent'], ...(signal ? { signal } : {}) })
+    })
+    agentListenerDisposers.push(disposeUserQuestions)
   }
 
   // ── /model picker ─────────────────────────────────────────────────────────
