@@ -38,6 +38,10 @@ import type {
   KernelAppExit,
   KernelApprovalPolicy,
   KernelApprovalService,
+  KernelAskUserQuestionAnswer,
+  KernelAskUserQuestionAnswerItem,
+  KernelAskUserQuestionRequest,
+  KernelUserQuestionService,
   KernelAttachmentStore,
   KernelCommandsService,
   KernelContext,
@@ -206,6 +210,7 @@ export function bootstrapApp(
   const getApproval = (): KernelApprovalService | undefined => ctx.get<KernelApprovalService>('approval', false)
   const getSessions = (): KernelSessionsService | undefined => ctx.get<KernelSessionsService>('sessions', false)
   const getAttachments = (): KernelAttachmentStore | undefined => ctx.get<KernelAttachmentStore>('attachments', false)
+  const getUserQuestions = (): KernelUserQuestionService | undefined => ctx.get<KernelUserQuestionService>('userQuestions', false)
   const getFileReferences = (): KernelFileReferenceService | undefined =>
     ctx.get<KernelFileReferenceService>('fileReferences', false)
 
@@ -257,6 +262,18 @@ export function bootstrapApp(
   let planMode = false
   /** One-shot ask mode: the current `/ask` turn should answer without tools. */
   let askMode = false
+  /**
+   * Active agent-initiated question (ctx.userQuestions provider). When set,
+   * the next submit is captured as the human's answer instead of being sent
+   * to the agent.
+   */
+  let pendingQuestion: {
+    readonly request: KernelAskUserQuestionRequest
+    index: number
+    readonly answers: KernelAskUserQuestionAnswerItem[]
+    resolve: (answer: KernelAskUserQuestionAnswer) => void
+    reject: (error: Error) => void
+  } | null = null
 
   /** Live model selection — overrides the request route via the waterfall. */
   let selection: SessionRoute | null = null
@@ -732,6 +749,90 @@ export function bootstrapApp(
     planMode = next
     if (next) askMode = false
     channel.pushSystem(next ? 'Plan 模式已开启：只规划，不执行工具' : 'Plan 模式已关闭：恢复正常执行')
+  }
+
+  // ── agent-initiated questions (ctx.userQuestions provider) ────────────────
+
+  const showCurrentQuestion = (): void => {
+    if (!pendingQuestion) return
+    const item = pendingQuestion.request.questions[pendingQuestion.index]
+    if (!item) return
+    channel.pushSystem(`问题：${item.question}`)
+    if (item.detail) channel.pushSystem(`详情：${item.detail}`)
+    if (item.options && item.options.length > 0) {
+      for (const [index, option] of item.options.entries()) {
+        channel.pushSystem(`  ${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ''}`)
+      }
+      channel.pushSystem('请输入编号或选项文字后回车；Esc 取消')
+    } else {
+      channel.pushSystem('请直接输入回答后回车；Esc 取消')
+    }
+  }
+
+  const answerCurrentQuestion = (raw: string): void => {
+    if (!pendingQuestion) return
+    const item = pendingQuestion.request.questions[pendingQuestion.index]
+    if (!item) {
+      pendingQuestion.reject(new Error('question list is empty'))
+      pendingQuestion = null
+      return
+    }
+    const text = raw.trim()
+    let selected: string[] = []
+    let custom: string | undefined
+    if (item.options && item.options.length > 0) {
+      const parts = item.multiSelect ? text.split(/[,，、\s]+/).filter(Boolean) : [text]
+      for (const part of parts) {
+        const num = Number(part)
+        const option =
+          Number.isInteger(num) && num >= 1 && num <= item.options.length
+            ? item.options[num - 1]
+            : item.options.find((candidate) => candidate.label === part)
+        if (option) selected.push(option.label)
+        else custom = custom ? `${custom} ${part}` : part
+      }
+      if (!item.multiSelect && selected.length > 0) custom = undefined
+      if (!item.multiSelect && selected.length === 0 && custom === undefined) custom = text
+    } else {
+      custom = text || undefined
+    }
+    pendingQuestion.answers.push({
+      id: item.id,
+      selected,
+      ...(custom !== undefined ? { custom } : {}),
+    })
+    pendingQuestion.index++
+    const next = pendingQuestion.request.questions[pendingQuestion.index]
+    if (next) {
+      showCurrentQuestion()
+    } else {
+      const answers = [...pendingQuestion.answers]
+      const resolve = pendingQuestion.resolve
+      pendingQuestion = null
+      resolve({ answers })
+    }
+  }
+
+  const cancelPendingQuestion = (): void => {
+    if (!pendingQuestion) return
+    const reject = pendingQuestion.reject
+    pendingQuestion = null
+    reject(new Error('ask_user_question was aborted before the user answered'))
+  }
+
+  const askUserQuestions = (request: KernelAskUserQuestionRequest): Promise<KernelAskUserQuestionAnswer> =>
+    new Promise((resolve, reject) => {
+      if (pendingQuestion) {
+        reject(new Error('已有待回答问题，请先完成当前问题'))
+        return
+      }
+      pendingQuestion = { request, index: 0, answers: [], resolve, reject }
+      showCurrentQuestion()
+    })
+
+  const userQuestionsService = getUserQuestions()
+  if (userQuestionsService) {
+    listenerDisposers.push(userQuestionsService.registerProvider({ ask: askUserQuestions }))
   }
 
   const doTitle = (args: string): void => {
@@ -2126,6 +2227,11 @@ export function bootstrapApp(
           break
         }
         case 'cancel': {
+          if (pendingQuestion) {
+            cancelPendingQuestion()
+            resetEditor()
+            break
+          }
           if (editor || cursorPos !== 0 || pendingImages.length > 0) {
             resetEditor()
             break
@@ -2149,6 +2255,13 @@ export function bootstrapApp(
           break
         }
         case 'submit': {
+          // Agent-initiated question: capture the answer instead of sending.
+          if (pendingQuestion) {
+            const answer = editor.trim()
+            resetEditor()
+            answerCurrentQuestion(answer)
+            break
+          }
           // A visible @ menu completes first; Enter never submits through it.
           if (completeAt()) break
           const { text: submitted, images } = collectSubmission()

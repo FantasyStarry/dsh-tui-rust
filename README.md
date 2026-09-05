@@ -85,7 +85,7 @@ dsh --profile orca          # 或安装后直接 orca / dsh-orca
 | `/model` | provider → 模型 → 思考强度 三段选择器，waterfall 热切换、持久化默认 |
 | `update` / `/update` | 检查并更新 dsh-orca 到最新版（CLI 运行 `orca update` 或 `dsh-orca update`） |
 | `/todo` | 查看/编辑待办：`list`、`add <内容>`、`done <编号>`、`undo <编号>`、`del <编号>`、`clear` |
-| `/ask <问题>` | 向 agent 提问，本轮只回答、不执行工具 |
+| `/ask <问题>` | 向 agent 提问，本轮只回答、不执行工具；也支持 agent 通过 `dsh-tool-ask-user` 发起问题（需 profile 挂载该工具） |
 | `/plan [on\|off]` | 切换 plan 模式：只规划、不执行工具 |
 | `/preset` | Agent 预设 roster 选择器（standard/ptc/minimal/cordis），下个新会话挂载组成、页脚显示 live 预设 |
 | `/img <路径>` · `Ctrl+V`/`Alt+V` · 粘贴/输入图片路径 | 附加图片（png/jpg/webp/gif），输入框内联 `[image #N]`，可 Backspace/Delete 删除，随下一条消息发送，`Esc` 全部取消 |

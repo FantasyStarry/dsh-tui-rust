@@ -559,6 +559,52 @@ export interface KernelCommandsService {
 }
 
 /**
+ * User-questions seam (`ctx.userQuestions`, dsh-user-questions). The model
+ * asks via `dsh-tool-ask-user`; Orca registers the single UI provider that
+ * renders the question and returns the human's structured answer.
+ * Checked against @deepseek-ai/dsh-user-questions 0.0.1-rc.3.
+ */
+export interface KernelAskUserQuestionOption {
+  readonly label: string
+  readonly description?: string
+}
+
+export interface KernelAskUserQuestionItem {
+  readonly id: string
+  readonly question: string
+  readonly detail?: string
+  readonly header?: string
+  readonly options?: readonly KernelAskUserQuestionOption[]
+  readonly multiSelect?: boolean
+  readonly intent?: { readonly kind: 'plan-review'; readonly approve: string }
+}
+
+export interface KernelAskUserQuestionAnswerItem {
+  readonly id: string
+  readonly selected: readonly string[]
+  readonly custom?: string
+}
+
+export interface KernelAskUserQuestionAnswer {
+  readonly answers: readonly KernelAskUserQuestionAnswerItem[]
+}
+
+export interface KernelAskUserQuestionRequest {
+  readonly questions: readonly KernelAskUserQuestionItem[]
+  readonly agent?: unknown
+  readonly signal?: AbortSignal
+}
+
+export interface KernelUserQuestionProvider {
+  ask(request: KernelAskUserQuestionRequest): Promise<KernelAskUserQuestionAnswer>
+}
+
+export interface KernelUserQuestionService {
+  registerProvider(provider: KernelUserQuestionProvider): () => void
+}
+
+
+/**
  * Approval seam (`ctx.approval`, dsh-user-approval). Orca only switches the
  * session policy (`ask` ⇄ `never` for `/yolo`) and answers the
  * `approval/request` waterfall as the interactive answerer; the audit pair
