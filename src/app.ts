@@ -27,11 +27,13 @@ import type { OrcaConfig } from './index.js'
 import type {
   Agent,
   AgentHandle,
+  AgentScopedContext,
   ContentBlock,
   FileReferenceCandidate,
   ImageAttachmentRef,
   ImageMediaType,
   KernelAgentDefaultModel,
+  KernelAgentPresetsService,
   KernelAgentsService,
   KernelApprovalPolicy,
   KernelApprovalService,
@@ -75,6 +77,7 @@ type PickerStage =
   | { readonly kind: 'models'; readonly provider: string }
   | { readonly kind: 'effort'; readonly provider: string; readonly model: string }
   | { readonly kind: 'sessions' }
+  | { readonly kind: 'presets' }
   | { readonly kind: 'approval' }
 
 /** Slash command metadata — kimi-style grouping, aliases, idle gating. */
@@ -90,6 +93,7 @@ interface SlashCommand {
 const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'help', aliases: ['h', '?'], group: '信息', description: '显示命令帮助' },
   { name: 'model', aliases: [], group: '账号/配置', description: '切换模型（provider → 模型 → 思考强度）' },
+  { name: 'preset', aliases: [], group: '会话', description: '查看/切换 Agent 预设（下个新会话生效）' },
   { name: 'img', aliases: ['image'], group: '输入', description: '附加本地图片（/img <路径>，可多条，随下条消息发送）' },
   { name: 'new', aliases: ['clear'], group: '会话', description: '丢弃当前上下文，开新会话' },
   { name: 'resume', aliases: ['sessions'], group: '会话', description: '浏览并恢复历史会话' },
@@ -163,6 +167,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   const getAgents = (): KernelAgentsService | undefined => ctx.get<KernelAgentsService>('agents', false)
   const getLlm = (): KernelLlmService | undefined => ctx.get<KernelLlmService>('llm', false)
   const getDefaultModel = (): KernelAgentDefaultModel | undefined => ctx.get<KernelAgentDefaultModel>('agentDefaultModel', false)
+  const getAgentPresets = (): KernelAgentPresetsService | undefined => ctx.get<KernelAgentPresetsService>('agentPresets', false)
   const getSessionQuery = (): KernelSessionQueryService | undefined => ctx.get<KernelSessionQueryService>('sessionQuery', false)
   const getSessionTitle = (): KernelSessionTitleService | undefined => ctx.get<KernelSessionTitleService>('sessionTitle', false)
   const getCommands = (): KernelCommandsService | undefined => ctx.get<KernelCommandsService>('commands', false)
@@ -187,6 +192,14 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   /** Live model selection — overrides the request route via the waterfall. */
   let selection: SessionRoute | null = null
+  /**
+   * Live preset selection (preset id) — composed via `meta.agentPreset` +
+   * factory `setup` mount on the NEXT fresh session (`/new`). Resume/fork
+   * inherit the recorded lineage; the running session never changes.
+   */
+  let presetSelection: string | null = null
+  /** Preset id the live agent actually runs on (`composedPreset`, footer truth). */
+  let livePreset: string | null = null
   /** The user explicitly chose 模型默认行为 in the effort picker — a real
    * "no effort" choice that persisted defaults must not silently undo. */
   let effortCleared = false
@@ -365,6 +378,9 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         break
       case 'model':
         openModelPicker()
+        break
+      case 'preset':
+        doPreset(args)
         break
       case 'img':
         void doImage(args)
@@ -554,6 +570,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the fresh session.
     }
     channel.clearForSwitch()
+    livePreset = null
     welcomed = true // suppress the one-time welcome on switches
     await createAgent()
   }
@@ -566,19 +583,56 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
     const cwd = process.cwd()
     const agentOptions = currentAgentOptions()
-    const createOptions = agentOptions
-      ? { sessionId: mintSessionId(), meta: { cwd }, agentOptions }
-      : { sessionId: mintSessionId(), meta: { cwd } }
+    // Fresh sessions compose the selected preset (explicit pick wins, else the
+    // kernel default): the id is recorded in `meta.agentPreset` lineage AND
+    // mounted via the factory `setup` hook (the only supported call site — a
+    // mount rejection rolls the creation back). Resume/fork inherit the
+    // recorded lineage untouched. Without the roster service this collapses
+    // to today's rosterless create.
+    const presetService = resumeId ? undefined : getAgentPresets()
+    let presetId: string | undefined
+    if (presetService) {
+      try {
+        presetId = (await presetService.resolve(presetSelection ?? undefined)).id
+      } catch {
+        if (presetSelection) channel.pushSystem(`预设 ${presetSelection} 不可用，已回退默认组成`)
+      }
+    }
+    const resolvedPresetId = presetId
+    const presetComposed = resolvedPresetId !== undefined && presetService !== undefined
+    const buildCreateOptions = (withPreset: boolean) => ({
+      sessionId: mintSessionId(),
+      meta: { cwd, ...(withPreset && resolvedPresetId !== undefined ? { agentPreset: resolvedPresetId } : {}) },
+      ...(agentOptions ? { agentOptions } : {}),
+      ...(withPreset && resolvedPresetId !== undefined && presetService !== undefined
+        ? {
+            setup: async (agentCtx: AgentScopedContext): Promise<void> => {
+              await presetService.mount(agentCtx, resolvedPresetId)
+            },
+          }
+        : {}),
+    })
+    let withPreset = presetComposed
     for (let attempt = 0; ; attempt++) {
       try {
         handle = resumeId
           ? await agentFactory.resume(agentOptions ? { resumeSessionId: resumeId, agentOptions } : { resumeSessionId: resumeId })
-          : await agentFactory.create(createOptions)
+          : await agentFactory.create(buildCreateOptions(withPreset))
         break
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         if (attempt < FACTORY_RETRY_ATTEMPTS && /no agent factory registered/i.test(message)) {
           await sleep(FACTORY_RETRY_DELAY_MS)
+          continue
+        }
+        // A rejected preset composition rolls the whole creation back —
+        // retry ONCE rosterless (the pre-preset behavior) so a broken
+        // preset or a missing host service degrades instead of bricking
+        // the boot. The pick stays recorded for the NEXT session.
+        if (!resumeId && withPreset) {
+          withPreset = false
+          dbg(`createAgent 预设回退：${message}`)
+          channel.pushSystem(`预设 ${resolvedPresetId} 挂载失败，本次启动回退无预设组成：${message}`)
           continue
         }
         dbg(`createAgent 失败：${message}`)
@@ -676,6 +730,13 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   const attachAgent = (next: Agent): void => {
     agent = next
+    // Footer truth: what this live agent actually runs on (recorded lineage
+    // may predate the pick; the scope chain is authoritative).
+    try {
+      livePreset = getAgentPresets()?.composedPreset(next.ctx) ?? null
+    } catch {
+      livePreset = null
+    }
     if (!selection) {
       const createdProvider = next.options.provider
       const createdModel = next.options.model
@@ -829,6 +890,13 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       settleApprovalHead(item.value === 'allowed-once' ? 'allowed-once' : 'rejected')
       return
     }
+    if (pickerStage.kind === 'presets') {
+      const item = pickedItem(picker)
+      if (!item || item.disabled) return
+      applyPreset(item.value)
+      closePicker()
+      return
+    }
     const llm = getLlm()
     if (!llm) {
       dbg(`confirmPicker skip: picker=${picker !== null} stage=${pickerStage?.kind ?? 'null'} llm=${llm !== undefined}`)
@@ -969,6 +1037,86 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     })()
   }
 
+  // ── /preset picker ────────────────────────────────────────────────────────
+  // Single-stage roster browser (unlike /model's three stages): the pick only
+  // records `presetSelection` — a preset composes at session creation, so the
+  // running session keeps its composition and the next FRESH session mounts
+  // the pick (`meta.agentPreset` + factory `setup`). Resume/fork inherit.
+
+  const applyPreset = (id: string): void => {
+    dbg(`applyPreset ${id}`)
+    presetSelection = id
+    channel.pushSystem(`预设已切换：${id} · 下个新会话生效（当前会话保持原组成）`)
+  }
+
+  const presetFailed = (error: unknown): void => {
+    closePicker()
+    channel.pushSystem(`枚举预设失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  const openPresetPicker = (): void => {
+    const presets = getAgentPresets()
+    if (!presets) {
+      channel.pushSystem('kernel service `agentPresets` 未挂载：无法枚举预设（profile 需挂载 dsh-agent-presets）')
+      return
+    }
+    const stage: PickerStage = { kind: 'presets' }
+    pickerStage = stage
+    picker = openPicker('选择 Agent 预设', loadingItems(), livePreset ?? presetSelection ?? undefined)
+    void (async (): Promise<void> => {
+      try {
+        const roster = await presets.list()
+        if (stage !== pickerStage) return
+        if (roster.length === 0) {
+          channel.pushSystem('没有可用的 Agent 预设')
+          closePicker()
+          return
+        }
+        const sorted = [...roster].sort(
+          (a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER) || (a.id < b.id ? -1 : 1),
+        )
+        picker = openPicker(
+          '选择 Agent 预设（Enter 切换 · 下个新会话生效）',
+          sorted.map((preset) => ({
+            value: preset.id,
+            label: preset.name ?? preset.id,
+            hint: `${preset.trust === 'user' ? '自建' : '内置'}${preset.broken ? ` · 不可用：${preset.broken}` : ''}${preset.description ? ` · ${preset.description}` : ''}`,
+            ...(preset.broken ? { disabled: true } : {}),
+          })),
+          livePreset ?? presetSelection ?? undefined,
+        )
+      } catch (error) {
+        if (stage !== pickerStage) return
+        presetFailed(error)
+      }
+    })()
+  }
+
+  const doPreset = (args: string): void => {
+    const id = args.trim()
+    if (id === '') {
+      openPresetPicker()
+      return
+    }
+    const presets = getAgentPresets()
+    if (!presets) {
+      channel.pushSystem('kernel service `agentPresets` 未挂载：无法切换预设（profile 需挂载 dsh-agent-presets）')
+      return
+    }
+    void (async (): Promise<void> => {
+      try {
+        const preset = await presets.resolve(id)
+        if (preset.broken) {
+          channel.pushSystem(`预设 ${preset.id} 不可用：${preset.broken}`)
+          return
+        }
+        applyPreset(preset.id)
+      } catch (error) {
+        channel.pushSystem(`未知预设：${id}${error instanceof Error ? `（${error.message}）` : ''}`)
+      }
+    })()
+  }
+
   // ── /resume browser (placeholder: full picker lands next) ──────────────────
 
   const openResumePicker = (): void => {
@@ -1044,6 +1192,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the resumed session.
     }
     channel.clearForSwitch()
+    livePreset = null
     welcomed = true
     await createAgent(resumeId)
     // Best-effort: replay the persisted log so the transcript is not empty
@@ -1109,6 +1258,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       // Teardown failures must not block the rewound session.
     }
     channel.clearForSwitch()
+    livePreset = null
     welcomed = true
     dbg('doRewind: start')
     await createAgent(childSessionId)
@@ -1820,6 +1970,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       usage: channel.usage,
       now: Date.now(),
       picker,
+      preset: livePreset,
       commandMenu: currentMenu(),
       thoughtExpanded,
       connecting: agent === null,

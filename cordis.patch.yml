@@ -16,6 +16,24 @@
 
 # ── the interactive front door ────────────────────────────────────────────────
 
+# The preset roster (parity with the web-app bundle): shipped presets
+# (standard/ptc/minimal/cordis) mount as the read-only `system` root,
+# `$DSH_HOME/.agent-presets` as the writable `user` root. Orca names the
+# composition per fresh session (`meta.agentPreset` + factory `setup` mount);
+# resume/fork inherit the recorded lineage.
+- insert:
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: standard
+
+    # Host-owned service the standard/ptc/cordis presets' `tool-subagent`
+    # (`modelSelectionSettings: true`) HARD-requires in the Host scope —
+    # without it the standing mount rejects the whole composition and the
+    # agent fails to boot. Same row the dsh-web-app bundle inserts.
+    - id: subagent-model-selection-settings
+      name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
+
 - insert:
     # Entry-level inject only; the plugin module's own code-level inject stays
     # empty so a stale patch cannot deadlock a composition lacking these

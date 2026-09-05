@@ -13,8 +13,13 @@
  * (`dsh/node_modules/@deepseek-ai/…/lib/types/*.d.ts`):
  *
  * - `dsh-agent`  → `AgentRegistry` (`ctx.agents`), `AgentHandle`, `Agent`,
- *   `AgentOptions` (carries `reasoningEffort` since 0.1.2), `CreateAgentOptions`,
+ *   `AgentOptions` (carries `reasoningEffort` since 0.1.2), `CreateAgentOptions`
+ *   (`meta.agentPreset` lineage + creation-time `setup` composition hook),
  *   `ResumeAgentOptions`, `AgentCancelCause`, and the `agent/*` cordis events.
+ * - `dsh-agent-presets` → `AgentPresets` (`ctx.agentPresets`): roster
+ *   (`list`/`resolve`), the user default (`defaultId`), per-agent live lookup
+ *   (`composedPreset`) and standing-mount composition (`mount`, called from the
+ *   agent factory `setup` hook — the only supported call site).
  * - `dsh-session` → `Session`, `SessionEvent`, `SessionEventMap`, and the
  *   `session/*` cordis events.
  * - `dsh-llm` → `StreamChunk`, `ContentBlock` (incl. `ImageBlock`), `UserMessage`
@@ -35,8 +40,8 @@
  *   extensions (`agent/inbox/spliced`, compaction, …) and `request/header` /
  *   `request/context` are intentionally absent — unknown event types are
  *   ignored at the channel boundary.
- * - `CreateAgentOptions` / `ResumeAgentOptions` omit `seed` / `signal` /
- *   `setup` until Orca uses them.
+ * - `CreateAgentOptions` / `ResumeAgentOptions` omit `seed` / `signal`
+ *   until Orca uses them.
  */
 
 // ── dsh-llm: content blocks and messages ────────────────────────────────────
@@ -367,6 +372,14 @@ export interface CreateAgentOptions {
   }
   /** Per-agent options (model, …). */
   readonly agentOptions?: AgentOptions
+  /**
+   * Creation-time composition of the agent's scoped world (dsh-agent `setup`).
+   * Runs inside the factory after minting `agentCtx` but before publication —
+   * the one supported call site for `agentPresets.mount` (a rejection rolls
+   * the whole creation back). Real hook receives the full scoped Context;
+   * the subset below is all Orca passes through.
+   */
+  readonly setup?: (agentCtx: AgentScopedContext) => void | Promise<void>
 }
 
 /** Options for `ctx.agents.resume` (dsh-agent `ResumeAgentOptions`, used subset). */
@@ -401,6 +414,48 @@ export interface KernelAgentDefaultModel {
     reasoningEffort?: string
   }
   saveSelection(next: { provider: string; model: string; reasoningEffort?: string }): Promise<void>
+}
+
+/**
+ * One preset directory carrying a mountable agent composition
+ * (dsh-agent-presets `AgentPreset`, display subset — checked 0.1.2-rc.1).
+ */
+export interface AgentPreset {
+  /** Stable identifier; the preset directory's name. */
+  readonly id: string
+  /** `system` ships with the deployment, `user` was authored locally. */
+  readonly trust: 'system' | 'user'
+  /** Display name from the preset's metadata; absent falls back to `id`. */
+  readonly name?: string
+  /** One sentence on what this preset is for, when published. */
+  readonly description?: string
+  /** Declared position within its group; absent sorts after those declaring one. */
+  readonly order?: number
+  /** Why this preset cannot compose a session — absent when it can. */
+  readonly broken?: string
+}
+
+/**
+ * Registry over the deployment's agent presets (`ctx.agentPresets`,
+ * dsh-agent-presets `AgentPresets` — the Orca-used subset).
+ */
+export interface KernelAgentPresetsService {
+  /** Every preset the configured roots currently supply. */
+  list(): Promise<AgentPreset[]>
+  /** The preset id mounted when a caller names none (reads live settings). */
+  readonly defaultId: string
+  /**
+   * Resolve one preset by id (`undefined` → default). Broken presets still
+   * resolve — mounting paths refuse them; throws when unknown.
+   */
+  resolve(id?: string): Promise<AgentPreset>
+  /** The preset one live agent runs on (`undefined` when it joined none). */
+  composedPreset(agentCtx: AgentScopedContext): string | undefined
+  /**
+   * Compose one agent from a preset (standing mount + scope join). Call from
+   * the agent factory `setup` hook only; throws on unknown/unusable presets.
+   */
+  mount(agentCtx: AgentScopedContext, id?: string): Promise<AgentPreset>
 }
 
 /**

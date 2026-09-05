@@ -194,6 +194,7 @@ interface KernelRecord {
   titleRenamed: string | null
   compactLine: string | null
   forkCalled: { boundary: number | undefined; childId: string | undefined } | null
+  presetMounted: string | null
   disposed: boolean
 }
 
@@ -216,6 +217,7 @@ class FakeKernel implements KernelContext {
     titleRenamed: null,
     compactLine: null,
     forkCalled: null,
+    presetMounted: null,
     disposed: false,
   }
   private readonly listeners = new Map<string, Set<(...args: unknown[]) => void>>()
@@ -226,6 +228,8 @@ class FakeKernel implements KernelContext {
   private attachmentSeq = 0
   /** When true, `sessionQuery` reads as unregistered (late-registration probe). */
   hideSessionQuery = false
+  /** When true, `agentPresets.mount` rejects (preset-failure fallback probe). */
+  presetMountFails = false
   /** Live agents by session id (removed on dispose, like the real store). */
   private readonly liveAgents = new Map<string, AgentHandle['agent']>()
   /** Sessions durable on "disk" (survive dispose, loadable via resume). */
@@ -371,6 +375,33 @@ class FakeKernel implements KernelContext {
         },
       } as T
     }
+    if (name === 'agentPresets') {
+      const roster = [
+        { id: 'standard', trust: 'system' as const, name: '标准模式', description: '功能完整的编码 Agent', order: 1 },
+        { id: 'ptc', trust: 'system' as const, name: 'PTC 模式', description: '默认不提供 workflow 工具', order: 2 },
+        { id: 'minimal', trust: 'system' as const, name: '极简模式', description: '双工具编码 Agent', order: 3 },
+        { id: 'cordis', trust: 'system' as const, name: '创造模式', description: '自定义预设', order: 4 },
+        { id: 'broken-demo', trust: 'user' as const, name: '坏预设', broken: '组成文件损坏（演示）', order: 5 },
+      ]
+      return {
+        list: async () => roster,
+        defaultId: 'standard',
+        resolve: async (id?: string) => {
+          const found = roster.find((preset) => preset.id === (id ?? 'standard'))
+          if (!found) throw new Error(`unknown preset: ${id}`)
+          return found
+        },
+        composedPreset: () => this.record.presetMounted ?? 'standard',
+        mount: async (_agentCtx: unknown, id?: string) => {
+          if (this.presetMountFails) {
+            throw new Error('agent-presets: preset "standard" failed to mount: (simulated host-service gap)')
+          }
+          const next = id ?? 'standard'
+          this.record.presetMounted = next
+          return { id: next, trust: 'system' as const }
+        },
+      } as T
+    }
     if (name === 'fileReferences') {
       return {
         list: async (_agent: unknown, query: string) =>
@@ -407,7 +438,16 @@ class FakeKernel implements KernelContext {
       }
       this.record.createOptions = options
       this.record.createCalls++
+      // The factory runs creation-time `setup` (preset standing-mount in the
+      // real kernel); the fake honors it so the mount path is covered.
       const kernel = this
+      if (options.setup) {
+        await options.setup({
+          on(_name: string, _listener: (...args: unknown[]) => unknown): () => void {
+            return () => {}
+          },
+        })
+      }
       const session: Session = {
         id: options.sessionId,
         events: [],
@@ -1293,6 +1333,79 @@ async function main(): Promise<void> {
       )
     }
     dispose9()
+    await sleep(20)
+  }
+
+  // ── Phase 10: /preset 预设选择 → 下个新会话挂载组成 ─────────────────────
+  // Roster lists (built-in + broken-disabled), the pick records a selection,
+  // and the next FRESH session carries `meta.agentPreset` + runs `setup`
+  // mount; the footer shows the live composed preset.
+  {
+    const writes10: string[] = []
+    const stdin10 = new FakeStdin()
+    const kernel10 = new FakeKernel(true)
+    const dispose10 = bootstrapApp(
+      kernel10,
+      { provider: '', model: '', fullscreen: false },
+      { stdout: () => makeStdout(writes10), stdin: () => stdin10 },
+    )
+    await sleep(300) // boot create (factory-race retry) + default mount
+    if (kernel10.record.presetMounted !== 'standard') {
+      problems.push(`phase10：首建未挂默认预设：${kernel10.record.presetMounted ?? '(none)'}`)
+    }
+    for (const ch of '/preset') stdin10.text(ch)
+    stdin10.key('return')
+    await sleep(150)
+    const flow10 = (): string => stripSgr(writes10.join(''))
+    if (!flow10().includes('选择 Agent 预设') || !flow10().includes('标准模式')) {
+      problems.push('phase10：/preset 选择器未列出 roster')
+    }
+    stdin10.key('down')
+    await sleep(60)
+    stdin10.key('down')
+    await sleep(60)
+    stdin10.key('return') // minimal (broken-demo stays disabled at the tail)
+    await sleep(150)
+    if (!flow10().includes('预设已切换：minimal')) problems.push('phase10：预设选择未应用')
+    for (const ch of '/new') stdin10.text(ch)
+    stdin10.key('return')
+    await sleep(400) // dispose + fresh create (factory already registered)
+    if (kernel10.record.createOptions?.meta?.agentPreset !== 'minimal') {
+      problems.push(`phase10：新会话未携带预设 lineage：${JSON.stringify(kernel10.record.createOptions?.meta ?? null)}`)
+    }
+    if (kernel10.record.presetMounted !== 'minimal') problems.push('phase10：创建时未 mount 预设组成')
+    if (!flow10().includes('预设:minimal')) problems.push('phase10：页脚未显示 live 预设')
+    dispose10()
+    await sleep(20)
+  }
+
+  // ── Phase 10b: 预设挂载失败回退——mount 被拒不 brick 启动 ─────────────────
+  // A rejected preset composition rolls the whole create back; the app must
+  // retry ONCE rosterless (pre-preset behavior) instead of dying with
+  // "agent 启动失败". Boot: race-retry → create(mount throws) → fallback.
+  {
+    const writes11: string[] = []
+    const kernel11 = new FakeKernel(true)
+    kernel11.presetMountFails = true
+    const dispose11 = bootstrapApp(
+      kernel11,
+      { provider: '', model: '', fullscreen: false },
+      { stdout: () => makeStdout(writes11), stdin: () => new FakeStdin() },
+    )
+    await sleep(900) // 100ms factory race + mount rejection + rosterless retry
+    if (kernel11.record.createCalls < 2) {
+      problems.push(`phase10b：挂载失败后未回退重试（create 次数 ${kernel11.record.createCalls}）`)
+    }
+    if (kernel11.record.createOptions?.meta?.agentPreset !== undefined) {
+      problems.push(`phase10b：回退创建仍携带预设 lineage：${JSON.stringify(kernel11.record.createOptions?.meta ?? null)}`)
+    }
+    if (kernel11.record.presetMounted !== null) {
+      problems.push(`phase10b：被拒的 mount 不应生效：${kernel11.record.presetMounted}`)
+    }
+    const flow11 = (): string => stripSgr(writes11.join(''))
+    if (!flow11().includes('回退无预设组成')) problems.push('phase10b：未提示回退')
+    if (flow11().includes('agent 启动失败')) problems.push('phase10b：回退成功却报了启动失败')
+    dispose11()
     await sleep(20)
   }
 

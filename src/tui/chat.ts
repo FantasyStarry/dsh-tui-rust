@@ -56,6 +56,8 @@ export interface FrameContext {
   readonly sessionId: string | null
   /** Live selection override (picker result) — wins over the logged route. */
   readonly route: SessionRoute | null
+  /** Live agent preset id (`composedPreset`) for the footer slot. */
+  readonly preset?: string | null
   readonly usage: SessionUsage
   /** Wall-clock now, for the live thought timer. */
   readonly now: number
@@ -575,13 +577,15 @@ function footerLines(ctx: FrameContext, width: number): string[] {
   const routeText = route
     ? theme.text(`${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}`)
     : ''
+  // Live agent preset (M5 status slot): model-adjacent, vanishes when unknown.
+  const presetText = ctx.preset ? theme.text(`预设:${ctx.preset}`) : ''
   // M3/M4 status slots: title · yolo/policy · git branch — all best-effort,
   // all truncated by the gutter guard. Empty slots vanish, never blank gaps.
   const titleText = ctx.title ? theme.text(`「${ctx.title}」`) : ''
   const modeText = ctx.yolo ? theme.warn('yolo') : ctx.policy === 'never' ? theme.warn('never') : ''
   const branchText = ctx.branch ? theme.muted(`⑂ ${ctx.branch}`) : ''
   const dir = theme.muted(short(ctx.cwd))
-  const line1 = [badge, routeText, titleText, modeText, dir, branchText]
+  const line1 = [badge, routeText, presetText, titleText, modeText, dir, branchText]
     .filter((part) => part !== '')
     .join(theme.subtle(' │ '))
 

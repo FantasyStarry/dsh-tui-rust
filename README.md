@@ -68,6 +68,7 @@ dsh --profile orca          # 或安装后直接 orca
 | 入口 | 作用 |
 | --- | --- |
 | `/model` | provider → 模型 → 思考强度 三段选择器，waterfall 热切换、持久化默认 |
+| `/preset` | Agent 预设 roster 选择器（standard/ptc/minimal/cordis），下个新会话挂载组成、页脚显示 live 预设 |
 | `/img <路径>` · `Ctrl+V` · 粘贴/输入图片路径 | 附加图片（png/jpg/webp/gif），随下一条消息发送，`Esc` 取消 |
 | `@路径` · `@"含空格路径"` | 文件补全（内核 `fileReferences`，缺席时本地扫描），↑↓/Tab/Enter |
 | `/` | 命令菜单（过滤/↑↓/Tab/Enter），未知命令回退为普通消息 |
@@ -78,7 +79,7 @@ dsh --profile orca          # 或安装后直接 orca
 | `Ctrl+C` | 打断回合/清空输入；1.2s 内再按退出 |
 | `Ctrl+A/E/K/U/W`、`Ctrl+←/→` | readline 风编辑（行首/行尾/删至行尾/行首/删词） |
 
-命令全集见 `/help`（信息 `/usage` · 会话 `/new` `/resume` `/title` `/compact` · 模式 `/yolo` `/permission`）。
+命令全集见 `/help`（信息 `/usage` · 会话 `/new` `/resume` `/title` `/compact` `/preset` · 模式 `/yolo` `/permission`）。
 
 ## 真机回归探针
 
