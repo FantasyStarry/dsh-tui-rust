@@ -52,11 +52,20 @@ async function runUpdate() {
 if (args[0] === 'update' || args[0] === '--update') {
   await runUpdate()
 } else {
-  const child = spawn('dsh', ['--profile', profile], {
-    stdio: 'inherit',
-    shell: process.platform === 'win32',
-    env: process.env,
-  })
+  // Avoid Node's DEP0190 (shell:true + args array). On Windows npm's `dsh`
+  // is a .cmd shim, so route through cmd.exe explicitly; elsewhere spawn dsh
+  // directly.
+  const child =
+    process.platform === 'win32'
+      ? spawn('cmd.exe', ['/d', '/s', '/c', `dsh --profile "${profile.replaceAll('"', '""')}"`], {
+          stdio: 'inherit',
+          windowsHide: true,
+          env: process.env,
+        })
+      : spawn('dsh', ['--profile', profile], {
+          stdio: 'inherit',
+          env: process.env,
+        })
 
   child.on('error', (error) => {
     const code = /** @type {NodeJS.ErrnoException} */ (error).code
