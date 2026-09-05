@@ -563,7 +563,7 @@ function layoutTail(layout: ChannelLayoutCache, count: number): string[] {
 }
 
 /** One-time welcome block — kimi-style box with info rows; brand wordmark. */
-export function welcomeCard(cwd: string, sessionId: string | null, model: string | null, width: number): string[] {
+export function welcomeCard(cwd: string, sessionId: string | null, model: string | null, width: number, version: string): string[] {
   const style: BoxStyle = { bg: (t) => t, border: theme.primary }
   // README 品牌：🐋（U+1F40B，eastAsianWidth = 2，与终端 emoji 渲染一致，
   // 不上色——原生彩色 emoji 就是 logo 本体）。
@@ -577,6 +577,7 @@ export function welcomeCard(cwd: string, sessionId: string | null, model: string
     label('Directory:') + '  ' + short(cwd),
     label('Session:') + '    ' + (sessionId ? shortSession(sessionId) : '—'),
     label('Model:') + '      ' + (model !== null ? cleanLine(model) : theme.warn('未设置')),
+    label('Version:') + '    ' + cleanLine(version),
   ]
   return ['', ...boxed(['', row0, row1, '', ...info, ''], width, style), '']
 }

@@ -2159,7 +2159,7 @@ export function bootstrapApp(
     if (!welcomed && agent) {
       welcomed = true
       const routeModel = route ? `${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}` : null
-      channel.pushRaw(welcomeCard(process.cwd(), agent.session.id, routeModel, stdout.columns ?? 80), true)
+      channel.pushRaw(welcomeCard(process.cwd(), agent.session.id, routeModel, stdout.columns ?? 80, currentOrcaVersion()), true)
       if (route) {
         channel.pushRaw([routeLine(route)], true)
         lastRouteKey = routeKey(route)

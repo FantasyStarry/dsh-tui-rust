@@ -6,6 +6,20 @@
 orca / dsh-orca   # 均 ≡ dsh --profile orca
 ```
 
+## 命令行
+
+| 命令 | 作用 |
+| --- | --- |
+| `orca` / `dsh-orca` | 启动 Orca TUI |
+| `orca --help` / `-h` | 显示帮助 |
+| `orca --version` / `-v` | 显示版本号 |
+| `orca update` | 检查并更新 dsh-orca |
+| `orca --profile <name>` | 指定 dsh profile（默认 orca） |
+| `orca --fullscreen` | 以全屏备用屏模式启动 |
+| `orca --resume <id>` | 恢复指定会话 |
+| `orca --debug` | 开启 ORCA_DEBUG 诊断 |
+| `orca --nerd-font` | 开启页脚 Nerd Font 分支图标 |
+
 ## 为什么重来一次
 
 本仓库的前身是一个 Rust 编写的 ACP 客户端（TUI spawn `dsh --profile acp` 子进程，stdio 上跑 JSON-RPC）。那条路的三个结构性问题最终让方向「做偏」：
