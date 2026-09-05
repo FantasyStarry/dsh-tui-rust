@@ -930,7 +930,7 @@ async function main(): Promise<void> {
   }
 
   await typeLine('/help')
-  if (!visible3().includes('可用命令') || !visible3().includes('/resume')) problems.push('phase3：/help 未列出会话命令')
+  if (!visible3().includes('【信息】/help') || !visible3().includes('/resume')) problems.push('phase3：/help 未列出会话命令')
   await typeLine('/usage')
   if (!visible3().includes('用量')) problems.push('phase3：/usage 未上屏')
   // Turn summary: one scripted turn settles a `✓ 本轮 · 用时 · tok/s` row.
@@ -958,6 +958,10 @@ async function main(): Promise<void> {
   }
   await typeLine('/yolo off')
   if (!visible3().includes('yolo 已关闭')) problems.push('phase3：/yolo off 未上屏')
+  await typeLine('/nerdfont on')
+  if (!visible3().includes('Nerd Font 分支图标已开启')) problems.push('phase3：/nerdfont on 未上屏')
+  await typeLine('/nerdfont off')
+  if (!visible3().includes('Nerd Font 分支图标已关闭')) problems.push('phase3：/nerdfont off 未上屏')
   // Panel path: the ask pends, the picker shows, `1` allows.
   {
     const listener = kernel3.record.approvalListener

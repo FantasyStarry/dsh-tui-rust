@@ -116,6 +116,7 @@ const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'usage', aliases: [], group: '信息', description: '显示 token 用量明细' },
   { name: 'yolo', aliases: [], group: '模式', description: '审批全放行开关（on/off）' },
   { name: 'permission', aliases: [], group: '模式', description: '查看当前审批策略' },
+  { name: 'nerdfont', aliases: ['branch-icon'], group: '界面', description: '切换页脚 git 分支 Nerd Font 图标（on/off，无参切换）' },
 ]
 
 function findSlash(name: string): SlashCommand | undefined {
@@ -474,6 +475,9 @@ export function bootstrapApp(
       case 'permission':
         showPermission()
         break
+      case 'nerdfont':
+        doNerdFont(args)
+        break
       default:
         channel.pushSystem(`未知命令：/${name}（/help 查看）`)
         break
@@ -565,6 +569,24 @@ export function bootstrapApp(
       return
     }
     await attachImageFile(path)
+  }
+
+  const doNerdFont = (args: string): void => {
+    const arg = args.trim().toLowerCase()
+    let next: boolean
+    if (arg === '' || arg === 'toggle') {
+      next = !nerdFont
+    } else if (arg === 'on' || arg === '1' || arg === 'true' || arg === 'yes') {
+      next = true
+    } else if (arg === 'off' || arg === '0' || arg === 'false' || arg === 'no') {
+      next = false
+    } else {
+      channel.pushSystem('用法：/nerdfont [on|off]（无参切换）')
+      return
+    }
+    nerdFont = next
+    writeOrcaSettings({ nerdFont })
+    channel.pushSystem(next ? 'Nerd Font 分支图标已开启（页脚显示 ）' : 'Nerd Font 分支图标已关闭（仅显示分支名）')
   }
 
   const doTitle = (args: string): void => {
@@ -1420,6 +1442,8 @@ export function bootstrapApp(
   // 不再有"浮动→钉底"跳变需要闩）。
   /** Ctrl+O: full thinking text instead of the short live preview (kimi expand). */
   let thoughtExpanded = false
+  /** Nerd Font branch icon in footer (ORCA_NERD_FONT env or `/nerdfont`). */
+  let nerdFont = process.env['ORCA_NERD_FONT'] === '1' || readOrcaSettings().nerdFont === true
   /** Submitted prompts (slash commands excluded) — ↑ recalls, ↓ returns. */
   const promptHistory: string[] = []
   let historyIndex: number | null = null
@@ -2147,7 +2171,7 @@ export function bootstrapApp(
       policy: approvalPolicy,
       yolo: yoloMode,
       branch: gitBranch(cwd),
-      nerdFont: process.env['ORCA_NERD_FONT'] === '1',
+      nerdFont,
     })
     renderer.render(frame.live, frame.stream, frame.cursor)
     // Advance only past lines the frame actually sedimented. Unflushed sealed
@@ -2294,6 +2318,38 @@ function writeLastSession(sessionId: string): void {
     writeFileSync(lastSessionFile(), JSON.stringify({ pid: process.pid, sessionId }))
   } catch {
     // Marker loss only costs a silent remount, never the session.
+  }
+}
+
+interface OrcaSettings {
+  readonly nerdFont?: boolean
+}
+
+/** Local Orca UI settings file (command-persisted, best-effort). */
+function orcaSettingsFile(): string {
+  const override = process.env['ORCA_SETTINGS_FILE']
+  if (override) return override
+  const home = process.env['USERPROFILE'] ?? process.env['HOME'] ?? ''
+  return join(home, '.dsh', 'orca-settings.json')
+}
+
+function readOrcaSettings(): OrcaSettings {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(orcaSettingsFile(), 'utf8'))
+    const record = recordOf(parsed)
+    if (!record) return {}
+    const nerdFont = record['nerdFont']
+    return typeof nerdFont === 'boolean' ? { nerdFont } : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeOrcaSettings(settings: OrcaSettings): void {
+  try {
+    writeFileSync(orcaSettingsFile(), JSON.stringify(settings))
+  } catch {
+    // Best-effort: the in-session toggle still works even if persistence fails.
   }
 }
 
