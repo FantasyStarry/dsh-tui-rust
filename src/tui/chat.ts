@@ -80,6 +80,9 @@ export interface FrameContext {
   readonly yolo?: boolean
   /** Git branch for the footer slot (M4 status slot, best-effort). */
   readonly branch?: string | null
+  /** Opt-in Nerd Font branch icon (`ORCA_NERD_FONT=1`); off by default so
+   *  terminals without the glyph fall back to a plain branch name. */
+  readonly nerdFont?: boolean
   /** Alternate-screen mode: whole-viewport window, chrome always pinned. */
   readonly fullscreen?: boolean
 }
@@ -782,7 +785,9 @@ function footerLines(ctx: FrameContext, width: number): string[] {
   // all truncated by the gutter guard. Empty slots vanish, never blank gaps.
   const titleText = ctx.title ? theme.text(`「${cleanLine(ctx.title)}」`) : ''
   const modeText = ctx.yolo ? theme.warn('yolo') : ctx.policy === 'never' ? theme.warn('never') : ''
-  const branchText = ctx.branch ? theme.muted(cleanLine(ctx.branch)) : ''
+  const branchName = ctx.branch ? cleanLine(ctx.branch) : ''
+  const branchIcon = ctx.nerdFont ? ' ' : ''
+  const branchText = branchName ? theme.muted(branchIcon + branchName) : ''
   const dir = theme.muted(short(ctx.cwd))
   const line1 = [badge, routeText, presetText, titleText, modeText, dir, branchText]
     .filter((part) => part !== '')

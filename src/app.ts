@@ -2147,6 +2147,7 @@ export function bootstrapApp(
       policy: approvalPolicy,
       yolo: yoloMode,
       branch: gitBranch(cwd),
+      nerdFont: process.env['ORCA_NERD_FONT'] === '1',
     })
     renderer.render(frame.live, frame.stream, frame.cursor)
     // Advance only past lines the frame actually sedimented. Unflushed sealed
