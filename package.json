@@ -45,7 +45,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx/esm --test scripts/lifecycle.test.ts scripts/render-regressions.ts",
     "dev": "node --import tsx/esm scripts/dev.ts",
-    "probe:scrollback": "node scripts/probe-scrollback.mjs"
+    "probe:scrollback": "node scripts/probe-scrollback.mjs",
+    "prepublishOnly": "pnpm build && pnpm test"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
