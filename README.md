@@ -3,7 +3,7 @@
 **属于你自己的 DeepSeek Harness 终端前端** —— 一个 TypeScript Cordis 插件，挂载进 dsh 自定义 profile，跑在官方内核进程内。零内核改动，卸载无残留。
 
 ```sh
-orca   # ≡ dsh --profile orca
+orca / dsh-orca   # 均 ≡ dsh --profile orca
 ```
 
 ## 为什么重来一次
@@ -59,7 +59,7 @@ pnpm dev          # 假内核冒烟：渲染循环 + 键盘 + 降级启动路径
 
 ```sh
 dsh plugin --profile orca add <本包路径或 npm 包名>
-dsh --profile orca          # 或安装后直接 orca
+dsh --profile orca          # 或安装后直接 orca / dsh-orca
 ```
 
 `ORCA_RESUME_SESSION=<id>` 恢复会话；`ORCA_PROVIDER`/`ORCA_MODEL` 成对覆盖模型路由（默认空 = 组合默认 `agentDefaultModel`，内核自身不会兜底缺省模型）；`ORCA_FULLSCREEN=1` 切备用屏（骨架期默认 inline 主屏）；页脚 git 分支前的 Nerd Font 图标 `` 用 `/nerdfont` 命令切换（默认关闭，避免字体不支持时出现豆腐块；`ORCA_NERD_FONT=1` 仍可作为启动初始值）。思考强度经 `/model` 第三段选择（或 dsh settings 的 `agent-default-model` 命名空间）设定，选择会经 `agentDefaultModel.saveSelection` 尽力持久化。

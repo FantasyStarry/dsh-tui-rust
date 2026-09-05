@@ -30,7 +30,8 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "orca": "./bin/orca.js"
+    "orca": "./bin/orca.js",
+    "dsh-orca": "./bin/orca.js"
   },
   "files": [
     "lib",
