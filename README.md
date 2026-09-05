@@ -69,6 +69,7 @@ dsh --profile orca          # 或安装后直接 orca / dsh-orca
 | 入口 | 作用 |
 | --- | --- |
 | `/model` | provider → 模型 → 思考强度 三段选择器，waterfall 热切换、持久化默认 |
+| `update` / `/update` | 检查并更新 dsh-orca 到最新版（CLI 运行 `orca update` 或 `dsh-orca update`） |
 | `/preset` | Agent 预设 roster 选择器（standard/ptc/minimal/cordis），下个新会话挂载组成、页脚显示 live 预设 |
 | `/img <路径>` · `Ctrl+V`/`Alt+V` · 粘贴/输入图片路径 | 附加图片（png/jpg/webp/gif），输入框内联 `[image #N]`，可 Backspace/Delete 删除，随下一条消息发送，`Esc` 全部取消 |
 | `@路径` · `@"含空格路径"` | 文件补全（内核 `fileReferences`，缺席时本地扫描），↑↓/Tab/Enter |

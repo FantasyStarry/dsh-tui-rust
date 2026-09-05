@@ -56,6 +56,7 @@ import { classify, Keyboard } from './tui/input.js'
 import type { KeyPress } from './tui/input.js'
 import { openPicker, movePicker, pickedItem, type PickerItem, type PickerState } from './tui/picker.js'
 import { Renderer } from './tui/renderer.js'
+import { currentOrcaVersion, fetchLatestOrcaVersion, installLatestOrca, compareVersions } from './update.js'
 
 export interface AppIoDeps {
   stdout(): NodeJS.WriteStream
@@ -117,6 +118,7 @@ const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'yolo', aliases: [], group: '模式', description: '审批全放行开关（on/off）' },
   { name: 'permission', aliases: [], group: '模式', description: '查看当前审批策略' },
   { name: 'nerdfont', aliases: ['branch-icon'], group: '界面', description: '切换页脚 git 分支 Nerd Font 图标（on/off，无参切换）' },
+  { name: 'update', aliases: ['upgrade'], group: '信息', description: '检查并更新 dsh-orca 到最新版' },
 ]
 
 function findSlash(name: string): SlashCommand | undefined {
@@ -478,6 +480,9 @@ export function bootstrapApp(
       case 'nerdfont':
         doNerdFont(args)
         break
+      case 'update':
+        void doUpdate(args)
+        break
       default:
         channel.pushSystem(`未知命令：/${name}（/help 查看）`)
         break
@@ -587,6 +592,27 @@ export function bootstrapApp(
     nerdFont = next
     writeOrcaSettings({ nerdFont })
     channel.pushSystem(next ? 'Nerd Font 分支图标已开启（页脚显示 ）' : 'Nerd Font 分支图标已关闭（仅显示分支名）')
+  }
+
+  const doUpdate = async (_args: string): Promise<void> => {
+    const current = currentOrcaVersion()
+    channel.pushSystem(`当前版本：v${current}，正在检查最新版本...`)
+    const latest = await fetchLatestOrcaVersion()
+    if (!latest) {
+      channel.pushSystem('检查最新版本失败：请确认网络或 npm 可用')
+      return
+    }
+    if (compareVersions(latest, current) <= 0) {
+      channel.pushSystem(`已是最新版本：v${current}`)
+      return
+    }
+    channel.pushSystem(`发现新版本：v${latest}，开始更新...`)
+    const result = await installLatestOrca()
+    if (result.ok) {
+      channel.pushSystem(`更新成功：v${latest}，请重启 Orca 生效`)
+    } else {
+      channel.pushSystem(`更新失败：${result.message}`)
+    }
   }
 
   const doTitle = (args: string): void => {
