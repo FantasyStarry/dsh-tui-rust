@@ -14,7 +14,7 @@
  * event types are ignored, legacy flat payloads still parse.
  */
 
-import type { SessionEvent, StreamChunk } from '../kernel/types.js'
+import type { SessionEvent, StreamChunk, TodoItem } from '../kernel/types.js'
 
 export type RowKind = 'user' | 'assistant' | 'thought' | 'tool' | 'system'
 
@@ -310,6 +310,8 @@ export class Channel {
   private turnCacheWrite = 0
   /** Latest folded `session/title` text — session truth for footer/browser. */
   title: string | null = null
+  /** Latest todo list from `todo/write` (agent truth; UI edits are local). */
+  todos: TodoItem[] = []
   /** True while a `compaction/start` … `compaction/end` cycle is open. */
   compacting = false
   /** Last observed event seq (for rewind boundaries). Null before any event. */
@@ -623,6 +625,17 @@ export class Channel {
       case 'todo/write': {
         const data = dataOf(event)
         const todos = Array.isArray(data['todos']) ? data['todos'] : []
+        this.todos = todos
+          .map((item) => {
+            const record = recordOf(item)
+            if (!record) return null
+            const content = str(record, 'content')
+            const status = str(record, 'status')
+            if (!content || (status !== 'pending' && status !== 'in_progress' && status !== 'completed')) return null
+            return { content, status } satisfies TodoItem
+          })
+          .filter((item): item is TodoItem => item !== null)
+        this.version++
         if (todos.length > 0) {
           const lines = todos
             .map((item) => {
@@ -740,6 +753,7 @@ export class Channel {
     this.turnCacheRead = 0
     this.turnCacheWrite = 0
     this.title = null
+    this.todos = []
     this.compacting = false
     this.lastSeq = null
     this.turnSeqs = []

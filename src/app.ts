@@ -48,6 +48,7 @@ import type {
   KernelSessionTitleService,
   KernelSessionsService,
   SessionEvent,
+  TodoItem,
   UserMessage,
 } from './kernel/types.js'
 import { KERNEL_EVENTS } from './kernel/types.js'
@@ -119,6 +120,9 @@ const SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'permission', aliases: [], group: '模式', description: '查看当前审批策略' },
   { name: 'nerdfont', aliases: ['branch-icon'], group: '界面', description: '切换页脚 git 分支 Nerd Font 图标（on/off，无参切换）' },
   { name: 'update', aliases: ['upgrade'], group: '信息', description: '检查并更新 dsh-orca 到最新版' },
+  { name: 'todo', aliases: ['todos'], group: '任务', description: '查看/编辑待办（list/add/done/undo/del/clear）' },
+  { name: 'ask', aliases: [], group: '模式', description: '向 agent 提问（仅回答，不执行工具）' },
+  { name: 'plan', aliases: [], group: '模式', description: '切换 plan 模式（只规划，不执行工具）' },
 ]
 
 function findSlash(name: string): SlashCommand | undefined {
@@ -249,6 +253,10 @@ export function bootstrapApp(
   let approvalPolicy: KernelApprovalPolicy = 'ask'
   /** Yolo mode: auto-answer every approval ask with `allowed-once`. */
   let yoloMode = false
+  /** Plan mode: reject tool approvals so the agent only produces a plan. */
+  let planMode = false
+  /** One-shot ask mode: the current `/ask` turn should answer without tools. */
+  let askMode = false
 
   /** Live model selection — overrides the request route via the waterfall. */
   let selection: SessionRoute | null = null
@@ -314,6 +322,8 @@ export function bootstrapApp(
     reason: string,
     signal: AbortSignal | undefined,
   ): Promise<'allowed-once' | 'rejected' | 'cancelled'> => {
+    // Plan/ask modes block tool execution by rejecting approvals before yolo.
+    if (planMode || askMode) return Promise.resolve('rejected')
     // Yolo: auto-allow without ever showing the panel.
     if (yoloMode) return Promise.resolve('allowed-once')
     if (disposed) return Promise.resolve('cancelled')
@@ -354,6 +364,8 @@ export function bootstrapApp(
       if (event && typeof event.type === 'string') {
         if (replaying) bufferedEvents.push(event as SessionEvent)
         else project(event as SessionEvent)
+        // One-shot /ask mode lasts exactly one turn.
+        if (event.type === 'turn/end') askMode = false
         // Fold the durable approval override for the footer — the log is
         // truth; the local /yolo switch below only updates the same fold.
         if (event.type === 'approval/policy' && agent) {
@@ -482,6 +494,15 @@ export function bootstrapApp(
         break
       case 'update':
         void doUpdate(args)
+        break
+      case 'todo':
+        doTodo(args)
+        break
+      case 'ask':
+        doAsk(args)
+        break
+      case 'plan':
+        doPlan(args)
         break
       default:
         channel.pushSystem(`未知命令：/${name}（/help 查看）`)
@@ -613,6 +634,104 @@ export function bootstrapApp(
     } else {
       channel.pushSystem(`更新失败：${result.message}`)
     }
+  }
+
+  const doTodo = (args: string): void => {
+    const parts = args.trim().split(/\s+/).filter((part) => part !== '')
+    const command = (parts[0] ?? 'list').toLowerCase()
+    const todos = channel.todos
+    const showList = (): void => {
+      if (todos.length === 0) {
+        channel.pushSystem('暂无待办')
+        return
+      }
+      const lines = todos.map((todo, index) => {
+        const mark = todo.status === 'completed' ? '✓' : todo.status === 'in_progress' ? '◐' : '○'
+        return `${index + 1}. ${mark} ${todo.content}`
+      })
+      channel.pushSystem(`待办（${todos.length}）：`)
+      for (const line of lines) channel.pushSystem(line)
+    }
+    const update = (next: TodoItem[]): void => {
+      channel.todos = next
+      channel.version++
+      showList()
+    }
+    switch (command) {
+      case 'list':
+      case 'ls':
+        showList()
+        break
+      case 'add': {
+        const text = parts.slice(1).join(' ').trim()
+        if (!text) {
+          channel.pushSystem('用法：/todo add <内容>')
+          return
+        }
+        update([...todos, { content: text, status: 'pending' }])
+        break
+      }
+      case 'done': {
+        const n = Number(parts[1])
+        if (!Number.isInteger(n) || n < 1 || n > todos.length) {
+          channel.pushSystem(`用法：/todo done <编号>（1-${todos.length}）`)
+          return
+        }
+        update(todos.map((todo, index) => (index === n - 1 ? { ...todo, status: 'completed' } : todo)))
+        break
+      }
+      case 'undo': {
+        const n = Number(parts[1])
+        if (!Number.isInteger(n) || n < 1 || n > todos.length) {
+          channel.pushSystem(`用法：/todo undo <编号>（1-${todos.length}）`)
+          return
+        }
+        update(todos.map((todo, index) => (index === n - 1 ? { ...todo, status: 'pending' } : todo)))
+        break
+      }
+      case 'del':
+      case 'delete': {
+        const n = Number(parts[1])
+        if (!Number.isInteger(n) || n < 1 || n > todos.length) {
+          channel.pushSystem(`用法：/todo del <编号>（1-${todos.length}）`)
+          return
+        }
+        update(todos.filter((_, index) => index !== n - 1))
+        break
+      }
+      case 'clear':
+        update([])
+        break
+      default:
+        channel.pushSystem('用法：/todo [list|add <内容>|done <编号>|undo <编号>|del <编号>|clear]')
+        break
+    }
+  }
+
+  const doAsk = (args: string): void => {
+    const question = args.trim()
+    if (!question) {
+      channel.pushSystem('用法：/ask <问题>')
+      return
+    }
+    askMode = true
+    channel.pushSystem('Ask 模式：本轮只回答，不执行工具')
+    submit(question, [])
+  }
+
+  const doPlan = (args: string): void => {
+    const arg = args.trim().toLowerCase()
+    let next: boolean
+    if (arg === '' || arg === 'toggle') next = !planMode
+    else if (arg === 'on' || arg === '1' || arg === 'true') next = true
+    else if (arg === 'off' || arg === '0' || arg === 'false') next = false
+    else {
+      channel.pushSystem('用法：/plan [on|off]（无参切换）')
+      return
+    }
+    planMode = next
+    if (next) askMode = false
+    channel.pushSystem(next ? 'Plan 模式已开启：只规划，不执行工具' : 'Plan 模式已关闭：恢复正常执行')
   }
 
   const doTitle = (args: string): void => {
@@ -2196,6 +2315,8 @@ export function bootstrapApp(
       title,
       policy: approvalPolicy,
       yolo: yoloMode,
+      planMode,
+      askMode,
       branch: gitBranch(cwd),
       nerdFont,
     })

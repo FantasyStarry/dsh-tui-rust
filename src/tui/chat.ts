@@ -78,6 +78,10 @@ export interface FrameContext {
   readonly policy?: string
   /** Yolo auto-allow flag for the footer badge (M4). */
   readonly yolo?: boolean
+  /** Plan mode flag for the footer badge. */
+  readonly planMode?: boolean
+  /** One-shot ask mode flag for the footer badge. */
+  readonly askMode?: boolean
   /** Git branch for the footer slot (M4 status slot, best-effort). */
   readonly branch?: string | null
   /** Opt-in Nerd Font branch icon (`ORCA_NERD_FONT=1`); off by default so
@@ -786,11 +790,13 @@ function footerLines(ctx: FrameContext, width: number): string[] {
   // all truncated by the gutter guard. Empty slots vanish, never blank gaps.
   const titleText = ctx.title ? theme.text(`「${cleanLine(ctx.title)}」`) : ''
   const modeText = ctx.yolo ? theme.warn('yolo') : ctx.policy === 'never' ? theme.warn('never') : ''
+  const planText = ctx.planMode ? theme.warn('plan') : ''
+  const askText = ctx.askMode ? theme.warn('ask') : ''
   const branchName = ctx.branch ? cleanLine(ctx.branch) : ''
   const branchIcon = ctx.nerdFont ? ' ' : ''
   const branchText = branchName ? theme.muted(branchIcon + branchName) : ''
   const dir = theme.muted(short(ctx.cwd))
-  const line1 = [badge, routeText, presetText, titleText, modeText, dir, branchText]
+  const line1 = [badge, routeText, presetText, titleText, modeText, planText, askText, dir, branchText]
     .filter((part) => part !== '')
     .join(theme.subtle(' │ '))
 

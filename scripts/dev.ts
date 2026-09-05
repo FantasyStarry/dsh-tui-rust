@@ -930,7 +930,7 @@ async function main(): Promise<void> {
   }
 
   await typeLine('/help')
-  if (!visible3().includes('【信息】/help') || !visible3().includes('/resume')) problems.push('phase3：/help 未列出会话命令')
+  if (!visible3().includes('【任务】/todo') || !visible3().includes('/resume')) problems.push('phase3：/help 未列出会话命令')
   await typeLine('/usage')
   if (!visible3().includes('用量')) problems.push('phase3：/usage 未上屏')
   // Turn summary: one scripted turn settles a `✓ 本轮 · 用时 · tok/s` row.
