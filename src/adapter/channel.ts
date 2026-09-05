@@ -26,6 +26,8 @@ export interface TranscriptRow {
   status?: 'pending' | 'running' | 'ok' | 'failed'
   /** Tool rows: tool display name. */
   tool?: string
+  /** Durable tool/call id, matched by tool-result blocks. */
+  toolCallId?: string
   /** Tool rows: thought-style live timer. */
   startMs?: number
   /** Thought rows: sealed duration in seconds (collapses the block). */
@@ -312,6 +314,7 @@ export class Channel {
 
   private openAssistantId: number | null = null
   private openThoughtId: number | null = null
+  private readonly pendingTools = new Map<string, TranscriptRow>()
 
   ingest(event: SessionEvent): void {
     if (typeof event.seq === 'number' && Number.isFinite(event.seq)) {
@@ -470,31 +473,41 @@ export class Channel {
       case 'tool/call': {
         const data = dataOf(event)
         const tool = str(data, 'name', 'tool') || 'tool'
+        const callId = str(data, 'callId')
         this.sealThought()
         this.openAssistantId = null
-        this.rows.push({
+        const row: TranscriptRow = {
           id: ++rowId,
           kind: 'tool',
           tool,
           text: preview(str(data, 'arguments', 'summary', 'input')),
           status: 'running',
           seq: ++this.version,
-        })
+          ...(callId ? { toolCallId: callId } : {}),
+        }
+        this.rows.push(row)
+        if (callId) this.pendingTools.set(callId, row)
         this.runState = 'working'
         break
       }
       case 'tool/result': {
         const data = dataOf(event)
-        const last = this.lastToolRow()
+        const message = recordOf(data['message'])
+        const content = message && Array.isArray(message['content']) ? message['content'] : []
+        const firstBlock = recordOf(content[0])
+        const source = message && recordOf(message['source'])
+        const callId = (firstBlock && str(firstBlock, 'toolCallId')) || (source && str(source, 'callId')) || str(data, 'callId')
+        // Legacy events without ids are only unambiguous with one pending row.
+        const candidates = callId ? [] : this.rows.slice(this.sealedRowCount).filter((row) => row.kind === 'tool' && row.status === 'running')
+        const last = callId ? this.pendingTools.get(callId) : candidates.length === 1 ? candidates[0] : undefined
         if (last) {
-          const message = recordOf(data['message'])
-          const content = message && Array.isArray(message['content']) ? message['content'] : []
-          const firstBlock = recordOf(content[0])
           const failed =
             data['error'] !== undefined ||
             data['isError'] === true ||
             (firstBlock && firstBlock['isError'] === true)
           last.status = failed ? 'failed' : 'ok'
+          last.seq = ++this.version
+          if (last.toolCallId) this.pendingTools.delete(last.toolCallId)
           const diff = diffViewFromMeta(data['meta'])
           if (diff) {
             last.diff = diff
@@ -504,7 +517,7 @@ export class Channel {
             if (out) last.text = preview(out)
           }
         }
-        this.runState = 'thinking'
+        if (last) this.runState = this.pendingTools.size > 0 ? 'working' : 'thinking'
         break
       }
       case 'session/title': {
@@ -711,6 +724,7 @@ export class Channel {
     this.sealedRowCount = 0
     this.openAssistantId = null
     this.openThoughtId = null
+    this.pendingTools.clear()
     this.runState = 'idle'
     this.route = null
     this.usage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, messages: 0 }
@@ -760,11 +774,4 @@ export class Channel {
     this.version++
   }
 
-  private lastToolRow(): TranscriptRow | undefined {
-    for (let i = this.rows.length - 1; i >= 0; i--) {
-      const row = this.rows[i]
-      if (row && row.kind === 'tool') return row
-    }
-    return undefined
-  }
 }

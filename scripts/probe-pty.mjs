@@ -453,7 +453,7 @@ function assertFooterPinned(step) {
 if (process.argv.includes('--fullscreen')) {
   const globalTimer = setTimeout(() => fail(`全局超时 ${GLOBAL_TIMEOUT_MS}ms`), GLOBAL_TIMEOUT_MS)
   try {
-    await waitMarker('fullscreen 连接', /orca 已连接/)
+    await waitMarker('fullscreen 连接', /DeepSeek Harness 终端前端/)
     await waitMarker('fullscreen session', /session 已连接：session-[0-9a-f-]+/)
     await settle()
     assertInputBox('fullscreen 启动', '')

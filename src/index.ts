@@ -80,7 +80,8 @@ export const Config: StandardSchema = {
  * torn down before the new one paints, even if the host disposes effects
  * late. Disposers are idempotent, so every ordering is safe.
  */
-let liveDispose: (() => void) | null = null
+let liveDispose: (() => Promise<void>) | null = null
+let lastTeardown: Promise<void> = Promise.resolve()
 
 export function apply(ctx: KernelContext, config: Partial<OrcaConfig> = {}): void {
   const resolved: OrcaConfig = { ...DEFAULTS, ...config }
@@ -94,13 +95,18 @@ export function apply(ctx: KernelContext, config: Partial<OrcaConfig> = {}): voi
     if (!process.stdout.isTTY || !process.stdin.isTTY) {
       return undefined
     }
-    liveDispose?.()
+    const previous = liveDispose?.() ?? lastTeardown
+    lastTeardown = previous
     liveDispose = null
-    const dispose = bootstrapApp(ctx, resolved)
+    const dispose = bootstrapApp(ctx, resolved, undefined, previous)
     liveDispose = dispose
     return () => {
-      if (liveDispose === dispose) liveDispose = null
-      dispose()
+      const pending = dispose()
+      if (liveDispose === dispose) {
+        liveDispose = null
+        lastTeardown = pending
+      }
+      return pending
     }
   })
 }

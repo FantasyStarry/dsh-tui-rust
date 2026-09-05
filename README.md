@@ -51,6 +51,7 @@ Cordis profile (orca)
 ```sh
 pnpm install
 pnpm build        # tsc → lib/
+pnpm test         # 会话生命周期、并行工具、渲染安全与缓存回归
 pnpm dev          # 假内核冒烟：渲染循环 + 键盘 + 降级启动路径
 ```
 

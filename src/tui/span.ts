@@ -7,6 +7,7 @@
  */
 
 import { charWidth } from './width.js'
+import { cleanText } from './sanitize.js'
 
 export interface Span {
   readonly text: string
@@ -16,7 +17,7 @@ export interface Span {
 export function spansWidth(spans: readonly Span[]): number {
   let width = 0
   for (const span of spans) {
-    for (const ch of span.text) width += charWidth(ch.codePointAt(0) ?? 0)
+    for (const ch of cleanText(span.text)) width += charWidth(ch.codePointAt(0) ?? 0)
   }
   return width
 }
@@ -27,7 +28,8 @@ export function renderSpans(spans: readonly Span[], width: number, ellipsis = 'â
   if (spansWidth(spans) <= width) {
     let out = ''
     for (const span of spans) {
-      out += span.paint ? span.paint(span.text) : span.text
+      const text = cleanText(span.text)
+      out += span.paint ? span.paint(text) : text
     }
     return out
   }
@@ -40,7 +42,7 @@ export function renderSpans(spans: readonly Span[], width: number, ellipsis = 'â
   let used = 0
   outer: for (const span of spans) {
     const paint = span.paint
-    for (const ch of span.text) {
+    for (const ch of cleanText(span.text)) {
       const w = charWidth(ch.codePointAt(0) ?? 0)
       if (used + w > budget) break outer
       out += paint ? paint(ch) : ch
@@ -71,7 +73,7 @@ export function wrapSpans(spans: readonly Span[], width: number, indent = ''): s
   }
 
   for (const span of spans) {
-    const words = span.text.split(/(\s+)/u)
+    const words = cleanText(span.text).split(/(\s+)/u)
     for (const word of words) {
       if (word === '') continue
       const isSpace = /^\s+$/u.test(word)

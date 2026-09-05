@@ -32,9 +32,10 @@ const ctx = {
   get(name: string, _soft?: boolean): unknown {
     if (name === 'agents') {
       return {
-        create: async () => {
+        create: async (options: { sessionId: string }) => {
           const session = {
-            id: 'session-exp',
+            id: options.sessionId,
+            turnNo: 0,
             events: [] as Array<{ type: string; seq: number; time: number; data: unknown }>,
             append(type: string, data: unknown) {
               const ev = { type, seq: session.events.length + 1, time: Date.now(), data }
@@ -43,15 +44,14 @@ const ctx = {
             },
           }
           const agent = {
-            id: 'a1',
+            id: options.sessionId,
             options: { provider: 'exp', model: 'exp-m' },
             session,
             status: 'idle' as const,
             ctx: { on: () => () => {} },
             followup(message: { content: Array<{ type: string; text?: string }> }) {
               const text = message.content.find((b) => b.type === 'text')?.text ?? ''
-              session['turnNo'] = ((session['turnNo'] as number | undefined) ?? 0) + 1
-              const turn = session['turnNo'] as number
+              const turn = ++session.turnNo
               emit(session, 'turn/start', { turn })
               emit(session, 'user/message', message)
               let out = ''
@@ -60,13 +60,10 @@ const ctx = {
               const step = 8
               const pump = (): void => {
                 if (idx >= out.length) {
-                  emit(session, {
-                    type: 'assistant/message',
-                    data: {
-                      turn,
-                      step: 0,
-                      message: { id: 'm', role: 'assistant', content: [{ type: 'text', text: out }], source: { kind: 'model' } },
-                    },
+                  emit(session, 'assistant/message', {
+                    turn,
+                    step: 0,
+                    message: { id: 'm', role: 'assistant', content: [{ type: 'text', text: out }], source: { kind: 'model' } },
                   })
                   emit(session, 'turn/end', { turn, reason: { kind: 'completed' } })
                   return

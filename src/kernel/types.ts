@@ -40,8 +40,7 @@
  *   extensions (`agent/inbox/spliced`, compaction, …) and `request/header` /
  *   `request/context` are intentionally absent — unknown event types are
  *   ignored at the channel boundary.
- * - `CreateAgentOptions` / `ResumeAgentOptions` omit `seed` / `signal`
- *   until Orca uses them.
+ * - `CreateAgentOptions` / `ResumeAgentOptions` omit `seed` until Orca uses it.
  */
 
 // ── dsh-llm: content blocks and messages ────────────────────────────────────
@@ -284,8 +283,10 @@ export interface SessionEvent {
  */
 export interface Session {
   readonly id: string
-  /** Immutable snapshot of the append-only log. */
-  readonly events: readonly SessionEvent[]
+  /** Legacy preview snapshot; current kernels use snapshotEvents(). */
+  readonly events?: readonly SessionEvent[]
+  /** dsh 0.1.2-rc.1 snapshot API; older previews expose `events` instead. */
+  snapshotEvents?(): readonly SessionEvent[]
   /**
    * Append one event. The real signature is strongly typed per event type and
    * requires surface metadata for surface types — Orca only appends log-only
@@ -363,6 +364,8 @@ export interface AgentHandle {
 
 /** Options for `ctx.agents.create` (dsh-agent `CreateAgentOptions`, used subset). */
 export interface CreateAgentOptions {
+  /** Creation cancellation (dsh-agent 0.1.2-rc.1). */
+  readonly signal?: AbortSignal
   /** The live agent/session identity — the caller mints it, e.g. `session-<uuid>`. */
   readonly sessionId: string
   /** Session creation metadata (validated absolute `cwd`, preset lineage, …). */
@@ -384,6 +387,8 @@ export interface CreateAgentOptions {
 
 /** Options for `ctx.agents.resume` (dsh-agent `ResumeAgentOptions`, used subset). */
 export interface ResumeAgentOptions {
+  /** Resume cancellation (dsh-agent 0.1.2-rc.1). */
+  readonly signal?: AbortSignal
   /** The persisted session id to load and use as the live identity. */
   readonly resumeSessionId: string
   readonly agentOptions?: AgentOptions
@@ -642,10 +647,14 @@ export interface KernelContext {
   /**
    * Register a reversible effect: the disposer runs when the plugin unloads
    * (hot reload, profile teardown). Orca's whole app tree hangs off one
-   * effect so unmount always restores the terminal.
+   * effect so unmount always restores the terminal. Cordis 4.0.2 awaits
+   * asynchronous disposers before completing scope teardown.
    */
-  effect(register: () => (() => void) | void): void
+  effect(register: () => (() => void | Promise<void>) | void): void
 }
+
+/** Launcher-owned bounded exit request (`dsh-cmdline` 0.1.2-rc.1). */
+export type KernelAppExit = (code: number) => void
 
 /**
  * Event names emitted by the kernel that Orca subscribes to. Real dispatch

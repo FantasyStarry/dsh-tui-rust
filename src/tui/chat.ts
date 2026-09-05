@@ -32,6 +32,7 @@ import { renderPicker, type PickerItem, type PickerState } from './picker.js'
 import { boxed, boxLine, boxTop, boxBottom, type BoxStyle } from './box.js'
 import { theme } from './theme.js'
 import { stringWidth, truncateWidth, wrapWidth } from './width.js'
+import { cleanLine, cleanText } from './sanitize.js'
 
 export interface FrameContext {
   readonly channel: Channel
@@ -120,6 +121,35 @@ const MESSAGE_INDENT = '  '
 /** kimi rendering.ts BRAILLE_SPINNER_FRAMES (80ms per frame). */
 const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
+interface RowSnapshot {
+  readonly row: TranscriptRow
+  readonly kind: TranscriptRow['kind']
+  readonly text: string
+  readonly status: TranscriptRow['status']
+  readonly tool: string | undefined
+  readonly startMs: number | undefined
+  readonly seconds: number | undefined
+  readonly diffKey: string
+  readonly rawLines: readonly string[] | undefined
+  readonly pinned: boolean | undefined
+  readonly clock: string
+}
+
+interface CachedRow extends RowSnapshot {
+  readonly lines: readonly string[]
+}
+
+interface ChannelLayoutCache {
+  width: number
+  thoughtExpanded: boolean
+  immutableUntil: number
+  readonly entries: CachedRow[]
+  readonly lineEnds: number[]
+}
+
+/** Cache lifetime follows the channel/session projection without retaining it. */
+const channelLayouts = new WeakMap<Channel, ChannelLayoutCache>()
+
 export function buildFrame(ctx: FrameContext): ChatFrame {
   const width = Math.max(20, ctx.width)
   const height = Math.max(8, ctx.height ?? 24)
@@ -139,15 +169,17 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   // written once and never tracked, so they keep the verbatim text.
   // Pre-rendered chrome rows (welcome card, route lines) span the FULL
   // width already and bypass the content gutter.
-  const paintRow = (row: TranscriptRow): string[] => {
-    if (row.rawLines !== undefined) {
-      return row.rawLines.map((line) => (line === '' ? '' : truncateWidth(asciiEllipses(line), width)))
-    }
-    return renderRow(row, ctx, inner).map((line) => (line === '' ? '' : gutter(asciiEllipses(line))))
-  }
-
   const editorBox = inputBox(ctx.editorText, width, ctx.editorCursor, ctx.attachments)
-  const bottom = [...editorBox.lines, ...footerLines(ctx, width)]
+  const footer = footerLines(ctx, width)
+  const bottom = [...editorBox.lines, ...footer]
+  const layout = syncChannelLayout(ctx, width, inner, gutter)
+  const cursorPlacement = (liveLength: number, bottomStart: number): ChatFrame['cursor'] => {
+    const editorLine = bottomStart + editorBox.cursorLine
+    return {
+      fromEnd: Math.max(0, Math.min(liveLength - 1, liveLength - 1 - editorLine)),
+      col: Math.max(1, Math.min(width, editorBox.cursorCol)),
+    }
+  }
 
   // ── fullscreen (alternate screen): pi-tui style whole-viewport mode ────────
   // No native scrollback exists there, so nothing is ever sealed to a
@@ -177,18 +209,21 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     const pickerReserve = pickerLines.length > 0 ? pickerLines.length + 1 : 0
     const menuReserve = menuLines.length > 0 ? menuLines.length + 1 : 0
     const windowCap = Math.max(1, height - bottom.length - pickerReserve - menuReserve)
-    let windowLines: string[] = []
-    for (const row of ctx.channel.rows) windowLines.push(...paintRow(row))
-    if (windowLines.length > windowCap) {
-      const dropped = windowLines.length - windowCap
-      windowLines = [theme.muted(`… 上方还有 ${dropped} 行`), ...windowLines.slice(-(windowCap - 1))]
+    const totalLines = layout.lineEnds.at(-1) ?? 0
+    let windowLines: string[]
+    if (totalLines > windowCap) {
+      const dropped = totalLines - windowCap
+      windowLines = [theme.muted(`… 上方还有 ${dropped} 行`), ...layoutTail(layout, Math.max(0, windowCap - 1))]
+    } else {
+      windowLines = layoutTail(layout, totalLines)
     }
     const spacer = Math.max(0, height - bottom.length - pickerReserve - menuReserve - windowLines.length)
     live.push(...windowLines, ...Array.from({ length: spacer }, () => ''))
     if (pickerLines.length > 0) live.push(...pickerLines, '')
     if (menuLines.length > 0) live.push(...menuLines, '')
+    const bottomStart = live.length
     live.push(...bottom)
-    const cursor = { fromEnd: bottom.length - 2, col: editorCursorCol(ctx) }
+    const cursor = cursorPlacement(live.length, bottomStart)
     return { stream, live, cursor, nextSealedFrom: ctx.sealedFrom, nextSealedFromLine: ctx.sealedFromLine ?? 0, transcriptLen: windowLines.length }
   }
 
@@ -264,7 +299,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
       sealedRemLens.push(0)
       continue
     }
-    const painted = paintRow(row)
+    const painted = layout.entries[i]?.lines ?? []
     const sliceFrom = i === baseRow ? Math.min(baseLine, painted.length) : 0
     // Snap a stale line offset (width rewrap) to the row start / next row.
     if (i === baseRow && sliceFrom >= painted.length) {
@@ -280,7 +315,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   let snappedLine = baseLine
   while (snappedRow < sealedTo) {
     const row = rows[snappedRow]
-    const len = row ? paintRow(row).length : 0
+    const len = row ? (layout.entries[snappedRow]?.lines.length ?? 0) : 0
     if (snappedLine < len) break
     snappedRow++
     snappedLine = 0
@@ -297,7 +332,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
         sealedRemLens.push(0)
         continue
       }
-      const painted = paintRow(row)
+      const painted = layout.entries[i]?.lines ?? []
       const rest = i === baseRow ? painted.slice(Math.min(baseLine, painted.length)) : painted
       sealedRemLens.push(rest.length)
       sealedEffFlat.push(...rest)
@@ -306,7 +341,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
   const openRawLines: string[] = []
   for (let i = sealedTo; i < rows.length; i++) {
     const row = rows[i]
-    if (row) openRawLines.push(...paintRow(row))
+    if (row) openRawLines.push(...(layout.entries[i]?.lines ?? []))
   }
   const sealedEffLen = sealedEffFlat.length
   const openRawLen = openRawLines.length
@@ -332,7 +367,7 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     // Re-paint lengths for advance (first row offset aware).
     for (let i = baseRow; i < sealedTo && left > 0; i++) {
       const row = rows[i]
-      const paintedLen = row ? paintRow(row).length : 0
+      const paintedLen = row ? (layout.entries[i]?.lines.length ?? 0) : 0
       const start = i === baseRow ? Math.min(baseLine, paintedLen) : 0
       const remaining = Math.max(0, paintedLen - start)
       if (left >= remaining) {
@@ -394,11 +429,132 @@ export function buildFrame(ctx: FrameContext): ChatFrame {
     live.push(...menuLines)
     live.push('')
   }
+  const bottomStart = live.length
   live.push(...bottom)
   // Cursor home: the editor content row is 3 above the frame bottom (box
   // bottom + footer L1 + L2); `│ > ` puts the text at column 5.
-  const cursor = { fromEnd: bottom.length - 2, col: editorCursorCol(ctx) }
+  const cursor = cursorPlacement(live.length, bottomStart)
   return { stream, live, cursor, nextSealedFrom: newBaseRow, nextSealedFromLine: newBaseLine, transcriptLen: transcriptVisible.length }
+}
+
+function syncChannelLayout(
+  ctx: FrameContext,
+  width: number,
+  inner: number,
+  gutter: (line: string) => string,
+): ChannelLayoutCache {
+  const expanded = ctx.thoughtExpanded ?? false
+  let cache = channelLayouts.get(ctx.channel)
+  if (!cache || cache.width !== width || cache.thoughtExpanded !== expanded) {
+    cache = { width, thoughtExpanded: expanded, immutableUntil: 0, entries: [], lineEnds: [] }
+    channelLayouts.set(ctx.channel, cache)
+  }
+
+  const rows = ctx.channel.rows
+  const sealedTo = Math.max(0, Math.min(ctx.channel.sealedRowCount, rows.length))
+  let start = Math.min(cache.immutableUntil, sealedTo, cache.entries.length, rows.length)
+
+  // Session switches replace the projection in place. Detect that uncommon
+  // structural reset without walking stable history on every 33 ms tick.
+  if (start > 0) {
+    const firstChanged = cache.entries[0]?.row !== rows[0]
+    const boundaryChanged = cache.entries[start - 1]?.row !== rows[start - 1]
+    if (firstChanged || boundaryChanged) {
+      start = 0
+      const common = Math.min(cache.entries.length, rows.length)
+      while (start < common && cache.entries[start]?.row === rows[start]) start++
+    }
+  }
+
+  let lineEnd = start > 0 ? (cache.lineEnds[start - 1] ?? 0) : 0
+  for (let i = start; i < rows.length; i++) {
+    const row = rows[i]
+    if (!row) continue
+    const snapshot = rowSnapshot(row, ctx)
+    const previous = cache.entries[i]
+    const entry = previous && sameSnapshot(previous, snapshot)
+      ? previous
+      : { ...snapshot, lines: paintTranscriptRow(row, ctx, width, inner, gutter) }
+    cache.entries[i] = entry
+    lineEnd += entry.lines.length
+    cache.lineEnds[i] = lineEnd
+  }
+  cache.entries.length = rows.length
+  cache.lineEnds.length = rows.length
+  cache.immutableUntil = sealedTo
+  return cache
+}
+
+function rowSnapshot(row: TranscriptRow, ctx: FrameContext): RowSnapshot {
+  const clock = row.kind === 'thought' && row.seconds === undefined
+    ? `${tickOf(row, ctx)}:${row.startMs === undefined ? 0 : Math.round((ctx.now - row.startMs) / 100)}`
+    : ''
+  return {
+    row,
+    kind: row.kind,
+    text: row.text,
+    status: row.status,
+    tool: row.tool,
+    startMs: row.startMs,
+    seconds: row.seconds,
+    diffKey: row.diff
+      ? `${row.diff.path}\u0000${row.diff.added}\u0000${row.diff.removed}\u0000${row.diff.lines.map((line) => `${line.kind}\u0000${line.text}`).join('\u0001')}`
+      : '',
+    rawLines: row.rawLines,
+    pinned: row.pinned,
+    clock,
+  }
+}
+
+function sameSnapshot(a: RowSnapshot, b: RowSnapshot): boolean {
+  return a.row === b.row &&
+    a.kind === b.kind &&
+    a.text === b.text &&
+    a.status === b.status &&
+    a.tool === b.tool &&
+    a.startMs === b.startMs &&
+    a.seconds === b.seconds &&
+    a.diffKey === b.diffKey &&
+    a.rawLines === b.rawLines &&
+    a.pinned === b.pinned &&
+    a.clock === b.clock
+}
+
+function paintTranscriptRow(
+  row: TranscriptRow,
+  ctx: FrameContext,
+  width: number,
+  inner: number,
+  gutter: (line: string) => string,
+): readonly string[] {
+  if (row.rawLines !== undefined) {
+    return row.rawLines.map((line) => (line === '' ? '' : truncateWidth(asciiEllipses(line), width)))
+  }
+  return renderRow(row, ctx, inner).map((line) => (line === '' ? '' : gutter(asciiEllipses(line))))
+}
+
+/** Extract a rendered suffix without traversing or flattening stable history. */
+function layoutTail(layout: ChannelLayoutCache, count: number): string[] {
+  const total = layout.lineEnds.at(-1) ?? 0
+  const take = Math.max(0, Math.min(Math.floor(count), total))
+  if (take === 0) return []
+  const startLine = total - take
+  let lo = 0
+  let hi = layout.lineEnds.length
+  while (lo < hi) {
+    const mid = lo + Math.floor((hi - lo) / 2)
+    if ((layout.lineEnds[mid] ?? 0) > startLine) hi = mid
+    else lo = mid + 1
+  }
+  const out: string[] = []
+  const before = lo > 0 ? (layout.lineEnds[lo - 1] ?? 0) : 0
+  const first = layout.entries[lo]
+  if (first) out.push(...first.lines.slice(startLine - before))
+  for (let i = lo + 1; i < layout.entries.length; i++) {
+    const entry = layout.entries[i]
+    if (entry) out.push(...entry.lines)
+  }
+  return out
 }
 
 /** One-time welcome block — kimi-style box with info rows; brand wordmark. */
@@ -415,15 +571,15 @@ export function welcomeCard(cwd: string, sessionId: string | null, model: string
   const info = [
     label('Directory:') + '  ' + short(cwd),
     label('Session:') + '    ' + (sessionId ? shortSession(sessionId) : '—'),
-    label('Model:') + '      ' + (model ?? theme.warn('未设置')),
+    label('Model:') + '      ' + (model !== null ? cleanLine(model) : theme.warn('未设置')),
   ]
   return ['', ...boxed(['', row0, row1, '', ...info, ''], width, style), '']
 }
 
 /** Slim in-stream line announcing the active route (on connect / change). */
 export function routeLine(route: SessionRoute): string {
-  const effort = route.reasoningEffort ? `(${route.reasoningEffort})` : ''
-  return theme.accent(`↳ 模型 ${route.provider}/${route.model}${effort}`)
+  const effort = route.reasoningEffort ? `(${cleanLine(route.reasoningEffort)})` : ''
+  return theme.accent(`↳ 模型 ${cleanLine(route.provider)}/${cleanLine(route.model)}${effort}`)
 }
 
 export function routeKey(route: SessionRoute): string {
@@ -433,15 +589,15 @@ export function routeKey(route: SessionRoute): string {
 function renderRow(row: TranscriptRow, ctx: FrameContext, width: number): string[] {
   switch (row.kind) {
     case 'user':
-      return userLines(row.text || '…', width)
+      return userLines(cleanText(row.text || '…'), width)
     case 'assistant':
-      return assistantLines(row.text || '…', width)
+      return assistantLines(cleanText(row.text || '…'), width)
     case 'thought':
       return thoughtLines(row, ctx, width)
     case 'tool':
       return toolCard(row, width)
     case 'system':
-      return ['', ...wrapWidth(row.text || '…', Math.max(8, width - 2)).map((line) => theme.muted(MESSAGE_INDENT + line))]
+      return ['', ...wrapWidth(cleanText(row.text || '…'), Math.max(8, width - 2)).map((line) => theme.muted(MESSAGE_INDENT + line))]
   }
 }
 
@@ -476,12 +632,12 @@ function thoughtLines(row: TranscriptRow, ctx: FrameContext, width: number): str
     const head = row.seconds === undefined
       ? theme.subtle(`${SPIN[tickOf(row, ctx)] ?? SPIN[0]} 思考中 ${elapsed}s · Ctrl+O 折叠`)
       : theme.subtle(`✻ 思考过程 ${row.seconds}s · Ctrl+O 折叠`)
-    const wrapped = wrapWidth(row.text || '（空）', Math.max(8, width - 4))
+    const wrapped = wrapWidth(cleanText(row.text || '（空）'), Math.max(8, width - 4))
     return ['', head, ...wrapped.map((line) => theme.placeholder(MESSAGE_INDENT + '│ ' + line))]
   }
   // Streaming + collapsed: spinner + timer, last two wrapped lines as preview.
   const head = theme.subtle(`${SPIN[tickOf(row, ctx)] ?? SPIN[0]} 思考中 ${elapsed}s · Ctrl+O 展开`)
-  const wrapped = wrapWidth(row.text || '', Math.max(8, width - 4))
+  const wrapped = wrapWidth(cleanText(row.text || ''), Math.max(8, width - 4))
   const tail = wrapped.slice(-2).map((line) => theme.placeholder(MESSAGE_INDENT + '⋯ ' + line))
   return ['', head, ...tail]
 }
@@ -492,17 +648,17 @@ function tickOf(row: TranscriptRow, ctx: FrameContext): number {
 
 /** Tool run: backgrounded card; status mark + counts in the frame. */
 function toolCard(row: TranscriptRow, width: number): string[] {
-  const name = row.tool ?? 'tool'
+  const name = cleanLine(row.tool ?? 'tool')
   const style: BoxStyle = { bg: theme.panel, border: theme.panelBorder }
   if (row.diff) {
     const mark = row.status === 'failed' ? theme.fail(FAILURE_MARK) : theme.ok(SUCCESS_MARK)
-    const title = mark + theme.strong(`${name} ${row.diff.path}`)
+    const title = mark + theme.strong(`${name} ${cleanLine(row.diff.path)}`)
     const right =
       `${row.diff.added > 0 ? theme.ok(`+${row.diff.added}`) : ''}` +
       `${row.diff.removed > 0 ? ' ' + theme.fail(`−${row.diff.removed}`) : ''}`
     const content: string[] = []
     for (const line of row.diff.lines) {
-      const text = truncateCells(line.text, Math.max(8, width - 10))
+      const text = truncateCells(cleanLine(line.text), Math.max(8, width - 10))
       if (line.kind === 'add') content.push(theme.ok('+ ' + text))
       else if (line.kind === 'del') content.push(theme.fail('- ' + text))
       else content.push(theme.subtle('· ' + text))
@@ -513,7 +669,7 @@ function toolCard(row: TranscriptRow, width: number): string[] {
     row.status === 'running' ? theme.primary('⠋') : row.status === 'failed' ? theme.fail(FAILURE_MARK) : theme.ok(SUCCESS_MARK)
   const suffix = row.status === 'running' ? theme.subtle(' ...') : ''
   const title = mark + theme.strong(name) + suffix
-  const wrapped = wrapWidth(row.text || '', Math.max(8, width - 8))
+  const wrapped = wrapWidth(cleanText(row.text || ''), Math.max(8, width - 8))
   const content = wrapped.slice(0, 3).map((line) => theme.subtle(line))
   return ['', ...boxed(content, width, { ...style, title })]
 }
@@ -529,22 +685,26 @@ function wrappedLines(text: string, width: number): string[] {
  * cannot trust mid-line cursor placement, but the visible highlight carries
  * the position.
  */
-function editorCursorCol(ctx: FrameContext): number {
-  return ctx.editorText === '' ? 5 : 5 + stringWidth(ctx.editorText)
-}
-
 /**
  * Boxed editor, kimi-style: primary rounded frame, `> ` prompt at column 2.
  * Pending image attachments render as rows inside the box above the prompt;
  * a mid-text logical cursor highlights the char under it (reverse video).
  */
-function inputBox(text: string, width: number, cursor?: number, attachments?: readonly string[]): { lines: string[] } {
+function inputBox(
+  text: string,
+  width: number,
+  cursor?: number,
+  attachments?: readonly string[],
+): { lines: string[]; cursorLine: number; cursorCol: number } {
   const w = Math.max(20, width)
   const style: BoxStyle = { bg: (t) => t, border: theme.primary }
   const rows: string[] = [boxTop(w, style)]
-  for (const label of attachments ?? []) rows.push(boxLine('🖼 ' + label, w, style))
-  const chars = Array.from(text)
-  const index = cursor ?? chars.length
+  for (const label of attachments ?? []) rows.push(boxLine('🖼 ' + cleanLine(label), w, style))
+  const sourceChars = Array.from(text)
+  const sourceIndex = Math.max(0, Math.min(sourceChars.length, cursor ?? sourceChars.length))
+  const cleaned = cleanLine(text)
+  const chars = Array.from(cleaned)
+  const index = Math.min(chars.length, Array.from(cleanLine(sourceChars.slice(0, sourceIndex).join(''))).length)
   const at = index >= 0 && index < chars.length ? (chars[index] ?? '') : null
   let body: string
   if (at !== null) {
@@ -552,11 +712,13 @@ function inputBox(text: string, width: number, cursor?: number, attachments?: re
     const after = chars.slice(index + 1).join('')
     body = before + theme.cursor(at) + after
   } else {
-    body = text !== '' ? text : theme.placeholder('说点什么...')
+    body = cleaned !== '' ? cleaned : theme.placeholder('说点什么...')
   }
+  const cursorLine = rows.length
   rows.push(boxLine('> ' + body, w, style))
   rows.push(boxBottom(w, style))
-  return { lines: rows }
+  const cursorCol = Math.min(w - 1, 5 + stringWidth(cleaned))
+  return { lines: rows, cursorLine, cursorCol }
 }
 
 /** Two-line plain status footer (kimi footer.ts): state/route/cwd + hints/context. */
@@ -575,15 +737,15 @@ function footerLines(ctx: FrameContext, width: number): string[] {
           ? theme.subtle('○ 连接中...')
           : ''
   const routeText = route
-    ? theme.text(`${route.provider}/${route.model}${route.reasoningEffort ? `(${route.reasoningEffort})` : ''}`)
+    ? theme.text(`${cleanLine(route.provider)}/${cleanLine(route.model)}${route.reasoningEffort ? `(${cleanLine(route.reasoningEffort)})` : ''}`)
     : ''
   // Live agent preset (M5 status slot): model-adjacent, vanishes when unknown.
-  const presetText = ctx.preset ? theme.text(`预设:${ctx.preset}`) : ''
+  const presetText = ctx.preset ? theme.text(`预设:${cleanLine(ctx.preset)}`) : ''
   // M3/M4 status slots: title · yolo/policy · git branch — all best-effort,
   // all truncated by the gutter guard. Empty slots vanish, never blank gaps.
-  const titleText = ctx.title ? theme.text(`「${ctx.title}」`) : ''
+  const titleText = ctx.title ? theme.text(`「${cleanLine(ctx.title)}」`) : ''
   const modeText = ctx.yolo ? theme.warn('yolo') : ctx.policy === 'never' ? theme.warn('never') : ''
-  const branchText = ctx.branch ? theme.muted(`⑂ ${ctx.branch}`) : ''
+  const branchText = ctx.branch ? theme.muted(`⑂ ${cleanLine(ctx.branch)}`) : ''
   const dir = theme.muted(short(ctx.cwd))
   const line1 = [badge, routeText, presetText, titleText, modeText, dir, branchText]
     .filter((part) => part !== '')
@@ -622,12 +784,14 @@ function fmtTokens(count: number): string {
 }
 
 function short(cwd: string): string {
+  cwd = cleanLine(cwd)
   const home = process.env['USERPROFILE'] ?? process.env['HOME'] ?? ''
   const display = home && cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd
   return display.replaceAll('\\', '/')
 }
 
 function shortSession(id: string): string {
+  id = cleanLine(id)
   return id.length > 18 ? '..' + id.slice(-12) : id
 }
 

@@ -35,6 +35,7 @@ import type {
   KernelAgentDefaultModel,
   KernelAgentPresetsService,
   KernelAgentsService,
+  KernelAppExit,
   KernelApprovalPolicy,
   KernelApprovalService,
   KernelAttachmentStore,
@@ -67,6 +68,19 @@ const FACTORY_RETRY_DELAY_MS = 100
 
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+/** Loader activation may itself be waiting for the scope being disposed. */
+async function waitUntilAborted(work: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return
+  let stop = (): void => {}
+  const aborted = new Promise<void>((resolve) => { stop = resolve })
+  signal.addEventListener('abort', stop, { once: true })
+  try {
+    await Promise.race([work, aborted])
+  } finally {
+    signal.removeEventListener('abort', stop)
+  }
 }
 
 /** In-process mount counter — attributes ORCA_LOG lines to one bootstrap. */
@@ -116,7 +130,12 @@ function parseSlash(text: string): { readonly name: string; readonly args: strin
   return { name: text.slice(1, space), args: text.slice(space + 1).trim() }
 }
 
-export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIoDeps = defaultDeps()): () => void {
+export function bootstrapApp(
+  ctx: KernelContext,
+  config: OrcaConfig,
+  deps: AppIoDeps = defaultDeps(),
+  previousTeardown: Promise<void> = Promise.resolve(),
+): () => Promise<void> {
   const stdout = deps.stdout()
   const stdin = deps.stdin()
   const bootId = ++bootSeq
@@ -126,15 +145,17 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   // (truncation/misalignment) against the exact byte stream. Never affects
   // rendering; failures are swallowed so logging can never break the TUI.
   const logPath = process.env['ORCA_LOG']
+  let restoreLog = (): void => {}
   if (logPath) {
     try {
       appendFileSync(
         logPath,
         `\n### boot#${bootId} pid=${process.pid} cols=${String(stdout.columns)} rows=${String(stdout.rows)} at=${new Date().toISOString()}\n`,
       )
-      const origWrite = stdout.write.bind(stdout) as (...args: unknown[]) => boolean
+      const originalWrite = stdout.write
+      const origWrite = originalWrite.bind(stdout) as (...args: unknown[]) => boolean
       let writeNo = 0
-      stdout.write = ((...args: unknown[]): boolean => {
+      const loggedWrite = ((...args: unknown[]): boolean => {
         try {
           const head = args[0]
           const body = typeof head === 'string' ? head : '<non-string chunk>'
@@ -147,6 +168,10 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         }
         return origWrite(...args)
       }) as typeof stdout.write
+      stdout.write = loggedWrite
+      restoreLog = () => {
+        if (stdout.write === loggedWrite) stdout.write = originalWrite
+      }
     } catch {
       // Logging must never break the TUI.
     }
@@ -180,6 +205,38 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   let handle: AgentHandle | null = null
   let agent: Agent | null = null
   let disposed = false
+  let disposeTask: Promise<void> | null = null
+  let sessionTask: Promise<void> = previousTeardown.catch(() => {})
+  let sessionAbort = new AbortController()
+  let targetSessionId: string | null = null
+  let replaying = false
+  let bufferedEvents: SessionEvent[] = []
+  let projectedSeq = -1
+  const agentListenerDisposers: Array<() => void> = []
+
+  const project = (event: SessionEvent): void => {
+    const seq = event.seq
+    if (typeof seq === 'number' && Number.isFinite(seq)) {
+      if (seq <= projectedSeq) return
+      projectedSeq = seq
+    }
+    channel.ingest(event)
+  }
+
+  const runSessionTask = (work: (signal: AbortSignal) => Promise<void>): Promise<void> => {
+    if (disposed) return Promise.resolve()
+    sessionAbort.abort()
+    const controller = new AbortController()
+    sessionAbort = controller
+    sessionTask = sessionTask.then(async () => {
+      if (!disposed && !controller.signal.aborted) await work(controller.signal)
+    }).catch((error: unknown) => {
+      if (!disposed && !controller.signal.aborted) {
+        channel.pushSystem(`会话操作失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+    })
+    return sessionTask
+  }
   /**
    * Effective approval policy folded from the log (`ask` default,
    * `never` = headless auto-reject). Yolo (auto-allow) is NOT a policy —
@@ -289,8 +346,11 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   listenerDisposers.push(
     ctx.on(KERNEL_EVENTS.sessionEvent, (...args: unknown[]) => {
       const event = args[1] as Partial<SessionEvent> | undefined
+      const session = recordOf(args[0])
+      if (disposed || session?.['id'] !== targetSessionId) return
       if (event && typeof event.type === 'string') {
-        channel.ingest(event as SessionEvent)
+        if (replaying) bufferedEvents.push(event as SessionEvent)
+        else project(event as SessionEvent)
         // Fold the durable approval override for the footer — the log is
         // truth; the local /yolo switch below only updates the same fold.
         if (event.type === 'approval/policy' && agent) {
@@ -305,10 +365,12 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }),
   )
   listenerDisposers.push(
-    ctx.on(KERNEL_EVENTS.sessionDisposed, () => {
+    ctx.on(KERNEL_EVENTS.sessionDisposed, (...args: unknown[]) => {
+      if (recordOf(args[0])?.['id'] !== targetSessionId) return
       channel.pushSystem('session 已释放')
       handle = null
       agent = null
+      targetSessionId = null
     }),
   )
   // Model-turn failures surface outside the session log (`agent/error` is a
@@ -316,6 +378,8 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   listenerDisposers.push(
     ctx.on(KERNEL_EVENTS.agentError, (...args: unknown[]) => {
       const payload = recordOf(args[0])
+      const subject = recordOf(payload?.['agent'])
+      if (subject?.['id'] !== targetSessionId) return
       const failure = payload ? recordOf(payload['error']) : undefined
       const message = failure && typeof failure['message'] === 'string' ? failure['message'] : '未知错误'
       channel.pushSystem(`agent 出错：${message}`)
@@ -555,31 +619,49 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     }
   }
 
-  const switchToNew = async (): Promise<void> => {
-    const agentFactory = getAgents()
-    if (!agentFactory) {
-      channel.pushSystem('agents 服务未挂载：无法新建会话')
-      return
-    }
+  const releaseAgent = async (): Promise<void> => {
+    targetSessionId = null
+    replaying = false
+    bufferedEvents = []
     const previous = handle
     handle = null
     agent = null
+    while (approvalQueue.length > 0) settleApprovalHead('cancelled')
+    for (const stop of agentListenerDisposers.splice(0)) stop()
     try {
       await previous?.dispose()
     } catch {
-      // Teardown failures must not block the fresh session.
+      // A failed teardown must not prevent terminal restoration or switching.
     }
-    channel.clearForSwitch()
-    livePreset = null
-    welcomed = true // suppress the one-time welcome on switches
-    await createAgent()
   }
 
-  const createAgent = async (resumeId?: string): Promise<void> => {
+  const clearProjection = (): void => {
+    channel.clearForSwitch()
+    projectedSeq = -1
+    flushedSealed = 0
+    flushedLine = 0
+    titleCache = null
+    livePreset = null
+  }
+
+  const switchToNew = (): Promise<void> => runSessionTask(async (signal) => {
+    if (!getAgents()) {
+      channel.pushSystem('agents 服务未挂载：无法新建会话')
+      return
+    }
+    await releaseAgent()
+    if (signal.aborted || disposed) return
+    clearProjection()
+    welcomed = true
+    await createAgent(signal)
+  })
+
+  const createAgent = async (signal: AbortSignal, resumeId?: string, silent = false): Promise<boolean> => {
+    if (disposed || signal.aborted) return false
     const agentFactory = getAgents()
     if (!agentFactory) {
       channel.pushSystem('kernel service `agents` 未挂载：Orca 以只读模式启动')
-      return
+      return false
     }
     const cwd = process.cwd()
     const agentOptions = currentAgentOptions()
@@ -602,6 +684,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     const presetComposed = resolvedPresetId !== undefined && presetService !== undefined
     const buildCreateOptions = (withPreset: boolean) => ({
       sessionId: mintSessionId(),
+      signal,
       meta: { cwd, ...(withPreset && resolvedPresetId !== undefined ? { agentPreset: resolvedPresetId } : {}) },
       ...(agentOptions ? { agentOptions } : {}),
       ...(withPreset && resolvedPresetId !== undefined && presetService !== undefined
@@ -613,13 +696,21 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         : {}),
     })
     let withPreset = presetComposed
+    let created: AgentHandle
     for (let attempt = 0; ; attempt++) {
+      if (disposed || signal.aborted) return false
+      const options = buildCreateOptions(withPreset)
+      targetSessionId = resumeId ?? options.sessionId
+      bufferedEvents = []
+      replaying = true
+      projectedSeq = -1
       try {
-        handle = resumeId
-          ? await agentFactory.resume(agentOptions ? { resumeSessionId: resumeId, agentOptions } : { resumeSessionId: resumeId })
-          : await agentFactory.create(buildCreateOptions(withPreset))
+        created = resumeId
+          ? await agentFactory.resume({ resumeSessionId: resumeId, signal, ...(agentOptions ? { agentOptions } : {}) })
+          : await agentFactory.create(options)
         break
       } catch (error) {
+        if (disposed || signal.aborted) return false
         const message = error instanceof Error ? error.message : String(error)
         if (attempt < FACTORY_RETRY_ATTEMPTS && /no agent factory registered/i.test(message)) {
           await sleep(FACTORY_RETRY_DELAY_MS)
@@ -636,16 +727,52 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
           continue
         }
         dbg(`createAgent 失败：${message}`)
-        channel.pushSystem(`agent 启动失败：${message}`)
-        return
+        if (!silent) channel.pushSystem(`agent 启动失败：${message}`)
+        targetSessionId = null
+        replaying = false
+        bufferedEvents = []
+        return false
       }
     }
-    attachAgent(handle.agent)
-    channel.pushSystem(`session 已连接：${handle.agent.session.id}`)
+    try {
+      if (disposed || signal.aborted) {
+        await created.dispose()
+        return false
+      }
+      // Snapshot construction does not re-emit historical events. Buffer live
+      // events during adoption, then merge them with the durable prefix by seq.
+      let events: readonly SessionEvent[] = []
+      try {
+        if (created.agent.session.snapshotEvents) events = created.agent.session.snapshotEvents()
+        else if (resumeId) events = (await getSessionQuery()?.readSession(resumeId))?.events ?? created.agent.session.events ?? []
+        else events = created.agent.session.events ?? []
+      } catch {
+        events = created.agent.session.events ?? []
+      }
+      if (disposed || signal.aborted) {
+        await created.dispose()
+        return false
+      }
+      const combined = [...events, ...bufferedEvents]
+      combined.sort((a, b) => (a.seq ?? Number.MAX_SAFE_INTEGER) - (b.seq ?? Number.MAX_SAFE_INTEGER))
+      for (const event of combined) project(event)
+      bufferedEvents = []
+      replaying = false
+      handle = created
+      attachAgent(created.agent)
+    } catch (error) {
+      await created.dispose().catch(() => {})
+      if (handle === created) handle = null
+      agent = null
+      throw error
+    }
+    if (silent) welcomed = true
+    else channel.pushSystem(`session 已连接：${created.agent.session.id}`)
     // Remember the live session for a same-process silent remount (hot
     // reload): the next bootstrap resumes THIS session instead of minting a
     // new one, so rebuilds stop stacking welcomes on the screen.
-    writeLastSession(handle.agent.session.id)
+    writeLastSession(created.agent.session.id)
+    return true
   }
 
   /**
@@ -657,7 +784,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
    * the normal fresh-create path. An explicit ORCA_RESUME_SESSION always
    * wins and bypasses this.
    */
-  const trySilentRemount = async (): Promise<boolean> => {
+  const trySilentRemount = async (signal: AbortSignal): Promise<boolean> => {
     const agentFactory = getAgents()
     if (!agentFactory) return false
     const last = readLastSession()
@@ -669,28 +796,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     } catch {
       return false
     }
-    const agentOptions = currentAgentOptions()
-    try {
-      handle = await agentFactory.resume(
-        agentOptions ? { resumeSessionId: last.sessionId, agentOptions } : { resumeSessionId: last.sessionId },
-      )
-    } catch {
-      return false
-    }
-    attachAgent(handle.agent)
-    welcomed = true // suppress the one-time welcome AND route line on remount
-    try {
-      const snapshot = await getSessionQuery()?.readSession(last.sessionId)
-      const events = snapshot?.events
-      if (events && events.length > 0) {
-        channel.replay(events)
-        channel.sealedRowCount = channel.rows.length
-      }
-    } catch {
-      // Empty transcript — live events are the truth from here on.
-    }
-    writeLastSession(handle.agent.session.id)
-    return true
+    return createAgent(signal, last.sessionId, true)
   }
 
   const currentAgentOptions = (): { provider: string; model: string; reasoningEffort?: string } | undefined => {
@@ -774,7 +880,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         }
       })()
     })
-    listenerDisposers.push(disposeWaterfall)
+    agentListenerDisposers.push(disposeWaterfall)
     // Interactive answerer for `approval/request` (dsh-user-approval
     // waterfall, scoped to this agent — dies with the agent). Yolo
     // short-circuits inside answerApproval; the audit pair still lands via
@@ -805,7 +911,7 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
         }
       })()
     })
-    listenerDisposers.push(disposeApproval)
+    agentListenerDisposers.push(disposeApproval)
   }
 
   // ── /model picker ─────────────────────────────────────────────────────────
@@ -1181,36 +1287,27 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     void switchToResume(resumeId)
   }
 
-  const switchToResume = async (resumeId: string): Promise<void> => {
+  const switchToResume = (resumeId: string): Promise<void> => runSessionTask(async (signal) => {
     if (!getAgents()) return
-    const previous = handle
-    handle = null
-    agent = null
-    try {
-      await previous?.dispose()
-    } catch {
-      // Teardown failures must not block the resumed session.
-    }
-    channel.clearForSwitch()
-    livePreset = null
+    await releaseAgent()
+    if (disposed || signal.aborted) return
+    clearProjection()
     welcomed = true
-    await createAgent(resumeId)
-    // Best-effort: replay the persisted log so the transcript is not empty
-    // before live events arrive. Failures stay silent — live events are truth.
+    if (!await createAgent(signal, resumeId)) return
     try {
       const snapshot = await getSessionQuery()?.readTitle(resumeId)
-      if (snapshot) channel.title = snapshot.title
+      if (snapshot && !disposed && !signal.aborted) channel.title = snapshot.title
     } catch {
       // Ignored.
     }
-  }
+  })
 
   // ── rewind: double-Esc forks to the previous turn boundary (M3) ────────────
   // pi `/tree` + kimi `/undo` spirit, kernel-native via `ctx.sessions.fork`:
   // the child keeps the prefix through the previous turn, later turns stay in
   // the parent log on disk. Idle-only; needs ≥2 observed turns.
 
-  const doRewind = async (): Promise<void> => {
+  const doRewind = (): Promise<void> => runSessionTask(async (signal) => {
     const agentFactory = getAgents()
     if (!agent || !handle || !agentFactory) {
       channel.pushSystem('agent 未就绪，无法回退')
@@ -1249,22 +1346,15 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
       return
     }
     const childSessionId = typeof child?.id === 'string' ? child.id : childId
-    const previous = handle
-    handle = null
-    agent = null
-    try {
-      await previous?.dispose()
-    } catch {
-      // Teardown failures must not block the rewound session.
-    }
-    channel.clearForSwitch()
-    livePreset = null
+    await releaseAgent()
+    if (disposed || signal.aborted) return
+    clearProjection()
     welcomed = true
     dbg('doRewind: start')
-    await createAgent(childSessionId)
+    if (!await createAgent(signal, childSessionId)) return
     dbg('doRewind: createAgent done')
     channel.pushSystem(`已回退到上一轮（fork ${shortSessionLabel(childSessionId)}）`)
-  }
+  })
 
   // M4 status slot: git branch, cached 2s (file read only, no spawn).
   let branchCache: { readonly at: number; readonly cwd: string; readonly value: string | null } | null = null
@@ -1298,16 +1388,17 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
 
   // ── agent lifecycle ───────────────────────────────────────────────────────
 
-  const start = async (): Promise<void> => {
+  const start = async (signal: AbortSignal): Promise<void> => {
     const resumeId = process.env['ORCA_RESUME_SESSION']
     // Loader entries activate concurrently, so the factory and the default
     // model service may not exist yet when apply() runs. Await full plugin
     // activation first — the canonical pattern (dsh-headless) — and keep the
     // targeted factory retry in createAgent as a safety net.
     const loader = ctx.get<KernelLoader>('loader', false)
-    await loader?.await()
-    if (!resumeId && (await trySilentRemount())) return
-    await createAgent(resumeId)
+    if (loader) await waitUntilAborted(loader.await(), signal)
+    if (disposed || signal.aborted) return
+    if (!resumeId && (await trySilentRemount(signal))) return
+    await createAgent(signal, resumeId)
   }
 
   let editor = ''
@@ -1769,8 +1860,9 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
           const now = Date.now()
           const idleAndClean = editor === '' && cursorPos === 0 && pendingImages.length === 0 && channel.runState === 'idle'
           if (now - lastExitAt < 1200 || idleAndClean) {
-            dispose()
-            process.exit(0)
+            const exit = ctx.get<KernelAppExit>('appExit', false)
+            if (typeof exit === 'function') exit(0)
+            else void dispose().then(() => { process.exitCode = 0 })
             break
           }
           lastExitAt = now
@@ -2003,14 +2095,17 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
   // mode take the alternate buffer instead — the pre-orca screen is
   // restored verbatim on exit. Bracketed paste (2004) is enabled so pastes
   // arrive as one 200~/201~ burst instead of a keystroke replay.
-  stdout.write(config.fullscreen ? '\x1b[?1049h\x1b[2J\x1b[H' : '\x1b[2J\x1b[H\x1b[?2004h')
+  stdout.write((config.fullscreen ? '\x1b[?1049h' : '') + '\x1b[2J\x1b[H\x1b[?2004h')
   keyboard.start()
-  void start()
+  void runSessionTask(start)
 
-  const dispose = (): void => {
-    if (disposed) return
+  const dispose = (): Promise<void> => {
+    if (disposeTask) return disposeTask
     disposed = true
+    sessionAbort.abort()
     clearInterval(tick)
+    if (atTimer !== null) clearTimeout(atTimer)
+    atFetchSeq++
     keyboard.stop()
     // Inline keeps the visible transcript tail; only the spacer/chrome below
     // it is cleared. Fullscreen restores the main screen (alt content is
@@ -2020,9 +2115,10 @@ export function bootstrapApp(ctx: KernelContext, config: OrcaConfig, deps: AppIo
     stdout.write('\x1b[?2004l')
     // Unblock any pending approval asks — late answers are discarded by the
     // service once the signal fires, but our promise must still settle.
-    while (approvalQueue.length > 0) settleApprovalHead('cancelled')
     for (const disposeListener of listenerDisposers) disposeListener()
-    void handle?.dispose()
+    restoreLog()
+    disposeTask = Promise.allSettled([releaseAgent(), sessionTask]).then(() => {})
+    return disposeTask
   }
 
   return dispose

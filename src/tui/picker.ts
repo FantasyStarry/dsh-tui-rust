@@ -16,6 +16,7 @@
 
 import { theme } from './theme.js'
 import { stringWidth, truncateWidth } from './width.js'
+import { cleanLine } from './sanitize.js'
 
 export interface PickerItem {
   /** Value carried out on selection (id / effort id). */
@@ -61,7 +62,7 @@ const HINT = '↑/↓ 选择 · Enter 确认 · Esc 取消'
 export function renderPicker(state: PickerState, width: number, maxItems = 17): string[] {
   const lines: string[] = []
   lines.push(theme.primary('─'.repeat(width)))
-  lines.push(' ' + theme.title(state.title))
+  lines.push(' ' + theme.title(cleanLine(state.title)))
   lines.push(theme.subtle(' ' + HINT))
   lines.push('')
 
@@ -85,9 +86,10 @@ export function renderPicker(state: PickerState, width: number, maxItems = 17): 
     const actual = from + i
     const selected = actual === state.index
     const pointer = selected ? theme.title('❯ ') : ' '.repeat(POINTER_W)
-    const label = selected ? theme.title(item.label) : item.label
+    const cleanLabel = cleanLine(item.label)
+    const label = selected ? theme.title(cleanLabel) : cleanLabel
     const current = state.current !== undefined && item.value === state.current ? theme.ok('  ← current') : ''
-    const hint = item.hint ? theme.subtle('  ' + item.hint) : ''
+    const hint = item.hint ? theme.subtle('  ' + cleanLine(item.hint)) : ''
     const budget = Math.max(8, width - 4)
     const content = `  ${pointer}${label}${hint}${current}`
     // Focus state: the selected row gets a full-row panel background so the

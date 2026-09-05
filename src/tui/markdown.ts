@@ -10,9 +10,11 @@ import { highlightCodeLine, normalizeLang } from './highlight.js'
 import { boxed, type BoxStyle } from './box.js'
 import { renderSpans, wrapSpans, type Span } from './span.js'
 import { theme } from './theme.js'
+import { cleanText } from './sanitize.js'
 
 /** Inline syntax → styled spans. Unmatched text stays plain. */
 export function inlineSpans(text: string): readonly Span[] {
+  text = cleanText(text)
   const spans: Span[] = []
   let plain = ''
   const flush = (): void => {
@@ -56,7 +58,7 @@ export function inlineSpans(text: string): readonly Span[] {
  */
 export function renderMarkdown(text: string, width: number): string[] {
   const lines: string[] = []
-  const source = text.split('\n')
+  const source = cleanText(text).split('\n')
   let inFence = false
   let fenceLang = ''
   let fenceLines: string[] = []

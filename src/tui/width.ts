@@ -114,11 +114,18 @@ export function wrapWidth(text: string, width: number): string[] {
         used += wordWidth
         continue
       }
-      if (wordWidth > width && stringWidth(current) === 0) {
-        // Single unbreakable run longer than the line: hard split.
+      if (wordWidth > width) {
+        // An overlong run always hard-splits, including after a partially
+        // filled line. Flush that prefix first so no emitted row exceeds the
+        // requested width (`a abcdefghij`, width 5 used to lose this rule).
+        if (current) {
+          lines.push(current)
+          current = ''
+          used = 0
+        }
         for (const ch of word) {
           const w = charWidth(ch.codePointAt(0) ?? 0)
-          if (used + w > width) {
+          if (used > 0 && used + w > width) {
             lines.push(current)
             current = ch
             used = w

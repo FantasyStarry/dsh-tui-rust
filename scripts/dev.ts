@@ -349,7 +349,9 @@ class FakeKernel implements KernelContext {
       return {
         fork: (_source: unknown, boundary?: number, childSessionId?: string) => {
           this.record.forkCalled = { boundary, childId: childSessionId }
-          return { id: childSessionId ?? 'session-fork' }
+          const id = childSessionId ?? 'session-fork'
+          this.persistedSessions.add(id)
+          return { id }
         },
       } as T
     }
@@ -416,7 +418,7 @@ class FakeKernel implements KernelContext {
     return undefined
   }
 
-  effect(_register: () => (() => void) | void): void {
+  effect(_register: () => (() => void | Promise<void>) | void): void {
     // Effects are lifecycle-managed by the real kernel; smoke ignores them.
   }
 
@@ -424,7 +426,7 @@ class FakeKernel implements KernelContext {
   emit(type: string, data: unknown): void {
     const event: SessionEvent = { type, seq: this.seq++, time: Date.now(), data }
     for (const listener of this.listeners.get('session/event') ?? []) {
-      listener({ id: 'fake-session' }, event)
+      listener({ id: this.record.createOptions?.sessionId ?? 'fake-session' }, event)
     }
   }
 
