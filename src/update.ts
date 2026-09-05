@@ -25,10 +25,19 @@ interface NpmResult {
 
 function runNpm(args: readonly string[], timeoutMs: number): Promise<NpmResult> {
   return new Promise((resolve) => {
-    const child = spawn('npm', [...args], {
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
+    // On Windows `npm` is a .cmd shim; spawn it through cmd.exe so stdout/
+    // stderr can still be captured without Node's DEP0190 shell+args warning.
+    const child =
+      process.platform === 'win32'
+        ? spawn(
+            'cmd.exe',
+            ['/d', '/s', '/c', `npm ${args.map((arg) => (/[\s"]/.test(arg) ? `"${arg.replaceAll('"', '""')}"` : arg)).join(' ')}`],
+            { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+          )
+        : spawn('npm', [...args], {
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
     let stdout = ''
     let stderr = ''
     const timer = setTimeout(() => child.kill(), timeoutMs)
