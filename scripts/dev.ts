@@ -899,7 +899,7 @@ async function main(): Promise<void> {
   // (top → prompt → bottom) + footer L1 → L2, each exactly once.
   while (rows2.length > 0 && rows2[rows2.length - 1] === '') rows2.pop()
   const tail = rows2.slice(-5)
-  const hint = 'Enter 发送 · /model · @ 文件 · Ctrl+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
+  const hint = 'Enter 发送 · /model · @文件 · Ctrl+V/Alt+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
   if (tail.length !== 5) problems.push(`phase2：最终画面尾部不足 5 行：${JSON.stringify(rows2.slice(-7))}`)
   const promptRow = rows2.find((row) => row.includes('> 说点什么...'))
   if (promptRow === undefined) {
@@ -1260,13 +1260,24 @@ async function main(): Promise<void> {
     stdin8.paste(pngPath)
     await sleep(400)
     {
-      // Notices stay in the live window until they age out (viewport shows
-      // recent history); live rewrites may repeat them in the byte flow, so
-      // assert at-least (visible screen holds both) rather than exactly twice.
-      const flow = stripSgr(rw.join(''))
-      if (flow.split('已附加图片').length - 1 < 2) problems.push('phase8：/img 与粘贴两次附加通知缺失')
-      // The editor box renders one 🖼 badge row per pending attachment.
-      if (!flow.includes('🖼')) problems.push('phase8：附件徽标未在输入框内渲染')
+      // Images are inline Claude Code style tokens inside the editor.
+      const screen = paintScreen(rw, 24).join('\n')
+      if (!screen.includes('[image #1] [image #2]')) problems.push('phase8：内联图片徽标未在输入框内渲染')
+    }
+    // Backspace removes the last inline image token (atomic delete).
+    stdin8.key('backspace')
+    await sleep(150)
+    {
+      const screen = paintScreen(rw, 24).join('\n')
+      if (!screen.includes('[image #1]')) problems.push('phase8：删除后 [image #1] 丢失')
+      if (screen.includes('[image #2]')) problems.push('phase8：Backspace 未能删除第二个内联图片')
+    }
+    // Re-add the second image so the final send still carries two.
+    stdin8.paste(pngPath)
+    await sleep(400)
+    {
+      const screen = paintScreen(rw, 24).join('\n')
+      if (!screen.includes('[image #1] [image #2]')) problems.push('phase8：重新附加后内联图片未恢复为两张')
     }
     for (const ch of '看看图') stdin8.text(ch)
     stdin8.key('return')
@@ -1281,7 +1292,7 @@ async function main(): Promise<void> {
         problems.push(`phase8：图片块未随消息发送：${JSON.stringify(image ?? null)}`)
       }
       if (blocks[2]?.type !== 'image') problems.push('phase8：第二张图片块缺失')
-      if (!stripSgr(rw.join('')).includes('[图片×2]')) problems.push('phase8：user/message 图片投影缺失')
+      if (!stripSgr(rw.join('')).includes('[image #1] [image #2]')) problems.push('phase8：user/message 图片投影缺失')
     }
     // ↑ on an empty editor recalls the last prompt; submitting again is image-free.
     stdin8.key('up')

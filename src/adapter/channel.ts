@@ -153,6 +153,11 @@ function countImageBlocks(content: unknown): number {
   return count
 }
 
+/** Claude Code style `[image #1] [image #2]` for user rows. */
+function imageLabels(count: number): string {
+  return Array.from({ length: count }, (_, i) => `[image #${i + 1}]`).join(' ')
+}
+
 /** Pull the model-facing text out of a `tool/result` event's message. */
 function toolResultText(data: Record<string, unknown>): string {
   const message = recordOf(data['message'])
@@ -436,7 +441,7 @@ export class Channel {
         const text = blockText(data['content']) || str(data, 'text')
         const images = countImageBlocks(data['content'])
         const label = text || (images > 0 ? '' : '…')
-        const suffix = images > 0 ? (text ? ` [图片×${images}]` : `[图片×${images}]`) : ''
+        const suffix = images > 0 ? (text ? ` ${imageLabels(images)}` : imageLabels(images)) : ''
         if (label || suffix) this.pushUser(label + suffix)
         break
       }

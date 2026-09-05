@@ -20,6 +20,9 @@
  * - bracketed paste (CSI 200~ … 201~, enabled by the app) arrives as ONE
  *   burst through the optional `onPaste` callback instead of a keystroke
  *   replay that would submit on the first embedded newline;
+ * - legacy Alt+V (`ESC v` / `ESC V`) and CSI-u Alt+V map to `alt+v` so the
+ *   app can bind an image-paste hotkey that survives Windows Terminal's
+ *   Ctrl+V interception;
  * - names mirror the old readline surface the app already keys off
  *   ('return' for \r, 'backspace' for \x7f/\x08, ctrl+letter for C0).
  */
@@ -52,6 +55,9 @@ const CSI_KEYS: Readonly<Record<string, string>> = {
   H: 'home',
   F: 'end',
 }
+
+/** CSI-u form of Alt+V (`\x1b[118;3u`) / Alt+Shift+V (`\x1b[86;4u`). */
+const ALT_V_CSI_RE = /^\x1b\[(\d+);(\d+)(?::(\d+))?u$/
 
 const SS3_KEYS: Readonly<Record<string, string>> = {
   A: 'up',
@@ -220,10 +226,17 @@ export class Keyboard {
       }
       const follower = this.pending[1] ?? ''
       if (follower === '[' || follower === 'O') return // partial sequence — wait for more
+      // Only Alt+V is recognized as an alt-chord: Windows Terminal consumes
+      // Ctrl+V for its own paste, so image paste needs this escape hatch.
+      // All other ESC+char stays the old behavior (Esc first, then the char).
+      if ((follower === 'v' || follower === 'V') && this.pending.length >= 2) {
+        const seq = this.pending.slice(0, 2)
+        this.pending = this.pending.slice(2)
+        this.handler({ name: follower, ctrl: false, alt: true, shift: follower === 'V', sequence: seq })
+        continue
+      }
       // ESC + ordinary char: flush the Esc FIRST (instant cancel), then
-      // parse the char as fresh input. Alt-chords are deliberately not
-      // recognized — nothing in Orca binds one, and guessing wrong is what
-      // used to smear escape bytes into the editor.
+      // parse the char as fresh input.
       this.pending = this.pending.slice(1)
       this.handler({ name: 'escape', ctrl: false, alt: false, shift: false, sequence: ESC })
     }
@@ -235,6 +248,22 @@ export class Keyboard {
     // 先还原成文本，否则 Kitty/Ghostty/WezTerm 下输入直接丢字。release 事件
     //（flag 2 的 `:3` 后缀）永远吞掉——按键松开不应再进一次编辑器。
     if (isKeyRelease(sequence)) return
+    // CSI-u Alt+V: Windows Terminal 不会把 Ctrl+V 交给 TUI，Alt+V 是图片粘贴
+    // 的逃生口；这里把 `\x1b[118;3u` / `\x1b[86;4u` 还原成 `alt+v`。
+    const altV = ALT_V_CSI_RE.exec(sequence)
+    if (altV) {
+      const modValue = Number(altV[2])
+      const bits = Number.isFinite(modValue) && modValue >= 2 ? modValue - 1 : 0
+      if ((bits & 2) !== 0 && (bits & 4) === 0) {
+        const cp = Number(altV[1])
+        if (!Number.isFinite(cp) || cp < 0 || cp > 0x10ffff) return
+        const ch = String.fromCodePoint(cp)
+        if (ch === 'v' || ch === 'V') {
+          this.handler({ name: ch, ctrl: false, alt: true, shift: ch === 'V', sequence })
+          return
+        }
+      }
+    }
     const printable = decodePrintableKey(sequence)
     if (printable !== undefined) {
       for (const ch of printable) this.handler(decodeChar(ch))

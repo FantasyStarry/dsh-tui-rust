@@ -108,7 +108,9 @@ export interface ChatFrame {
   readonly transcriptLen: number
 }
 
-const HINT = 'Enter 发送 · /model · @ 文件 · Ctrl+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
+export const IMAGE_SENTINEL = ''
+
+const HINT = 'Enter 发送 · /model · @文件 · Ctrl+V/Alt+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
 
 /** kimi symbols.ts: role bullets, status marks; `✨` carries VS16 so both our
  *  cell math (1+1) and real emoji rendering (2 cells) agree on 3. */
@@ -690,6 +692,23 @@ function wrappedLines(text: string, width: number): string[] {
  * Pending image attachments render as rows inside the box above the prompt;
  * a mid-text logical cursor highlights the char under it (reverse video).
  */
+function expandImageTokens(text: string): string {
+  let out = ''
+  let n = 0
+  for (const ch of Array.from(text)) {
+    if (ch === IMAGE_SENTINEL) {
+      n++
+      // Display-only trailing space keeps multiple tokens readable without
+      // putting a real space in the raw editor (so Backspace deletes the
+      // whole token atomically).
+      out += `[image #${n}] `
+    } else {
+      out += ch
+    }
+  }
+  return out
+}
+
 function inputBox(
   text: string,
   width: number,
@@ -699,21 +718,39 @@ function inputBox(
   const w = Math.max(20, width)
   const style: BoxStyle = { bg: (t) => t, border: theme.primary }
   const rows: string[] = [boxTop(w, style)]
+  // Legacy separate attachment rows are kept for callers that still pass
+  // `attachments`; Orca now embeds image tokens inline via IMAGE_SENTINEL.
   for (const label of attachments ?? []) rows.push(boxLine('🖼 ' + cleanLine(label), w, style))
   const sourceChars = Array.from(text)
   const sourceIndex = Math.max(0, Math.min(sourceChars.length, cursor ?? sourceChars.length))
-  const cleaned = cleanLine(text)
-  const chars = Array.from(cleaned)
-  const index = Math.min(chars.length, Array.from(cleanLine(sourceChars.slice(0, sourceIndex).join(''))).length)
-  const at = index >= 0 && index < chars.length ? (chars[index] ?? '') : null
-  let body: string
-  if (at !== null) {
-    const before = chars.slice(0, index).join('')
-    const after = chars.slice(index + 1).join('')
-    body = before + theme.cursor(at) + after
-  } else {
-    body = cleaned !== '' ? cleaned : theme.placeholder('说点什么...')
+  const cleaned = cleanLine(expandImageTokens(text))
+  // Build the visible line directly from raw chars: only real IMAGE_SENTINEL
+  // tokens are highlighted, so manually typed `[image #1]` text stays plain.
+  let body = ''
+  let displayIndex = 0
+  let imageNumber = 0
+  for (let i = 0; i < sourceChars.length; i++) {
+    const ch = sourceChars[i] ?? ''
+    if (ch === IMAGE_SENTINEL) {
+      imageNumber++
+      const token = `[image #${imageNumber}] `
+      const tokenChars = Array.from(token)
+      let cursorDisplay = -1
+      if (sourceIndex === i) cursorDisplay = displayIndex
+      else if (sourceIndex === i + 1) cursorDisplay = displayIndex + tokenChars.length - 1
+      let tokenBody = ''
+      for (let j = 0; j < tokenChars.length; j++) {
+        const tokenChar = tokenChars[j] ?? ''
+        tokenBody += displayIndex + j === cursorDisplay ? theme.cursor(tokenChar) : tokenChar
+      }
+      body += theme.primary(tokenBody)
+      displayIndex += tokenChars.length
+      continue
+    }
+    body += sourceIndex === i ? theme.cursor(ch) : ch
+    displayIndex++
   }
+  if (body === '') body = theme.placeholder('说点什么...')
   const cursorLine = rows.length
   rows.push(boxLine('> ' + body, w, style))
   rows.push(boxBottom(w, style))

@@ -70,7 +70,7 @@ dsh --profile orca          # 或安装后直接 orca
 | --- | --- |
 | `/model` | provider → 模型 → 思考强度 三段选择器，waterfall 热切换、持久化默认 |
 | `/preset` | Agent 预设 roster 选择器（standard/ptc/minimal/cordis），下个新会话挂载组成、页脚显示 live 预设 |
-| `/img <路径>` · `Ctrl+V` · 粘贴/输入图片路径 | 附加图片（png/jpg/webp/gif），随下一条消息发送，`Esc` 取消 |
+| `/img <路径>` · `Ctrl+V`/`Alt+V` · 粘贴/输入图片路径 | 附加图片（png/jpg/webp/gif），输入框内联 `[image #N]`，可 Backspace/Delete 删除，随下一条消息发送，`Esc` 全部取消 |
 | `@路径` · `@"含空格路径"` | 文件补全（内核 `fileReferences`，缺席时本地扫描），↑↓/Tab/Enter |
 | `/` | 命令菜单（过滤/↑↓/Tab/Enter），未知命令回退为普通消息 |
 | `↑` / `↓` | 召回/返回上一条输入（≤100 条） |
@@ -106,7 +106,7 @@ pnpm run probe:scrollback          # 带滚动缓冲的 ConPTY 断言：历史�
 - [x] **M8 流式沉淀渲染重构**（真机 PTY 探针 + `probe:scrollback` ConPTY scrollback 断言 ✔，真回合 ✔）：根治"新消息一来老的整块消失、滚不回去"——旧 painter 的相对光标算术在 live 帧超出视口后失准，封存行被覆盖、活动行被重影（ConPTY scrollback 实测：T1 只剩 3/14 行、同帧内容重复 6 次）。重写为 Ink/pi-tui 式**流式追加模型**：live 块（生长中行 + chrome）物理位置绝对跟踪（CUP），封存行从块顶顺序下写、靠终端自然滚动进入原生 scrollback——**逐行沉淀、零覆盖、零重影**；行级连续封存（user 行/完成的 tool 卡/思考摘要/已完成的 assistant 行定稿即沉淀，不再等下一回合批量）；欢迎卡/路由行改走 channel pin 行（首个 `turn/start` 随内容一起沉淀，日志序不丢）；`clearForSwitch` 后 flush 游标复位修复（回退消息永不上屏的根因）；`scripts/probe-scrollback.mjs` 新增——带 scrollback 的 ConPTY 端到端断言（历史完整可回溯 / 无 ghost / chrome 钉底），这类"渲染器 vs scrollback"的 bug 从此有专门的回归网。M6 的"一次性通知常驻 live 置顶"机制由 M8 的 channel pin 行替代
 - [x] **M7 输入体验 + 思考强度全链路**（冒烟 phase2/7/8/9 + 真机 PTY 探针 ✔）：
   - **思考强度不再丢**：`agentDefaultModel` 持久化的 `reasoningEffort` 全链路进入 `agentOptions` 与 `agent/request` waterfall 种子（对齐 dsh 0.1.2 `installModelSelection` / agent-loop `buildRequest` 镜像）；attach 时 seed 完整 selection（此前 waterfall 每请求把创建时带来的 effort 剥成模型默认——"模型配置正常但思考强度匹配不上"的根因）；插件级 `provider`/`model` 覆盖与 effort 合并而非互斥；选择器里显式选「默认（模型默认行为）」会被记住、不被持久化默认悄悄改回
-  - **图片输入**：`/img <路径>` · `Ctrl+V` 剪贴板图片（Windows PowerShell 截图直入）· 括号粘贴/拖入图片路径自动识别；经 `dsh-attachment` 持久引用随下一条消息发送，输入框内渲染附件徽标，`user/message` 投影 `[图片×N]` 后缀
+  - **图片输入**：`/img <路径>` · `Ctrl+V`/`Alt+V` 剪贴板图片（Windows PowerShell 截图直入；Windows Terminal 会吞掉 `Ctrl+V`，请用 `Alt+V`）· 括号粘贴/拖入图片路径自动识别（含带引号路径）；经 `dsh-attachment` 持久引用随下一条消息发送，输入框内联 Claude Code 式高亮 `[image #N]` 占位符，可 Backspace/Delete 单独删除，`user/message` 投影同为 `[image #N]`
   - **@ 文件补全**：内核 `fileReferences` 接缝（缺席时本地浅扫描降级）；`@路径` 与 `@"含空格路径"` 语法；↑↓ 选择、Tab/Enter 完成；文件候选完成后菜单保持关闭（Enter 提交而非重新补全的死循环）；目录候选保持枚举
   - **编辑器与快捷键**：逻辑光标（反显字符）+ readline 编辑键（Ctrl+A/E/K/U/W、Ctrl+←/→ 词移动）；↑ 历史召回/↓ 返回；括号粘贴（200~/201~）单突发不逐键重放；`Shift+Tab` 循环 yolo；`Ctrl+C` 双击退出（首按打断回合/清空输入，误触不杀会话）；`Esc` 打断、双击 `Esc` 回退上一轮、`Ctrl+O` 思考展开
   - **页脚**：提示行 + 右对齐紧凑 token 用量（↑输入 ↓输出 ✻推理），100 列内不再截断互叠

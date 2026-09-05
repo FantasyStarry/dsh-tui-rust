@@ -51,7 +51,7 @@ import type {
   UserMessage,
 } from './kernel/types.js'
 import { KERNEL_EVENTS } from './kernel/types.js'
-import { buildFrame, routeKey, routeLine, welcomeCard } from './tui/chat.js'
+import { buildFrame, routeKey, routeLine, welcomeCard, IMAGE_SENTINEL } from './tui/chat.js'
 import { classify, Keyboard } from './tui/input.js'
 import type { KeyPress } from './tui/input.js'
 import { openPicker, movePicker, pickedItem, type PickerItem, type PickerState } from './tui/picker.js'
@@ -425,9 +425,13 @@ export function bootstrapApp(
       return
     }
     // A lone image path (drag-drop fallback for terminals without bracketed
-    // paste) attaches instead of sending the path as a prompt.
-    if (images.length === 0 && looksLikeImagePath(text.trim()) && existsSync(resolvePath(text.trim()))) {
-      void attachImageFile(text.trim())
+    // paste) attaches instead of sending the path as a prompt. Strip quotes
+    // for the existence check but keep the original for attachment (it knows
+    // how to handle quoted paths with spaces).
+    const rawPath = text.trim()
+    const unquotedPath = rawPath.replace(/^"|"$/g, '').trim()
+    if (images.length === 0 && looksLikeImagePath(rawPath) && existsSync(resolvePath(unquotedPath))) {
+      void attachImageFile(rawPath)
       return
     }
     // No optimistic echo: the user row is projected from the kernel's
@@ -502,7 +506,7 @@ export function bootstrapApp(
     for (const [group, lines] of groups) {
       channel.pushSystem(`【${group}】${lines.join(' · ')}`)
     }
-    channel.pushSystem('快捷键：@ 文件补全（Tab/Enter 确认）· Ctrl+V 附加剪贴板图片 · ↑ 召回上一条 · Shift+Tab 切换 yolo · Ctrl+O 展开思考 · Ctrl+C 打断/双击退出 · 双击 Esc 回退上一轮 · 未知 /命令将作为普通消息发给模型')
+    channel.pushSystem('快捷键：@ 文件补全（Tab/Enter 确认）· Ctrl+V/Alt+V 附加剪贴板图片 · ↑ 召回上一条 · Shift+Tab 切换 yolo · Ctrl+O 展开思考 · Ctrl+C 打断/双击退出 · 双击 Esc 回退上一轮 · 未知 /命令将作为普通消息发给模型')
   }
 
   const showUsage = (): void => {
@@ -953,6 +957,9 @@ export function bootstrapApp(
     const item = menu.items[menu.index]
     if (!item) return false
     editor = `/${item.value}`
+    // A completed slash command replaces the whole editor; inline image
+    // tokens must not survive into command dispatch.
+    pendingImages.length = 0
     menuIndex = 0
     return true
   }
@@ -1433,13 +1440,62 @@ export function bootstrapApp(
    */
   let atDoneQuery: string | null = null
 
-  // ── editor helpers (code-point based; the cursor is an index into them) ───
+  // ── editor helpers (code-point based; cursor is an index into chars) ──────
+  // Image attachments are inline IMAGE_SENTINEL chars. They render as
+  // `[image #N]` in chat.ts and are atomic for editing: backspace/delete
+  // remove the whole token and the matching pending image.
 
   const codeLen = (text: string): number => Array.from(text).length
 
+  /** Count image sentinels in chars[0..pos). */
+  const imageIndexBefore = (chars: readonly string[], pos: number): number => {
+    let n = 0
+    for (let i = 0; i < pos; i++) if (chars[i] === IMAGE_SENTINEL) n++
+    return n
+  }
+
+  /** Remove pending images whose sentinels lie in chars[start..end). */
+  const removePendingImagesInRange = (chars: readonly string[], start: number, end: number): void => {
+    const indexes: number[] = []
+    for (let i = start; i < end; i++) {
+      if ((chars[i] ?? '') === IMAGE_SENTINEL) indexes.push(imageIndexBefore(chars, i))
+    }
+    indexes.sort((a, b) => b - a)
+    for (const index of indexes) {
+      if (index >= 0 && index < pendingImages.length) pendingImages.splice(index, 1)
+    }
+  }
+
+  /** Insert one inline image token at the cursor (call after pendingImages.push). */
+  const insertImageToken = (): void => {
+    const chars = Array.from(editor)
+    chars.splice(cursorPos, 0, IMAGE_SENTINEL)
+    editor = chars.join('')
+    cursorPos += 1
+    scheduleAtFetch()
+  }
+
+  /** Split editor into plain text + ordered image refs for submission. */
+  const collectSubmission = (): { readonly text: string; readonly images: ImageAttachmentRef[] } => {
+    const chars = Array.from(editor)
+    let text = ''
+    const images: ImageAttachmentRef[] = []
+    let imageIndex = 0
+    for (const ch of chars) {
+      if (ch === IMAGE_SENTINEL) {
+        const ref = pendingImages[imageIndex]?.ref
+        if (ref) images.push(ref)
+        imageIndex++
+      } else {
+        text += ch
+      }
+    }
+    return { text: text.trim(), images }
+  }
+
   /** Insert text at the cursor; folded pasted newlines stay single-line. */
   const insertText = (seq: string): void => {
-    const clean = seq.replace(/\r\n?/g, ' ')
+    const clean = seq.replace(/\r\n?/g, ' ').replaceAll(IMAGE_SENTINEL, '')
     if (clean === '') return
     const chars = Array.from(editor)
     const ins = Array.from(clean)
@@ -1458,6 +1514,7 @@ export function bootstrapApp(
       while (from > 0 && (chars[from] ?? '') === ' ') from--
       while (from > 0 && (chars[from - 1] ?? '') !== ' ') from--
     }
+    removePendingImagesInRange(chars, from, cursorPos)
     editor = [...chars.slice(0, from), ...chars.slice(cursorPos)].join('')
     cursorPos = from
     scheduleAtFetch()
@@ -1466,7 +1523,23 @@ export function bootstrapApp(
   const deleteAt = (): void => {
     const chars = Array.from(editor)
     if (cursorPos >= chars.length) return
+    removePendingImagesInRange(chars, cursorPos, cursorPos + 1)
     editor = [...chars.slice(0, cursorPos), ...chars.slice(cursorPos + 1)].join('')
+    scheduleAtFetch()
+  }
+
+  const killToStart = (): void => {
+    const chars = Array.from(editor)
+    removePendingImagesInRange(chars, 0, cursorPos)
+    editor = chars.slice(cursorPos).join('')
+    cursorPos = 0
+    scheduleAtFetch()
+  }
+
+  const killToEnd = (): void => {
+    const chars = Array.from(editor)
+    removePendingImagesInRange(chars, cursorPos, chars.length)
+    editor = chars.slice(0, cursorPos).join('')
     scheduleAtFetch()
   }
 
@@ -1634,6 +1707,7 @@ export function bootstrapApp(
     }
     const mention = Array.from(formatFileMention(candidate))
     const chars = Array.from(editor)
+    removePendingImagesInRange(chars, token.start, cursorPos)
     editor = [...chars.slice(0, token.start), ...mention, ...chars.slice(cursorPos)].join('')
     cursorPos = token.start + mention.length
     atMenu = null
@@ -1656,10 +1730,6 @@ export function bootstrapApp(
     pendingImages.length = 0
   }
 
-  /** Visible labels of the pending attachments (rendered inside the editor box). */
-  const attachmentLabels = (): string[] =>
-    pendingImages.map((image) => `${image.label} ${image.ref.width}×${image.ref.height}`)
-
   // ── prompt history recall (↑ on an empty editor) ──────────────────────────
 
   const historyRecall = (delta: -1 | 1): void => {
@@ -1674,6 +1744,7 @@ export function bootstrapApp(
         historyIndex = null
         editor = ''
         cursorPos = 0
+        pendingImages.length = 0
         return
       }
       historyIndex = next
@@ -1681,6 +1752,9 @@ export function bootstrapApp(
     const entry = historyIndex !== null ? promptHistory[historyIndex] : undefined
     editor = entry ?? ''
     cursorPos = codeLen(editor)
+    // History entries are text-only; drop any inline image tokens that were
+    // pending so the editor and pendingImages never drift apart.
+    pendingImages.length = 0
     menuIndex = 0
   }
   // ── image attachments (kernel `attachments` seam, dsh-attachment) ─────────
@@ -1699,11 +1773,20 @@ export function bootstrapApp(
   }
 
   function looksLikeImagePath(text: string): boolean {
-    const lower = text.toLowerCase()
-    return (
-      (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp') || lower.endsWith('.gif')) &&
-      !/\s/.test(text)
-    )
+    const trimmed = text.trim()
+    // Windows Explorer 复制文件后粘贴进终端，路径常带引号（尤其含空格时）；
+    // 去掉首尾引号再判断，否则“粘贴图片路径”会完全没反应。
+    const unquoted = trimmed.replace(/^"(.*)"$/, '$1').trim()
+    const lower = unquoted.toLowerCase()
+    const isImage =
+      lower.endsWith('.png') ||
+      lower.endsWith('.jpg') ||
+      lower.endsWith('.jpeg') ||
+      lower.endsWith('.webp') ||
+      lower.endsWith('.gif')
+    if (!isImage) return false
+    // 无空格路径直接收；带空格路径必须原本带引号，避免把普通句子误判成图片。
+    return !/\s/.test(unquoted) || /^".*"$/.test(trimmed)
   }
 
   /** Expand `~` and make relative paths cwd-absolute. */
@@ -1745,16 +1828,18 @@ export function bootstrapApp(
     try {
       const ref = await attachments.saveImage({ data: new Uint8Array(data), mediaType, name: basename(abs) })
       pendingImages.push({ ref, label: ref.name ?? basename(abs) })
-      channel.pushSystem(`已附加图片：${ref.name ?? basename(abs)}（${ref.width}×${ref.height}，随下一条消息发送，Esc 取消）`)
+      insertImageToken()
     } catch (error) {
       channel.pushSystem(`图片附加失败：${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
   /**
-   * Ctrl+V: read the clipboard via PowerShell (Windows only) — an image goes
-   * through the attachment path, an image-file path in the text clipboard
-   * attaches directly. Failures degrade to a notice; never break the TUI.
+   * Ctrl+V / Alt+V: read the clipboard via PowerShell (Windows only) — an
+   * image goes through the attachment path, an image-file path in the text
+   * clipboard attaches directly. Failures degrade to a notice; never break
+   * the TUI. Alt+V is the Windows Terminal escape hatch because it consumes
+   * Ctrl+V for its own paste.
    */
   const pasteClipboardImage = (): void => {
     if (process.platform !== 'win32') {
@@ -1803,7 +1888,7 @@ export function bootstrapApp(
           return
         }
       }
-      channel.pushSystem('剪贴板里没有图片（复制文件或截图后再按 Ctrl+V；文本请用终端粘贴）')
+      channel.pushSystem('剪贴板里没有图片（复制文件或截图后再按 Ctrl+V/Alt+V；文本请用终端粘贴）')
     })
   }
 
@@ -1836,10 +1921,10 @@ export function bootstrapApp(
         handlePickerKey(key)
         return
       }
-      // Ctrl+V: attach the clipboard image (terminals that deliver the raw
-      // chord — Windows Terminal pastes bracketed text itself and never
-      // reaches here).
-      if (key.ctrl && key.name === 'v') {
+      // Ctrl+V / Alt+V: attach the clipboard image. Windows Terminal never
+      // delivers Ctrl+V to the TUI (it consumes it for bracketed paste), so
+      // Alt+V is the reliable in-app image-paste hotkey there.
+      if ((key.ctrl || key.alt) && key.name === 'v') {
         void pasteClipboardImage()
         return
       }
@@ -1897,7 +1982,8 @@ export function bootstrapApp(
         case 'submit': {
           // A visible @ menu completes first; Enter never submits through it.
           if (completeAt()) break
-          const text = editor.trim()
+          const { text: submitted, images } = collectSubmission()
+          const text = submitted
           // Partial slash input completes from the menu first (kimi behavior);
           // a second Enter dispatches the completed command.
           if (text.startsWith('/') && !text.includes(' ') && !picker) {
@@ -1906,11 +1992,9 @@ export function bootstrapApp(
               if (completeMenu()) break
             }
           }
-          const submitted = editor.trim()
           // Detach the pending images BEFORE resetEditor wipes them — the
           // refs must ride THIS message, and Esc-cancel still clears the
           // rest of the editor state.
-          const images = pendingImages.map((image) => image.ref)
           resetEditor()
           historyIndex = null
           if (submitted || images.length > 0) {
@@ -1972,19 +2056,12 @@ export function bootstrapApp(
             case 'e':
               moveTo(codeLen(editor))
               break
-            case 'k': {
-              // Kill to end of line.
-              editor = Array.from(editor).slice(0, cursorPos).join('')
-              scheduleAtFetch()
+            case 'k':
+              killToEnd()
               break
-            }
-            case 'u': {
-              // Kill to start of line.
-              editor = Array.from(editor).slice(cursorPos).join('')
-              cursorPos = 0
-              scheduleAtFetch()
+            case 'u':
+              killToStart()
               break
-            }
             case 'w':
               deleteBefore(true)
               break
@@ -2050,7 +2127,7 @@ export function bootstrapApp(
       sealedFromLine: flushedLine,
       editorText: editor,
       editorCursor: cursorPos,
-      attachments: attachmentLabels(),
+      attachments: [], // images are inline IMAGE_SENTINEL tokens in editorText
       atMenu: currentAtMenu(),
       width: frameWidth,
       height: stdout.rows ?? 24,
