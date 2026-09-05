@@ -99,6 +99,7 @@ type PickerStage =
   | { readonly kind: 'sessions' }
   | { readonly kind: 'presets' }
   | { readonly kind: 'approval' }
+  | { readonly kind: 'question' }
 
 /** Slash command metadata — kimi-style grouping, aliases, idle gating. */
 interface SlashCommand {
@@ -274,6 +275,8 @@ export function bootstrapApp(
     resolve: (answer: KernelAskUserQuestionAnswer) => void
     reject: (error: Error) => void
   } | null = null
+  /** When true, the current question is waiting for a free-text custom answer. */
+  let questionCustomMode = false
 
   /** Live model selection — overrides the request route via the waterfall. */
   let selection: SessionRoute | null = null
@@ -757,19 +760,27 @@ export function bootstrapApp(
     if (!pendingQuestion) return
     const item = pendingQuestion.request.questions[pendingQuestion.index]
     if (!item) return
+    questionCustomMode = false
     channel.pushSystem(`问题：${item.question}`)
     if (item.detail) channel.pushSystem(`详情：${item.detail}`)
-    if (item.options && item.options.length > 0) {
-      for (const [index, option] of item.options.entries()) {
-        channel.pushSystem(`  ${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ''}`)
-      }
-      channel.pushSystem('请输入编号或选项文字后回车；Esc 取消')
+    if (item.options && item.options.length > 0 && !item.multiSelect) {
+      pickerStage = { kind: 'question' }
+      picker = openPicker(`问题：${item.question}`, [
+        ...item.options.map((option, index) => ({
+          value: option.label,
+          label: `${index + 1}. ${option.label}`,
+          ...(option.description ? { hint: option.description } : {}),
+        })),
+        { value: '__custom__', label: '自定义回答...' },
+      ])
     } else {
-      channel.pushSystem('请直接输入回答后回车；Esc 取消')
+      channel.pushSystem(
+        item.multiSelect ? '多选：请输入编号或选项文字（逗号分隔），也可直接输入自定义回答' : '请直接输入回答后回车；Esc 取消',
+      )
     }
   }
 
-  const answerCurrentQuestion = (raw: string): void => {
+  const answerCurrentQuestion = (raw: string, forceCustom = false): void => {
     if (!pendingQuestion) return
     const item = pendingQuestion.request.questions[pendingQuestion.index]
     if (!item) {
@@ -780,7 +791,9 @@ export function bootstrapApp(
     const text = raw.trim()
     let selected: string[] = []
     let custom: string | undefined
-    if (item.options && item.options.length > 0) {
+    if (forceCustom) {
+      custom = text || undefined
+    } else if (item.options && item.options.length > 0) {
       const parts = item.multiSelect ? text.split(/[,，、\s]+/).filter(Boolean) : [text]
       for (const part of parts) {
         const num = Number(part)
@@ -817,7 +830,19 @@ export function bootstrapApp(
     if (!pendingQuestion) return
     const reject = pendingQuestion.reject
     pendingQuestion = null
+    questionCustomMode = false
     reject(new Error('ask_user_question was aborted before the user answered'))
+  }
+
+  const answerCurrentQuestionOption = (label: string): void => {
+    closePicker()
+    answerCurrentQuestion(label)
+  }
+
+  const startCustomAnswer = (): void => {
+    questionCustomMode = true
+    closePicker()
+    channel.pushSystem('请输入自定义回答后回车；Esc 取消')
   }
 
   const askUserQuestions = (request: KernelAskUserQuestionRequest): Promise<KernelAskUserQuestionAnswer> =>
@@ -1261,6 +1286,13 @@ export function bootstrapApp(
       dbg(`confirmPicker skip: picker=${picker !== null} stage=${pickerStage?.kind ?? 'null'}`)
       return
     }
+    if (pickerStage.kind === 'question') {
+      const item = pickedItem(picker)
+      if (!item || item.disabled) return
+      if (item.value === '__custom__') startCustomAnswer()
+      else answerCurrentQuestionOption(item.value)
+      return
+    }
     if (pickerStage.kind === 'sessions') {
       confirmResumePicker()
       return
@@ -1366,9 +1398,14 @@ export function bootstrapApp(
     const action = classify(key)
     if (action === 'cancel') {
       // Esc on the approval panel is an explicit reject (kimi behavior);
-      // on other pickers it just closes.
+      // on the question panel it aborts the whole ask.
       if (pickerStage?.kind === 'approval') {
         settleApprovalHead('rejected')
+        return
+      }
+      if (pickerStage?.kind === 'question') {
+        cancelPendingQuestion()
+        closePicker()
         return
       }
       closePicker()
@@ -2258,8 +2295,10 @@ export function bootstrapApp(
           // Agent-initiated question: capture the answer instead of sending.
           if (pendingQuestion) {
             const answer = editor.trim()
+            const forceCustom = questionCustomMode
             resetEditor()
-            answerCurrentQuestion(answer)
+            questionCustomMode = false
+            answerCurrentQuestion(answer, forceCustom)
             break
           }
           // A visible @ menu completes first; Enter never submits through it.
