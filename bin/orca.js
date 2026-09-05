@@ -114,7 +114,7 @@ if (args[0] === 'update' || args[0] === '--update') {
 // directly.
 const child =
   process.platform === 'win32'
-    ? spawn('cmd.exe', ['/d', '/s', '/c', `dsh --profile "${profile.replaceAll('"', '""')}"`], {
+    ? spawn('cmd.exe', ['/d', '/s', '/c', 'dsh', '--profile', profile], {
         stdio: 'inherit',
         windowsHide: true,
         env: process.env,
