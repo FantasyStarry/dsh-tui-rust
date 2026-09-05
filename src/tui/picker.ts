@@ -35,6 +35,10 @@ export interface PickerState {
   index: number
   /** The live route value at this stage — its row gets ` ← current`. */
   readonly current?: string
+  /** Multi-select mode: Space toggles rows, Enter confirms the checked set. */
+  multi?: boolean
+  /** Checked values in multi-select mode (mutable by togglePicker). */
+  checked?: Set<string>
 }
 
 export function openPicker(title: string, items: readonly PickerItem[], current?: string): PickerState {
@@ -54,16 +58,31 @@ export function pickedItem(state: PickerState): PickerItem | undefined {
   return state.items[state.index]
 }
 
+/** Toggle a value in multi-select mode. */
+export function togglePicker(state: PickerState, value: string): void {
+  if (!state.multi) return
+  const checked = state.checked ?? new Set<string>()
+  if (checked.has(value)) checked.delete(value)
+  else checked.add(value)
+  state.checked = checked
+}
+
+/** Whether a value is checked in multi-select mode. */
+export function isPickerChecked(state: PickerState, value: string): boolean {
+  return state.checked?.has(value) ?? false
+}
+
 /** kimi SELECT_POINTER / CURRENT_MARK, per DESIGN.md: indents align. */
 const POINTER_W = 2
 const HINT = '↑/↓ 选择 · Enter 确认 · Esc 取消'
+const MULTI_HINT = '↑/↓ 选择 · Space 多选 · Enter 确认 · Esc 取消'
 
 /** Render the picker as a flat-bordered overlay block (already themed). */
 export function renderPicker(state: PickerState, width: number, maxItems = 17): string[] {
   const lines: string[] = []
   lines.push(theme.primary('─'.repeat(width)))
   lines.push(' ' + theme.title(cleanLine(state.title)))
-  lines.push(theme.subtle(' ' + HINT))
+  lines.push(theme.subtle(' ' + (state.multi ? MULTI_HINT : HINT)))
   lines.push('')
 
   // Fixed item window: the panel ALWAYS occupies 4 chrome + itemWindow + 1
@@ -88,10 +107,11 @@ export function renderPicker(state: PickerState, width: number, maxItems = 17): 
     const pointer = selected ? theme.title('❯ ') : ' '.repeat(POINTER_W)
     const cleanLabel = cleanLine(item.label)
     const label = selected ? theme.title(cleanLabel) : cleanLabel
+    const check = state.multi ? (isPickerChecked(state, item.value) ? theme.ok('☑ ') : '☐ ') : ''
     const current = state.current !== undefined && item.value === state.current ? theme.ok('  ← current') : ''
     const hint = item.hint ? theme.subtle('  ' + cleanLine(item.hint)) : ''
     const budget = Math.max(8, width - 4)
-    const content = `  ${pointer}${label}${hint}${current}`
+    const content = `  ${pointer}${check}${label}${hint}${current}`
     // Focus state: the selected row gets a full-row panel background so the
     // cursor row reads at a glance (the pointer + bold title stay too). The
     // fill pads by CELLS — string.length would mispad CJK labels.

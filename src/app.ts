@@ -59,7 +59,7 @@ import { KERNEL_EVENTS } from './kernel/types.js'
 import { buildFrame, routeKey, routeLine, welcomeCard, IMAGE_SENTINEL } from './tui/chat.js'
 import { classify, Keyboard } from './tui/input.js'
 import type { KeyPress } from './tui/input.js'
-import { openPicker, movePicker, pickedItem, type PickerItem, type PickerState } from './tui/picker.js'
+import { openPicker, movePicker, pickedItem, togglePicker, type PickerItem, type PickerState } from './tui/picker.js'
 import { Renderer } from './tui/renderer.js'
 import { currentOrcaVersion, fetchLatestOrcaVersion, installLatestOrca, compareVersions } from './update.js'
 
@@ -277,6 +277,8 @@ export function bootstrapApp(
   } | null = null
   /** When true, the current question is waiting for a free-text custom answer. */
   let questionCustomMode = false
+  /** Draft selected labels for the current multi-select question. */
+  let questionDraftSelected: string[] = []
 
   /** Live model selection — overrides the request route via the waterfall. */
   let selection: SessionRoute | null = null
@@ -761,26 +763,30 @@ export function bootstrapApp(
     const item = pendingQuestion.request.questions[pendingQuestion.index]
     if (!item) return
     questionCustomMode = false
+    questionDraftSelected = []
     channel.pushSystem(`问题：${item.question}`)
     if (item.detail) channel.pushSystem(`详情：${item.detail}`)
-    if (item.options && item.options.length > 0 && !item.multiSelect) {
+    if (item.options && item.options.length > 0) {
       pickerStage = { kind: 'question' }
-      picker = openPicker(`问题：${item.question}`, [
-        ...item.options.map((option, index) => ({
-          value: option.label,
-          label: `${index + 1}. ${option.label}`,
-          ...(option.description ? { hint: option.description } : {}),
-        })),
-        { value: '__custom__', label: '自定义回答...' },
-      ])
-    } else {
-      channel.pushSystem(
-        item.multiSelect ? '多选：请输入编号或选项文字（逗号分隔），也可直接输入自定义回答' : '请直接输入回答后回车；Esc 取消',
+      picker = openPicker(
+        `问题：${item.question}`,
+        [
+          ...item.options.map((option, index) => ({
+            value: option.label,
+            label: `${index + 1}. ${option.label}`,
+            ...(option.description ? { hint: option.description } : {}),
+          })),
+          { value: '__custom__', label: '自定义回答...' },
+        ],
+        undefined,
       )
+      if (item.multiSelect) picker.multi = true
+    } else {
+      channel.pushSystem('请直接输入回答后回车；Esc 取消')
     }
   }
 
-  const answerCurrentQuestion = (raw: string, forceCustom = false): void => {
+  const answerCurrentQuestion = (raw: string, forceCustom = false, baseSelected: readonly string[] = []): void => {
     if (!pendingQuestion) return
     const item = pendingQuestion.request.questions[pendingQuestion.index]
     if (!item) {
@@ -792,6 +798,7 @@ export function bootstrapApp(
     let selected: string[] = []
     let custom: string | undefined
     if (forceCustom) {
+      selected = [...baseSelected]
       custom = text || undefined
     } else if (item.options && item.options.length > 0) {
       const parts = item.multiSelect ? text.split(/[,，、\s]+/).filter(Boolean) : [text]
@@ -831,6 +838,7 @@ export function bootstrapApp(
     const reject = pendingQuestion.reject
     pendingQuestion = null
     questionCustomMode = false
+    questionDraftSelected = []
     reject(new Error('ask_user_question was aborted before the user answered'))
   }
 
@@ -839,8 +847,30 @@ export function bootstrapApp(
     answerCurrentQuestion(label)
   }
 
-  const startCustomAnswer = (): void => {
+  const answerCurrentQuestionSelected = (selected: readonly string[]): void => {
+    if (!pendingQuestion) return
+    const item = pendingQuestion.request.questions[pendingQuestion.index]
+    if (!item) {
+      pendingQuestion.reject(new Error('question list is empty'))
+      pendingQuestion = null
+      return
+    }
+    pendingQuestion.answers.push({ id: item.id, selected: [...selected] })
+    pendingQuestion.index++
+    const next = pendingQuestion.request.questions[pendingQuestion.index]
+    if (next) {
+      showCurrentQuestion()
+    } else {
+      const answers = [...pendingQuestion.answers]
+      const resolve = pendingQuestion.resolve
+      pendingQuestion = null
+      resolve({ answers })
+    }
+  }
+
+  const startCustomAnswer = (baseSelected: readonly string[] = []): void => {
     questionCustomMode = true
+    questionDraftSelected = [...baseSelected]
     closePicker()
     channel.pushSystem('请输入自定义回答后回车；Esc 取消')
   }
@@ -1289,8 +1319,14 @@ export function bootstrapApp(
     if (pickerStage.kind === 'question') {
       const item = pickedItem(picker)
       if (!item || item.disabled) return
-      if (item.value === '__custom__') startCustomAnswer()
-      else answerCurrentQuestionOption(item.value)
+      if (item.value === '__custom__') {
+        startCustomAnswer(picker.multi ? Array.from(picker.checked ?? []) : [])
+      } else if (picker.multi) {
+        closePicker()
+        answerCurrentQuestionSelected(Array.from(picker.checked ?? []))
+      } else {
+        answerCurrentQuestionOption(item.value)
+      }
       return
     }
     if (pickerStage.kind === 'sessions') {
@@ -1421,6 +1457,11 @@ export function bootstrapApp(
       return
     }
     if (action === 'text') {
+      if (key.name === ' ' && picker.multi) {
+        const item = pickedItem(picker)
+        if (item && !item.disabled) togglePicker(picker, item.value)
+        return
+      }
       if (key.name === 'k') movePicker(picker, -1)
       else if (key.name === 'j') movePicker(picker, 1)
     }
@@ -2296,9 +2337,11 @@ export function bootstrapApp(
           if (pendingQuestion) {
             const answer = editor.trim()
             const forceCustom = questionCustomMode
+            const baseSelected = questionDraftSelected
             resetEditor()
             questionCustomMode = false
-            answerCurrentQuestion(answer, forceCustom)
+            questionDraftSelected = []
+            answerCurrentQuestion(answer, forceCustom, baseSelected)
             break
           }
           // A visible @ menu completes first; Enter never submits through it.
