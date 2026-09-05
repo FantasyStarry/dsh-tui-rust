@@ -8,7 +8,7 @@
  * Visual language — the kimi-code school (MoonshotAI/kimi-code:
  * `src/tui/components/messages`, `components/editor`, `components/chrome`,
  * `constant/symbols.ts`, `constant/rendering.ts`):
- * - user prompts: `✨` amber bold role bullet, no bubble;
+ * - user prompts: `🐋` orca role bullet, amber bold text, no bubble;
  * - assistant voice: `● ` body-color bullet + markdown (code as cards);
  * - thinking: braille spinner + dim italic preview, sealed to `● 已思考 Ns`;
  * - tool runs: backgrounded cards, `⠋`/`✓ `/`✗ ` status marks in the frame;
@@ -115,9 +115,9 @@ export const IMAGE_SENTINEL = ''
 
 const HINT = 'Enter 发送 · /model · @文件 · Ctrl+V/Alt+V 图片 · Ctrl+O 思考 · Esc 取消 · Ctrl+C 退出'
 
-/** kimi symbols.ts: role bullets, status marks; `✨` carries VS16 so both our
- *  cell math (1+1) and real emoji rendering (2 cells) agree on 3. */
-const USER_BULLET = '✨\uFE0F '
+/** Orca brand role bullet: `🐋` is 2 cells + 1 space, so both our cell math
+ *  and real emoji rendering agree on 3 (same width as the old `✨` bullet). */
+const USER_BULLET = '🐋 '
 const STATUS_BULLET = '● '
 const SUCCESS_MARK = '✓ '
 const FAILURE_MARK = '✗ '
@@ -609,7 +609,7 @@ function renderRow(row: TranscriptRow, ctx: FrameContext, width: number): string
 
 /** Pre-rendered lines are painted verbatim (full width) — no extra guard. */
 
-/** User prompt: `✨ ` amber bold role bullet; continuation aligns under it. */
+/** User prompt: `🐋 ` orca role bullet; continuation aligns under it. */
 function userLines(text: string, width: number): string[] {
   const bulletW = stringWidth(USER_BULLET)
   const inner = Math.max(8, width - bulletW)
